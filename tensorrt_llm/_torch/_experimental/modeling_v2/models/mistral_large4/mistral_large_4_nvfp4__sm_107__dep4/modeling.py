@@ -303,9 +303,9 @@ _PREFILL_LOGITS_CEILING = 1 << 26
 # row) to 65536 (one CTA scans a whole row). DSpark verification (next_n 4):
 # split_radix_topk_decode, ten partitions plus a radix merge, at 20480 columns (the narrowest
 # row the op splits into ten blocks) to 1048584 (the 1M envelope with DSpark's headroom, the
-# split kernel's widest row), on the rows of a rank's padded graph batches 1, 2, 4, 8 and 16
-# (the CUDA-graph batches captured at max_batch_size 16 with padding). The split kernel takes
-# at most 64 rows, so graph batches 24 and 32 (96 and 128 rows) keep the op, as do a mixed
+# split kernel's widest row), on the rows of a rank's padded graph batches 1, 2, 4, 8 and 16.
+# The split kernel takes at most 64 rows, so the graph batches padding adds above 16 when
+# max_batch_size allows them (24 and 32: 96 and 128 rows) keep the op, as do a mixed
 # step's generation rows at other counts. split_radix_topk_decode itself keeps the op for a
 # call the op would not split into ten blocks, or whose rows are not 32-byte aligned with a
 # width that is a multiple of 8.
