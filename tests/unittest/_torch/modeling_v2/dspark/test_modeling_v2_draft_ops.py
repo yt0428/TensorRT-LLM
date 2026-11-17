@@ -161,15 +161,17 @@ def _fp32_reduced_bf16_matmul():
 
 
 def _check_attention(out: torch.Tensor, args) -> None:
-    """Measured on VR200 over the tp4 and tp8 cells, 3 draws each: within 1.98 ulp element-wise
-    of the reference and 0.74 ulp of relative RMS, gated at 4 and 1.5; the dep4 cells, whose
-    rows are computed the same way at 64 heads, are held to the same gates. Both round the
-    scores to bf16 first, which is most of their distance from float64; the op's relative RMS
-    from float64 was 0.84 to 1.04 times the reference's, gated at 1.1."""
+    """Measured on VR200 over every cell, 6 draws each: within 1.98 ulp element-wise of the
+    reference on the tp4 and tp8 cells (at most 384 query rows) and up to 5.82 on the dep4 cells,
+    whose 960 to 6144 rows reach the tail where the two sides' bf16 probabilities round apart;
+    each side alone is up to 5.7 ulp element-wise from float64 there. Relative RMS within 0.76
+    ulp. Gated at 8 and 1.5. Both round the scores to bf16 first, which is most of their
+    distance from float64; the op's relative RMS from float64 was 0.84 to 1.04 times the
+    reference's, gated at 1.1."""
     with _fp32_reduced_bf16_matmul():
         ref = attention.reference(*args)
     assert not out.isnan().any()
-    assert_within_ulp(out, ref, element_ulp=4, rms_ulp=1.5)
+    assert_within_ulp(out, ref, element_ulp=8, rms_ulp=1.5)
     truth = _attention_truth(args)
     assert _rel_rms(out, truth) <= 1.1 * _rel_rms(ref, truth)
 
