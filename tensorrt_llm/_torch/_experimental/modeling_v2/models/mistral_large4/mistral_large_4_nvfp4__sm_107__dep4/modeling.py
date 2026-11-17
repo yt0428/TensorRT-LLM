@@ -114,7 +114,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    build_split as build_ix_topk_verify,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     cute_dsl_radix_topk_decode,
+    split_radix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
     ds_mla_dequant_gather,
@@ -292,13 +296,28 @@ _NVFP4_SF_LINEAR = False
 # 1 GiB tile (1 << 28) left a dep4 rank under the 2%-of-device free-memory margin at 0.9 of free
 # memory to KV at max_seq_len 1048576.
 _PREFILL_LOGITS_CEILING = 1 << 26
-# The decode indexer's top-k: True runs cute_dsl_radix_topk_decode, one launch that selects the
-# trtllm indexer_topk_decode op's set (up to exact ties), False that op itself. The CuTe DSL
-# selector serves scorer rows from 4096 columns (where the op splits each row) to 65536 (one
-# CTA scans a whole row), the widths its cells cover; the scorer's column count is the engine's
-# max_seq_len, so an engine outside that range keeps the op (`_derive_first_step`).
+# The decode indexer's CuTe DSL selectors, False for the trtllm indexer_topk_decode op alone; the
+# scorer's column count is the engine's max_seq_len, so each selector is built for an engine
+# whose width it serves (`_derive_first_step`). next_n 1: cute_dsl_radix_topk_decode, one CTA
+# per row selecting the op's set (up to exact ties), at 4096 columns (where the op splits each
+# row) to 65536 (one CTA scans a whole row). DSpark verification (next_n 4):
+# split_radix_topk_decode, ten partitions plus a radix merge, at 20480 columns (the narrowest
+# row the op splits into ten blocks) to 1048584 (the 1M envelope with DSpark's headroom, the
+# split kernel's widest row), on the rows of a rank's padded graph batches 1, 2, 4, 8 and 16
+# (the CUDA-graph batches captured at max_batch_size 16 with padding). The split kernel takes
+# at most 64 rows, so graph batches 24 and 32 (96 and 128 rows) keep the op, as do a mixed
+# step's generation rows at other counts. split_radix_topk_decode itself keeps the op for a
+# call the op would not split into ten blocks, or whose rows are not 32-byte aligned with a
+# width that is a multiple of 8.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
+_TOPK_VERIFY_COLUMNS = (20480, 1048584)
+_TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
+# DSpark verification rows on the trtllm indexer_topk_decode op instead of the split radix
+# selector, for old-versus-new comparison (both select the same set up to exact ties; the split
+# selector's tests hold it to the op). Set TRTLLM_MODELING_V2_NATIVE_TOPK_VERIFY=1 in every
+# rank's environment at launch; off by default.
+_NATIVE_TOPK_VERIFY = os.environ.get("TRTLLM_MODELING_V2_NATIVE_TOPK_VERIFY", "0") == "1"
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -761,8 +780,10 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self.ctx_workspace_rows = 0
         self.expert_call_tokens = 0
         self.expert_tune_tokens = 0
-        # The decode top-k's handle, built on the first step at a scorer width it serves.
+        # The decode top-k's handles, next_n 1 and DSpark verification, each built on the first
+        # step at a scorer width it serves.
         self._ix_topk = None
+        self._ix_topk_verify = None
         # The prefill scorer's handle, built on the first step.
         self._ix_logits = None
         self._side_stream: torch.cuda.Stream | None = None
@@ -865,6 +886,18 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
             self._ix_topk = None
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if (
+            _NATIVE_TOPK_VERIFY
+            or not _TOPK_DECODE_CUTE_DSL
+            or not lo <= self._max_ctx_len <= hi
+            or self.idx_topk != 2048
+        ):
+            self._ix_topk_verify = None
+        elif self._ix_topk_verify is None:
+            self._ix_topk_verify = build_ix_topk_verify(
+                dev, next_n=4, use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+            )
         if self._ix_logits is None:
             self._ix_logits = build_ix_logits(dev)
         # Both key-pool layouts: a launcher compiled for a contiguous view addresses a strided
@@ -875,6 +908,35 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
                 for contiguous in (False, True)
             }
         self._derived_for = md.kv_cache_manager
+
+    def _select_indexer_decode(
+        self,
+        logits: torch.Tensor,
+        kv_lens: torch.Tensor,
+        indices: torch.Tensor,
+        next_n: int,
+        aux_indices: torch.Tensor,
+        aux_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select generation rows with the compiled selector for their static shape."""
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if (
+            self._ix_topk_verify is not None
+            and next_n == 4
+            and logits.shape[0] in _TOPK_VERIFY_ROWS
+            and lo <= logits.shape[1] <= hi
+            and logits.dtype == torch.float32
+        ):
+            return split_radix_topk_decode(
+                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
+            )
+        if next_n != 1 or self._ix_topk is None:
+            return indexer_topk_decode(
+                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
+            )
+        return cute_dsl_radix_topk_decode(
+            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step: one host-side integer read. A mixed batch goes to
@@ -1049,15 +1111,10 @@ class PrefillTarget:
                 step["scheduler_metadata_buffer"],
                 core._max_ctx_len,
             )
-            if next_n != 1 or core._ix_topk is None:
-                indexer_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n, core.idx_topk, 1,
-                    step["radix_aux_indices"], step["radix_aux_logits"],
-                )  # fmt: skip
-            else:
-                cute_dsl_radix_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n=1, compiled=core._ix_topk
-                )
+            core._select_indexer_decode(
+                logits, kv_lens, topk_buf[tc:], next_n,
+                step["radix_aux_indices"], step["radix_aux_logits"],
+            )  # fmt: skip
 
     def _ix_plan(self, step, tc: int) -> list[SimpleNamespace]:
         """Plan the context rows and key windows scored by each query tile.
@@ -1673,13 +1730,10 @@ class DecodeTarget:
             step["scheduler_metadata_buffer"],
             core._max_ctx_len,
         )
-        if next_n != 1 or core._ix_topk is None:
-            indexer_topk_decode(
-                logits, kv_lens, topk_buf, next_n, core.idx_topk, 1, step["radix_aux_indices"],
-                step["radix_aux_logits"],
-            )  # fmt: skip
-        else:
-            cute_dsl_radix_topk_decode(logits, kv_lens, topk_buf, next_n=1, compiled=core._ix_topk)
+        core._select_indexer_decode(
+            logits, kv_lens, topk_buf, next_n,
+            step["radix_aux_indices"], step["radix_aux_logits"],
+        )  # fmt: skip
 
     def _dense(self, o, L):
         """The SwiGLU MLP on this rank's own rows, whole: layer 0's, or a MoE layer's shared

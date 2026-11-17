@@ -88,6 +88,78 @@ def test_split_radix_causal_selection(batch, seed, kind, width):
         _check(logits, lengths, output)
 
 
+def _dep4_lengths(width):
+    """Sixteen KV lengths a DSpark scorer row of `width` columns holds: the shortest legal
+    request, the top-k edge, the ten-block edge, half the row and the full row."""
+    return [
+        *(3, 4, 5, 2047, 2048, 2049, 2051, 20479, 20480, 20481, 32769),
+        *(width // 2 + 1, width - 9, width - 8, width - 1, width),
+    ]
+
+
+_NATIVE_TARGET = (
+    "tensorrt_llm._torch._experimental.modeling_v2.catalog.attention."
+    "cute_dsl_radix_topk_decode.indexer_topk_decode"
+)
+
+
+@pytest.mark.parametrize("seed,kind", [(0, "ordinary"), (17, "ties"), (42, "boundaries")])
+@pytest.mark.parametrize("batch", [8, 16])
+@pytest.mark.parametrize("width", [32776, 1048584])
+def test_split_radix_dep4_graph_batches(batch, seed, kind, width):
+    """A dep4 rank's graph batches 8 and 16 (32 and 64 verification rows) at its DSpark scorer
+    widths, max_seq_len 32768 and 1048576 plus DSpark's headroom: the split launches where the
+    op splits each row into ten blocks (every row count at 1048584 columns), the op elsewhere."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.indexer_topk_decode import (
+        indexer_topk_decode as native_topk,
+    )
+
+    compiled = build_split(torch.cuda.current_device())
+    logits, output, aux_i, aux_l = _buffers(batch, width)
+    split = blocks_per_row(batch * 4, width, compiled.sm_count) == 10
+    if width == 1048584:
+        assert split
+    edge_lengths = _dep4_lengths(width)
+    for offset in range(0, len(edge_lengths), batch):
+        lengths = edge_lengths[offset : offset + batch]
+        lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        _fill(logits, lengths, 4, seed + offset, kind)
+        validate_split_radix_topk_lengths(logits, lens, next_n=4)
+        output.fill_(-7)
+        aux_i.fill_(-7)
+        aux_l.fill_(float("nan"))
+        with patch(_NATIVE_TARGET, wraps=native_topk) as fallback:
+            assert (
+                split_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+                is output
+            )
+        assert fallback.called != split
+        _check(logits, lengths, output)
+
+
+def test_split_radix_dep4_graph_replay():
+    """dep4's largest split graph batch, 16 requests (64 rows) at 1048584 columns, captured once
+    and replayed over new lengths and scores."""
+    compiled = build_split(torch.cuda.current_device())
+    width = 1048584
+    logits, output, aux_i, aux_l = _buffers(16, width)
+    edges = _dep4_lengths(width)
+    lens = torch.tensor(edges, dtype=torch.int32, device="cuda")
+    _fill(logits, edges, 4, 0, "ordinary")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        split_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+    for replay in range(3):
+        lengths = edges[replay + 1 :] + edges[: replay + 1]
+        _fill(logits, lengths, 4, replay, ("ordinary", "ties", "boundaries")[replay])
+        lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        output.fill_(-7)
+        aux_i.fill_(-7)
+        aux_l.fill_(float("nan"))
+        graph.replay()
+        _check(logits, lengths, output)
+
+
 @pytest.mark.parametrize("next_n,batch,width", [(1, 8, 65536), (4, 8, 65536), (4, 1, 1048584)])
 def test_split_radix_protection(next_n, batch, width):
     compiled = build_split(torch.cuda.current_device(), next_n=next_n)
@@ -179,6 +251,11 @@ def test_split_radix_rejects_invalid_inputs():
         lens.fill_(invalid)
         with pytest.raises(ValueError, match="seq_lens"):
             validate_split_radix_topk_lengths(logits, lens, next_n=4)
+    # 17 requests verify 68 rows, past the split kernel's 64 (dep4's graph batches 24 and 32).
+    logits, output, aux_i, aux_l = _buffers(17, 16384)
+    lens = torch.full((17,), 16384, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="at most 64 rows"):
+        split_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
 
 
 @pytest.mark.parametrize("length,seed", [(5, 0), (2049, 17), (65536, 42)])
