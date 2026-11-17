@@ -184,6 +184,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
@@ -307,6 +308,13 @@ _TOPK_DECODE_COLUMNS = (4096, 65536)
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
+# A generation step's query, absorbed query and owner's latent append on the main stream after
+# the indexer's keys, scoring and selection, instead of on the core's side stream beside them
+# (`DecodeTarget._attention`). Both orders run the same ops on the same inputs. The side stream
+# is used only where the engine enables multi-stream, its CUDA-graph warmup and capture
+# (`maybe_execute_in_parallel`). Set TRTLLM_MODELING_V2_SERIAL_INDEXER=1 in every rank's
+# environment at launch; off by default.
+_SERIAL_INDEXER = os.environ.get("TRTLLM_MODELING_V2_SERIAL_INDEXER", "0") == "1"
 # capacity: fixed: by attention-DP world size, the most gathered tokens one router / routing /
 # NVFP4-quantize / expert call takes, the token column those entries are certified to at that
 # world's expert window. At 4 ranks (32 local experts) the gathered set is up to
@@ -762,8 +770,8 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
-        """Derive what the weights fix, build the kernels, the shared expert's stream and the
-        communicator handle, then the targets.
+        """Derive what the weights fix, build the kernels, the side stream (the shared expert's,
+        and the decode attention's query half) and the communicator handle, then the targets.
 
         Named for the shell hook that drives it. Everything compiles here or on the first
         (eager) step: a first compile inside a CUDA-graph capture breaks the graph. The side
@@ -1569,6 +1577,13 @@ class DecodeTarget:
         self._layers = _layer_views(core)
         self._embed = core.w["embed"]
         self._norm0 = core.w["l0_attn_norm"]
+        # The attention block's query and latent half (`_attention`) runs beside the indexer on
+        # the core's side stream, the one the MoE block's shared expert (`_moe`) runs on; the
+        # events fork it from and join it to the main stream. Under `_SERIAL_INDEXER` there is
+        # no stream and it runs on the main stream.
+        self._latent_stream = None if _SERIAL_INDEXER else core._side_stream
+        self._latent_fork = torch.cuda.Event()
+        self._latent_join = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1810,41 +1825,59 @@ class DecodeTarget:
         )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
-        """One layer's attention block into `s.attn_out` (returned): the query with SSMax, the
-        indexer's selection, the absorbed query, the owner's rope and fp8_ds_mla append,
-        FlashMLA sparse decode over the pool, and the V up-projection of the kernel's live
-        heads, read in place."""
+        """One layer's attention block into `s.attn_out` (returned): the indexer's selection and
+        its pool slots; the query with SSMax, the absorbed query, the owner's rope and
+        fp8_ds_mla append; FlashMLA sparse decode over the pool, and the V up-projection of the
+        kernel's live heads, read in place.
+
+        Under CUDA-graph capture the query half runs on the side stream beside the selection.
+        The selection writes the indexer's key pool, `topk_buf` and, through the trtllm top-k,
+        the engine's radix arena; the query half writes `s.fused_q`, `s.nope_lat` and, on an
+        owner layer, its row of the latent pool. Neither reads what the other writes, and the
+        decode reads both after the join. A NoPE sharer appends nothing: its decode reads layer
+        35's rows, appended on the side stream and joined in layer 35. Each later use of the
+        side stream, the MoE block's shared expert and the next layer's query half, first waits
+        for the main stream past this join, so the two uses never overlap."""
         core = self.core
         rows = x.shape[0]
-        q = self._linear_fp8(x, L.wq, L.wq_s)
-        q3 = torch.reshape(q, [rows, core.heads, core.qk_dim])
         fq = s.fused_q[:, : core.heads]
-        if core.unfused_glue:
-            q3 = ssmax_scaling(q3, pos, L.ssmax_s, L.ssmax_b)
-            if L.rope:
-                fq[..., core.kv_lora :].copy_(q3[..., L.nope :])
-            else:
-                fq[..., core.kv_lora :].zero_()
-        else:
-            # SSMax in place; its rope half (a NoPE layer's zero) into the absorbed query's tail.
-            ssmax_scaling_fused_q(
-                q3, pos, L.ssmax_s, L.ssmax_b, q3, fq[..., core.kv_lora :], L.rope
-            )
-        if L.indexer is not None:
-            self._indexer(step, x, pos, L, topk_buf, skip_gen)
-        slots = convert_req_index_to_global(
-            req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
-            core._stride_factor, core._pool_row[L.kv_source],
-        )  # fmt: skip
-        bmm_out(
-            torch.transpose(q3[..., : L.nope], 0, 1), L.k_b,
-            torch.transpose(fq[..., : core.kv_lora], 0, 1),
-        )  # fmt: skip
-        if L.owner:
-            ds_mla_rope_append(
-                self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
-                step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
+
+        def select():
+            if L.indexer is not None:
+                self._indexer(step, x, pos, L, topk_buf, skip_gen)
+            return convert_req_index_to_global(
+                req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
+                core._stride_factor, core._pool_row[L.kv_source],
             )  # fmt: skip
+
+        def query():
+            q = self._linear_fp8(x, L.wq, L.wq_s)
+            q3 = torch.reshape(q, [rows, core.heads, core.qk_dim])
+            if core.unfused_glue:
+                q3 = ssmax_scaling(q3, pos, L.ssmax_s, L.ssmax_b)
+                if L.rope:
+                    fq[..., core.kv_lora :].copy_(q3[..., L.nope :])
+                else:
+                    fq[..., core.kv_lora :].zero_()
+            else:
+                # SSMax in place; its rope half (a NoPE layer's zero) into the absorbed query's
+                # tail.
+                ssmax_scaling_fused_q(
+                    q3, pos, L.ssmax_s, L.ssmax_b, q3, fq[..., core.kv_lora :], L.rope
+                )
+            bmm_out(
+                torch.transpose(q3[..., : L.nope], 0, 1), L.k_b,
+                torch.transpose(fq[..., : core.kv_lora], 0, 1),
+            )  # fmt: skip
+            if L.owner:
+                ds_mla_rope_append(
+                    self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
+                    step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
+                )  # fmt: skip
+
+        slots, _ = maybe_execute_in_parallel(
+            select, query, self._latent_fork, self._latent_join, self._latent_stream
+        )
         if core.unfused_glue:
             lat = flash_mla_sparse_decode(
                 s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out
