@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DSpark draft block's fused glue on SM107: its attention over the paged context window
 plus the query block, the latent and query rope tails, and the recurrent Markov head's
-per-step input, gate and biased-logit argmax. Each entry's `reference` is the torch chain the
-target ran before it."""
+per-step input, gate and biased-logit argmax, for the Mistral Large 4 targets' draft (tp4 and
+tp8 with their heads per rank, dep4 with all 64 on each rank's own requests). Each entry's
+`reference` is the torch chain it stands in for."""
 
 from __future__ import annotations
 
 import torch
 import triton
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
+from .._op import Arch, Cell, OpWrapper
 from . import _kernels
 
 #: The draft latent: 512 content dims and the 64-wide rope key, the MLA latent of the target.
@@ -59,10 +59,13 @@ class TritonDraftAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
     note = """
-    The window is a multiple of 16 * 64 keys; heads 16 (tp4) or 8 (tp8); the pool's last dim
-    contiguous. A masked key loads as zero, so pool rows past a sequence's length may hold any
-    bits, NaN included.
+    The window is a multiple of 16 * 64 keys; heads 16 (tp4), 8 (tp8) or 64 (dep4); the pool's
+    last dim contiguous. A masked key loads as zero, so pool rows past a sequence's length may
+    hold any bits, NaN included. The split counts were measured at 16 heads; at 64 heads a
+    sequence's 192 query rows take 12 CTAs of 16 rows per split, each reading the split's keys.
     """
+    #: A decode step's draft block: 3 query rows per sequence, up to 16 sequences a rank at
+    #: tp4/tp8 and up to 32 (the decode graph's largest batch) at dep4.
     CELLS = tuple(
         Cell(
             why=f"tp{tp} draft block of {batch} sequence(s), contexts {lengths}",
@@ -75,6 +78,18 @@ class TritonDraftAttention(OpWrapper):
             (4, 8, (2048,) * 8),
             (8, 1, (2047,)),
             (8, 16, tuple(range(1000, 33000, 2000))),
+        )
+    ) + tuple(
+        Cell(
+            why=f"dep4 draft block of {batch} sequence(s), 64 heads: {what}",
+            spec=dict(batch=batch, heads=64, block=3, window=2048, page=64, lengths=lengths),
+        )
+        for batch, what, lengths in (
+            (1, "one context of 17800", (17800,)),
+            (4, "the most at 32 splits, contexts at the window's edges", (2048, 2049, 300000, 1)),
+            (5, "the fewest at 8 splits", (1, 2047, 2048, 4096, 65536)),
+            (16, "contexts 1000 to 31000", tuple(range(1000, 33000, 2000))),
+            (32, "the largest decode graph batch", (1, 5, 300, 2047, 2048, 2049, 17800, 70000) * 4),
         )
     )
 
@@ -154,10 +169,10 @@ class TritonLatentTail(OpWrapper):
     so it can differ from flashinfer's by one bf16 ulp."""
 
     ARCHS = frozenset({Arch.SM_107})
-    #: The target calls it one layer at a time: a draft layer's tail with the query rope into a
+    #: The targets call it one layer at a time: a draft layer's tail with the query rope into a
     #: `[batch, block, 576]` buffer, or one of the 3 layers of the context features into its
-    #: slice of the `[rows, 3, 1, 576]` buffer, over a decode step's accepted tokens or a
-    #: prefill step.
+    #: slice of the `[rows, 3, 1, 576]` buffer, over a decode step's accepted tokens (up to 4 a
+    #: sequence) or a prefill step (up to max_num_tokens rows).
     CELLS = tuple(
         Cell(
             why=f"{what}: {rows} rows",
@@ -167,8 +182,11 @@ class TritonLatentTail(OpWrapper):
             ("tp4 draft layer, 1 sequence", 3, 16),
             ("tp4 draft layer, 16 sequences", 48, 16),
             ("tp8 draft layer, 4 sequences", 12, 8),
+            ("dep4 draft layer, 1 sequence", 3, 64),
+            ("dep4 draft layer, 32 sequences", 96, 64),
             ("context features layer, 1 sequence", 4, None),
             ("context features layer, 16 sequences", 64, None),
+            ("context features layer, 32 sequences", 128, None),
             ("context features layer, a 16384-token prefill step", 16384, None),
         )
     )
@@ -232,12 +250,13 @@ class TritonMarkovInput(OpWrapper):
     None (the chain's first step). Copies only, so bit-identical to the torch chain."""
 
     ARCHS = frozenset({Arch.SM_107})
+    #: One row per sequence: up to 16 a rank at tp4/tp8, 32 at dep4.
     CELLS = tuple(
         Cell(
             why=f"{batch} sequence(s), {'first' if first else 'later'} step",
             spec=dict(batch=batch, first=first),
         )
-        for batch in (1, 4, 16)
+        for batch in (1, 4, 16, 32)
         for first in (True, False)
     )
 
@@ -312,7 +331,7 @@ class TritonMarkovLogits(OpWrapper):
     ARCHS = frozenset({Arch.SM_107})
     CELLS = tuple(
         Cell(why=f"{batch} sequence(s) over the 204800 vocabulary", spec=dict(batch=batch))
-        for batch in (1, 4, 16)
+        for batch in (1, 4, 16, 32)
     )
 
     def __call__(self, base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

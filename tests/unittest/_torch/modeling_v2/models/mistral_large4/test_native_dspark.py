@@ -45,6 +45,24 @@ def modeling(request, target_sm):
     )
 
 
+#: A target's switches to its DSpark torch chains, where it keeps them: the fused entries they
+#: stand in for are SM107 Triton kernels at the checkpoint's widths, which these CPU cases' toy
+#: shapes cannot run.
+_TORCH_CHAIN_SWITCHES = (
+    "_UNFUSED_DRAFT_ATTENTION",
+    "_UNFUSED_DRAFT_ROPE",
+    "_UNFUSED_MARKOV",
+    "_UNFUSED_LOGITS_SOFTCAP",
+)
+
+
+def _torch_chains(modeling, monkeypatch):
+    """Select the target's DSpark torch chains for this test, where it has switches for them."""
+    for name in _TORCH_CHAIN_SWITCHES:
+        if hasattr(modeling, name):
+            monkeypatch.setattr(modeling, name, True)
+
+
 def _draft(modeling, core):
     spec = SimpleNamespace(
         _draft_model_config={"n_layers": 2, "ragged_attention": "4,4"},
@@ -213,6 +231,7 @@ def test_target_image_embeddings_preserve_worker_token_ids(
     )
     monkeypatch.setattr(modeling, "_image_rows", lambda *args: image_rows)
     monkeypatch.setattr(modeling, "tanh_softcap", lambda x, cap: cap * torch.tanh(x / cap))
+    _torch_chains(modeling, monkeypatch)
     family = modeling.__name__.split("__")[-1].split(".")[0].capitalize()
     target = getattr(modeling, f"ModelingV2MistralLarge4Nvfp4Sm{target_sm}{family}")
     result = target.forward(
@@ -262,6 +281,7 @@ def test_rnn_uses_hidden_and_resets_each_proposal(modeling, monkeypatch):
             "triton_markov_gate",
             "triton_markov_logits",
         )
+    _torch_chains(modeling, monkeypatch)
     # Rank-one head with explicit scalar equations: the candidate reads the
     # token and h0, the output reads the previous state, token and h1.
     weights = {
@@ -411,6 +431,7 @@ def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypa
         lambda x: torch.nn.functional.silu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
     )
     monkeypatch.setattr(modeling, "flashinfer_rmsnorm", norm)
+    _torch_chains(modeling, monkeypatch)
     if hasattr(modeling, "cute_dsl_allreduce_add_rmsnorm"):
 
         def add_norm(partial, residual, weight, out, workspace):

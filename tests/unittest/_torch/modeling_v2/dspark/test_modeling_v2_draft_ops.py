@@ -1,18 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the sm_107 tp4 target's DSpark draft ops: every entry's cells against its own
-reference, CUDA graph replay on changing inputs, and the edges each entry's docstring states."""
+"""GPU tests for the DSpark draft entries the sm_107 Mistral Large 4 targets share (tp4/tp8 with
+their heads per rank, dep4 with all 64): every entry's cells against its own reference, CUDA
+graph replay on changing inputs, and the edges each entry's docstring states."""
 
 from contextlib import contextmanager
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.dspark import (  # noqa: E501
-    draft_ops,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark import draft_ops
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
@@ -162,10 +161,11 @@ def _fp32_reduced_bf16_matmul():
 
 
 def _check_attention(out: torch.Tensor, args) -> None:
-    """Measured on VR200 over the cells, 3 draws each: within 1.98 ulp element-wise of the
-    reference and 0.74 ulp of relative RMS, gated at 4 and 1.5. Both round the scores to bf16
-    first, which is most of their distance from float64; the op's relative RMS from float64
-    was 0.84 to 1.04 times the reference's, gated at 1.1."""
+    """Measured on VR200 over the tp4 and tp8 cells, 3 draws each: within 1.98 ulp element-wise
+    of the reference and 0.74 ulp of relative RMS, gated at 4 and 1.5; the dep4 cells, whose
+    rows are computed the same way at 64 heads, are held to the same gates. Both round the
+    scores to bf16 first, which is most of their distance from float64; the op's relative RMS
+    from float64 was 0.84 to 1.04 times the reference's, gated at 1.1."""
     with _fp32_reduced_bf16_matmul():
         ref = attention.reference(*args)
     assert not out.isnan().any()
@@ -184,11 +184,15 @@ def test_draft_attention_cells(cell, draw, certifying) -> None:  # noqa: F811
     _check_attention(attention(*args), args)
 
 
-def test_draft_attention_graph_replay_as_contexts_grow() -> None:
+@pytest.mark.parametrize(
+    "heads, batch", [(16, 4), (64, 32)], ids=["tp4, 4 sequences", "dep4, 32 sequences"]
+)
+def test_draft_attention_graph_replay_as_contexts_grow(heads, batch) -> None:
     """One captured call replayed as a decode step replays it: the context grows by each
-    step's accepted tokens and the block's query and keys are new. The first sequence starts
+    step's accepted tokens and the block's query and keys are new. Every fourth sequence starts
     one key short of the window, so its replays cross the point where masking stops."""
-    spec = dict(batch=4, heads=16, block=3, window=2048, page=64, lengths=(2047, 5, 4096, 70000))
+    lengths = (2047, 5, 4096, 70000) * (batch // 4)
+    spec = dict(batch=batch, heads=heads, block=3, window=2048, page=64, lengths=lengths)
     gen = _gen(7)
     ctx = _Context(spec, 7)
     args = _attention_args(ctx, spec, gen)
@@ -246,9 +250,10 @@ class _LatentTail:
     def check(self, buffer: torch.Tensor, query: torch.Tensor | None, before) -> None:
         """The rope is bitwise; the RMSNorm within one bf16 ulp of the fp32 reference, which is
         up to 2 of the row-maximum units `assert_within_ulp` counts, and 1/4 ulp in RMS.
-        Measured on VR200, 6 draws a cell: no element differed at decode sizes and 15 to 28 of
-        8.4M by 1 ulp in the prefill cell (1.42 units, 0.003 in RMS); 3460 of 1.1e9 in the
-        served model. Nothing else in the buffer or the query moves."""
+        Measured on VR200 over the tp4 and tp8 cells, 6 draws a cell: no element differed at
+        decode sizes and 15 to 28 of 8.4M by 1 ulp in the prefill cell (1.42 units, 0.003 in
+        RMS); 3460 of 1.1e9 in the served model. Nothing else in the buffer or the query
+        moves."""
         expected_buffer, expected_query = before[0].clone(), None
         if self.with_q:
             expected_query = before[1].clone()
@@ -279,9 +284,12 @@ def test_latent_tail_cells(cell, draw, certifying) -> None:  # noqa: F811
     case.check(case.buffer, query, before)
 
 
+@pytest.mark.parametrize(
+    "rows, heads", [(12, 16), (96, 64)], ids=["tp4, 4 sequences", "dep4, 32 sequences"]
+)
 @pytest.mark.parametrize("with_q", [True, False], ids=["draft layer", "context features"])
-def test_latent_tail_graph_replay(with_q) -> None:
-    spec = dict(rows=12, heads=16, with_q=with_q)
+def test_latent_tail_graph_replay(with_q, rows, heads) -> None:
+    spec = dict(rows=rows, heads=heads, with_q=with_q)
     table = _rope_table()
     case = _LatentTail(spec, 3, table)
     query = case.query if with_q else None
@@ -388,10 +396,10 @@ def test_markov_logits_argmax_untied_and_last_column() -> None:
     assert torch.equal(tokens, torch.argmax(base[:, 0] + bias, dim=-1))
 
 
-def test_markov_chain_graph_replay() -> None:
+@pytest.mark.parametrize("batch", [4, 32])
+def test_markov_chain_graph_replay(batch) -> None:
     """One recurrent step captured whole, replayed on fresh inputs: the input, the gate and the
     logits all match the torch chain bitwise."""
-    batch = 4
     previous, embedding, state, hidden, joint = _markov_step(batch, False, 21)
     base, bias = _logits_inputs(batch, 22)
     refined = torch.empty_like(base)

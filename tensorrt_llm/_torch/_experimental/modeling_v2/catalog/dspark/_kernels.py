@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Triton kernels of this target's post-target step: the DSpark draft block's attention, its
-latent and query rope tails, the recurrent Markov head's per-step glue, and the vocabulary
-gather of the soft-capped logits.
+"""Triton kernels of the DSpark draft entries (`draft_ops`): the draft block's attention, its
+latent and query rope tails, and the recurrent Markov head's per-step glue.
 
-Every kernel is launched with `enable_fp_fusion=False`: the elementwise chains they replace
-round each torch op to its dtype, and a contracted multiply-add would skip one of those
-roundings.
+The attention's partial kernel, the latent tail and the Markov gate are launched with
+`enable_fp_fusion=False`: the elementwise chains they replace round each torch op to its dtype,
+and a contracted multiply-add would skip one of those roundings.
 """
 
 from __future__ import annotations
@@ -292,47 +291,3 @@ def argmax_finish_kernel(
     best = tl.max(m, axis=0)
     first = tl.min(tl.where((m == best) & mask, idx, 2147483647), axis=0)
     tl.store(out_ptr + b, first.to(tl.int64))
-
-
-@triton.jit
-def _mul_rn(a, b):
-    """fp32 product rounded to nearest with subnormals kept, as the torch kernels compute it."""
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1
-    )
-
-
-@triton.jit
-def scatter_shard_kernel(
-    src_ptr, src_s_row, peers_ptr, rank, rows_cap, shard, WORLD: tl.constexpr, BLOCK_V: tl.constexpr
-):
-    """Write this rank's bf16 vocabulary shard of row `r` into block `rank` of every rank's
-    `[world, rows_cap, shard]` symmetric slot, its own included: NVLink stores, no reads."""
-    r = tl.program_id(0).to(tl.int64)
-    chunk = tl.program_id(1)
-    v = chunk * BLOCK_V + tl.arange(0, BLOCK_V)
-    mask = v < shard
-    x = tl.load(src_ptr + r * src_s_row + v, mask=mask)
-    offset = (rank * rows_cap + r) * shard + v
-    for peer in tl.static_range(WORLD):
-        dst = tl.load(peers_ptr + peer).to(tl.pointer_type(tl.bfloat16))
-        tl.store(dst + offset, x, mask=mask)
-
-
-@triton.jit
-def softcap_gather_kernel(
-    buf_ptr, rows_cap, shard, out_ptr, out_s_row, inv_cap, cap, BLOCK_V: tl.constexpr
-):
-    """`out[r, p * shard + v] = cap * tanh(float(shard_p[r, v]) * inv_cap)` from this rank's own
-    slot, which every rank's scatter has filled. `x * inv_cap` is the torch division by a Python
-    float; tanh is libdevice's `tanhf`, which Triton links flushing subnormals, so a subnormal
-    argument (where tanhf is the identity) bypasses it."""
-    r = tl.program_id(0).to(tl.int64)
-    peer = tl.program_id(1)
-    chunk = tl.program_id(2)
-    v = chunk * BLOCK_V + tl.arange(0, BLOCK_V)
-    mask = v < shard
-    x = tl.load(buf_ptr + (peer * rows_cap + r) * shard + v, mask=mask, other=0.0)
-    y = _mul_rn(x.to(tl.float32), inv_cap)
-    t = tl.where(tl.abs(y) < 1.1754943508222875e-38, y, libdevice.tanh(y))
-    tl.store(out_ptr + r * out_s_row + peer * shard + v, _mul_rn(t, cap), mask=mask)

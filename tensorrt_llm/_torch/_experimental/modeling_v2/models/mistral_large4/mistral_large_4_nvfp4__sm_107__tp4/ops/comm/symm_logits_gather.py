@@ -19,8 +19,9 @@ import torch
 import triton
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation import _widen_softcap_kernel
 
-from ..dspark import _kernels
+from . import _symm_logits_gather_kernel
 
 #: Vocabulary columns per CTA of the scatter and of the soft-capped read.
 _BLOCK_V = 4096
@@ -92,14 +93,14 @@ class SymmLogitsGatherSoftcap(OpWrapper):
     ) -> torch.Tensor:
         rows, shard = local.shape
         chunks = triton.cdiv(shard, _BLOCK_V)
-        _kernels.scatter_shard_kernel[(rows, chunks)](
+        _symm_logits_gather_kernel.scatter_shard_kernel[(rows, chunks)](
             local, local.stride(0), workspace.peer_slots[slot], workspace.rank, workspace.rows,
             shard, WORLD=workspace.world, BLOCK_V=_BLOCK_V, num_warps=4,
         )  # fmt: skip
         workspace.handle.barrier(channel=0)
         out = local.new_empty((rows, workspace.world * shard), dtype=torch.float32)
         inv_cap = float(np.float32(1.0) / np.float32(cap))
-        _kernels.softcap_gather_kernel[(rows, workspace.world, chunks)](
+        _widen_softcap_kernel.softcap_gather_kernel[(rows, workspace.world, chunks)](
             workspace.buffer[slot], workspace.rows, shard, out, out.stride(0), inv_cap,
             float(cap), BLOCK_V=_BLOCK_V, num_warps=4, enable_fp_fusion=False,
         )  # fmt: skip

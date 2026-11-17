@@ -165,6 +165,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allreduce_add_rmsnorm import (
     cute_dsl_allreduce_add_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
+    triton_draft_attention,
+    triton_latent_tail,
+    triton_markov_gate,
+    triton_markov_input,
+    triton_markov_logits,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
     cute_dsl_fp8_block_scale_linear,
@@ -218,13 +225,6 @@ from .ops.comm.moe_tail_allreduce import (
 )
 from .ops.comm.symm_logits_gather import build_workspace as build_logits_gather
 from .ops.comm.symm_logits_gather import symm_logits_gather_softcap
-from .ops.dspark.draft_ops import (
-    triton_draft_attention,
-    triton_latent_tail,
-    triton_markov_gate,
-    triton_markov_input,
-    triton_markov_logits,
-)
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
 
