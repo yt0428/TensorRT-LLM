@@ -10,11 +10,14 @@ rows on its path: the workspace group's KV gathered, dequantized, into the held 
 first rows (`ds_mla_dequant_gather_tiled`) for FlashMLA's bf16 sparse prefill; the decode
 group's rows as one-row sequences of FlashMLA's sparse fp8 decode over the pool, in sub-batches
 of at most `_CTX_DECODE_ROWS`. Layer 35's rows are kept beside the step's only when the step is
-one workspace group whose KV fits twice; otherwise every sharer gathers them again.
+one workspace group whose KV fits twice; otherwise every sharer gathers them again. A step of
+context rows alone that is one workspace group returns the prefill kernel's own output, which
+the V up-projection reads in place of the latent scratch (`own_out`).
 
 Host only, with stand-ins for the kernels: the groups, their rows, request and position per
 workspace row, offsets, kept rows and sub-batches over a 40-row held workspace, and which
-kernel each group's rows reach, with which slices.
+kernel each group's rows reach, with which slices, and which steps return the kernel's own
+output.
 
 On one sm_107 GPU, over a 63-owner fp8_ds_mla pool (every byte 0xFF, a NaN in every field, but
 the owner rows of layers 1, 35 and 36), queries at all 64 heads and selections shaped like the
@@ -30,7 +33,10 @@ that order on one step's groups:
 * the step agrees within relative L2 1e-3 with the sparse decode over all of its context rows,
   the target's computation for a step past the held rows before it grouped requests;
 * sampled rows are within relative L2 1e-2 of an fp32 softmax over the selected keys read
-  straight from the pool.
+  straight from the pool;
+
+and on a step that is one workspace group, the kernel's own output and the copy of it the step
+makes with a generation row behind it are bitwise the same, as are their V up-projections.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_s
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flash_mla_sparse_prefill import (  # noqa: E501
     flash_mla_sparse_prefill,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4 import (  # noqa: E501
     modeling as M,
 )
@@ -97,6 +104,7 @@ def _host_step(contexts) -> dict:
     return dict(
         num_contexts=len(contexts),
         num_ctx_tokens=sum(new),
+        num_tokens=sum(new),
         ctx_cached_tokens=sum(c for c, _ in contexts),
         cu_ctx_kv=_cumsum(kv),
         host_cu_ctx_new=_cumsum(new).tolist(),
@@ -177,6 +185,7 @@ def test_groups_by_request_kv(contexts, expected):
     starts = _cumsum(kv).tolist()
     new_starts = _cumsum([n for _, n in contexts]).tolist()
     assert [g.rows for g in ctx.groups] == [rows for rows, _, _ in expected]
+    assert ctx.own_out is (len(expected) == 1 and expected[0][1] != "decode")
     sizes = set()
     for g, (rows, kind, shape) in zip(ctx.groups, expected):
         if kind == "decode":
@@ -292,6 +301,38 @@ def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
     decodes = [c for c in calls if c[0] == "decode"]
     assert [_rows_of(c[1], q) for c in decodes] == [(5, 8197), (8197, 16389), (16389, 20005)]
     assert [c[2] for c in decodes] == [ctx.sched[8192], ctx.sched[8192], ctx.sched[3616]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("gen_rows, own", [(0, True), (2, False)], ids=["ctx_alone", "gen_behind"])
+def test_one_group_alone_returns_the_kernel_output(monkeypatch, gen_rows, own):
+    """A step that is one workspace group (16 KV rows over 40): with its context rows alone the
+    prefill writes no latent scratch and its own output is returned for the V up-projection;
+    with generation rows behind them the prefill writes the scratch's context rows, which are
+    returned."""
+    prefills = []
+    kernel_out = torch.empty(9, 1)
+
+    def prefill(q, ws, idx, scale, out):
+        prefills.append(out)
+        return kernel_out if out is None else out
+
+    monkeypatch.setattr(M, "ds_mla_dequant_gather_tiled", lambda *args: args[-1])
+    monkeypatch.setattr(M, "flash_mla_sparse_prefill", prefill)
+    target = _target(40)
+    step = _host_step([(7, 3), (0, 6)])
+    step["num_tokens"] += gen_rows
+    ctx = target._ctx_workspace(step, 9, torch.device("cpu"))
+    assert ctx.own_out is own
+    lat_out = torch.empty(9, 1)
+    L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
+    req_idx = torch.tensor([0] * 3 + [1] * 6, dtype=torch.int32)
+    sel = torch.zeros(9, 4, dtype=torch.int32)
+    got = target._attn_ctx(step, L, torch.empty(9, 1), lat_out, req_idx, sel, ctx)
+    if own:
+        assert prefills == [None] and got is kernel_out
+    else:
+        assert _rows_of(prefills[0], lat_out) == (0, 9) and got is lat_out
 
 
 # ---- one GPU: the groups' numerics ----
@@ -449,9 +490,12 @@ def _check_step(env, contexts, expected_groups, seed: int) -> tuple[SimpleNamesp
     rows = torch.tensor(sorted(set(sampled) | set(edges)), device=env.dev)
     for layer in _RUN:
         src = _SOURCES[layer]
-        out = torch.full((s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev)
+        scratch = torch.full(
+            (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
+        )
         L = SimpleNamespace(kv_source=src, indexer=None if layer == 39 else object())
-        target._attn_ctx(s.step, L, s.q, out, s.req_idx, s.topk, ctx)
+        out = target._attn_ctx(s.step, L, s.q, scratch, s.req_idx, s.topk, ctx)
+        assert out is scratch or ctx.own_out
         assert bool(torch.isfinite(out).all()), f"layer {layer}: a row read an unwritten byte"
         for g in ctx.groups:
             q0, q1 = g.rows
@@ -537,3 +581,44 @@ def test_decode_group_of_two_sub_batches(env):
         seed=5,
     )
     assert ctx.groups[1].sub_batches == [(0, _SUB), (_SUB, 9000)]
+
+
+def test_kernel_output_feeds_the_v_projection_bitwise(env):
+    """One workspace group (1000 + 500 and 500 + 500 KV rows), with its context rows alone and
+    with a generation row behind them: the prefill kernel's own output the first returns and
+    the latent scratch the second writes are bitwise the same on every layer run, and so are
+    the V up-projections `bmm_out` makes of them with the target's transposed weight view."""
+    s = _step(env, [(1000, 500), (500, 500)], seed=6)
+    g = torch.Generator(device=env.dev).manual_seed(_SEED + 6)
+    v_b_t = torch.transpose(
+        (torch.randn(_HEADS, 128, _NOPE, generator=g, device=env.dev) * 0.05).to(torch.bfloat16),
+        1,
+        2,
+    )
+    runs = []
+    for gen_rows in (0, 1):
+        step = dict(s.step, num_tokens=s.tc + gen_rows)
+        target = _target(_HELD)
+        ctx = target._ctx_workspace(step, s.tc, env.dev)
+        assert ctx.own_out is (gen_rows == 0)
+        scratch = torch.full(
+            (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
+        )
+        per_layer = []
+        for layer in _RUN:
+            L = SimpleNamespace(
+                kv_source=_SOURCES[layer], indexer=None if layer == 39 else object()
+            )
+            lat = target._attn_ctx(step, L, s.q, scratch, s.req_idx, s.topk, ctx)
+            assert (lat is scratch) is (gen_rows == 1)
+            attn = torch.empty(s.tc, _HEADS * 128, dtype=torch.bfloat16, device=env.dev)
+            bmm_out(
+                torch.transpose(lat, 0, 1),
+                v_b_t,
+                torch.transpose(attn.view(s.tc, _HEADS, 128), 0, 1),
+            )
+            per_layer.append((lat.clone(), attn))
+        runs.append(per_layer)
+    for layer, (own, copied) in zip(_RUN, zip(*runs)):
+        assert torch.equal(own[0].view(torch.int16), copied[0].view(torch.int16)), layer
+        assert torch.equal(own[1].view(torch.int16), copied[1].view(torch.int16)), layer

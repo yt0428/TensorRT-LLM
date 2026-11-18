@@ -1298,7 +1298,10 @@ class PrefillTarget:
 
     def _attn_ctx(self, step, L, fused_q, lat_out, req_idx, topk_buf, ctx):
         """Sparse MLA over the context rows into `lat_out`, group by group (`ctx.groups`), each
-        group's rows on its own path (`_ctx_workspace`).
+        group's rows on its own path (`_ctx_workspace`). Returns the context rows' latent
+        output: `lat_out`, or on a step of context rows alone that is one workspace group
+        (`ctx.own_out`) the prefill kernel's own output, which the V up-projection reads in
+        its place instead of a copy into `lat_out`.
 
         Workspace group: FlashMLA's bf16 sparse prefill over its requests' latent rows of the
         source layer, dequantized out of the pool (this step's rows included, so every row is
@@ -1344,7 +1347,10 @@ class PrefillTarget:
                 # Request-local selections to workspace rows: each request's run starts at its
                 # KV offset in the group.
                 g.idx = torch.where(sel >= 0, sel + g.ws_off[req_idx[q0:q1]][:, None], sel)
+            if ctx.own_out:
+                return flash_mla_sparse_prefill(fused_q, ws, g.idx, core.softmax_scale, None)
             flash_mla_sparse_prefill(fused_q[q0:q1], ws, g.idx, core.softmax_scale, lat_out[q0:q1])
+        return lat_out
 
     def _attn_gen(self, step, L, fused_q, lat_out, slots, sched):
         """Sparse MLA over the generation rows behind the context rows into `lat_out`: FlashMLA's
@@ -1523,7 +1529,9 @@ class PrefillTarget:
         selections offset by it (`idx`, `_attn_ctx`). A run of requests each past the held
         rows is a decode group, with no workspace: its rows' sub-batches of at most
         `_CTX_DECODE_ROWS`, on one FlashMLA scheduler per sub-batch size (`sched`), filled by
-        its first call and shared by the step's layers."""
+        its first call and shared by the step's layers. A step of context rows alone that is
+        one workspace group takes the prefill kernel's own output as its latent output
+        (`own_out`, `_attn_ctx`)."""
         if self._ws_buf is None:
             # On the first context step: the KV-capacity estimate's profiling forward is one,
             # so the peak it measures, which sizes the pool, holds this buffer.
@@ -1594,7 +1602,11 @@ class PrefillTarget:
                 for g in groups
             )
         )
-        return SimpleNamespace(groups=groups, sched={rows: get_mla_metadata()[0] for rows in sizes})
+        return SimpleNamespace(
+            groups=groups,
+            sched={rows: get_mla_metadata()[0] for rows in sizes},
+            own_out=len(groups) == 1 and groups[0].ws_buf is not None and step["num_tokens"] == tc,
+        )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, ctx, tc, skip_ctx, skip_gen):
         """One layer's attention block, both phases, into `s.attn_out` (returned): the query
@@ -1630,8 +1642,13 @@ class PrefillTarget:
                 self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
                 step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
             )  # fmt: skip
+        lat_out = s.lat_out
         if tc:
-            self._attn_ctx(step, L, s.fused_q[:tc], s.lat_out[:tc], req_idx, topk_buf, ctx)
+            lat_ctx = self._attn_ctx(
+                step, L, s.fused_q[:tc], s.lat_out[:tc], req_idx, topk_buf, ctx
+            )
+            if ctx.own_out:
+                lat_out = lat_ctx
         if rows > tc:
             slots = convert_req_index_to_global(
                 req_idx[tc:], step["block_table"], topk_buf[tc:], step["tokens_per_block"],
@@ -1639,7 +1656,7 @@ class PrefillTarget:
             )  # fmt: skip
             self._attn_gen(step, L, s.fused_q[tc:], s.lat_out[tc:], slots, s.sched)
         bmm_out(
-            torch.transpose(s.lat_out, 0, 1),
+            torch.transpose(lat_out, 0, 1),
             L.v_b_t,
             torch.transpose(torch.reshape(s.attn_out, [rows, core.heads, core.v_dim]), 0, 1),
         )
