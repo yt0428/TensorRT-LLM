@@ -66,6 +66,18 @@ _FUSED_OPTIONS = dict(
 TWOSHOT_ABOVE = 3072
 
 
+def _rendezvous_env_describes(rank: int, world: int) -> bool:
+    """Whether the environment's rendezvous address is this group's: all four variables set,
+    `RANK` this rank, `WORLD_SIZE` this group's size and `MASTER_PORT` a port number."""
+    if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+        return False
+    try:
+        int(os.environ["MASTER_PORT"])
+        return int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world
+    except ValueError:
+        return False
+
+
 def ensure_process_group(rank: int, world: int) -> bool:
     """Bring up `torch.distributed` for this rank if nothing has yet; True if this call did.
 
@@ -75,13 +87,18 @@ def ensure_process_group(rank: int, world: int) -> bool:
 
     * A group is already up (the engine brought one up, or a test launcher
       did): it has to be this rank in a group of `world`, and is used as is.
-    * The rendezvous address is in the environment (`MASTER_ADDR`,
-      `MASTER_PORT`, `RANK`, `WORLD_SIZE`): the group comes up from it.
-      MPI is not touched.
+    * The rendezvous address in the environment describes this group
+      (`MASTER_ADDR`, `MASTER_PORT`, `RANK` this rank, `WORLD_SIZE` this
+      group's size): the group comes up from it. MPI is not touched.
     * Otherwise (the engine under MPI): rank 0 draws a free port and the
-      address is broadcast over `MPI.COMM_WORLD`, as TRT-LLM's MegaMoE path
-      does. Only this case needs MPI, so only it checks that `COMM_WORLD` is
-      the TP group.
+      address is broadcast over the engine's MPI communicator,
+      `tensorrt_llm._utils.mpi_comm()`, as TRT-LLM's MegaMoE path does over
+      its world. That communicator is `MPI.COMM_WORLD`, or this server's part
+      of it when one MPI world holds several (a disaggregated launch's context
+      and generation servers each `set_mpi_comm` their own), and a launcher's
+      `RANK` / `WORLD_SIZE` then describe the whole world, not this group.
+      Only this case needs MPI, so only it checks that the communicator is the
+      group.
     """
     import torch.distributed as dist
 
@@ -91,11 +108,14 @@ def ensure_process_group(rank: int, world: int) -> bool:
             f"the collective was built for rank {rank} of {world}"
         )
         return False
-    if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
-        from mpi4py import MPI
+    if not _rendezvous_env_describes(rank, world):
+        from tensorrt_llm._utils import mpi_comm
 
-        comm = MPI.COMM_WORLD
-        assert comm.Get_size() == world and comm.Get_rank() == rank, (comm.Get_size(), world)
+        comm = mpi_comm()
+        assert comm.Get_size() == world and comm.Get_rank() == rank, (
+            f"the engine's MPI communicator is rank {comm.Get_rank()} of {comm.Get_size()}; "
+            f"the collective was built for rank {rank} of {world}"
+        )
         addr = None
         if rank == 0:
             import socket

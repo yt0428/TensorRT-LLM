@@ -6,9 +6,9 @@
 
 Every rank runs under MPI, as a dep4 or dep8 engine's ranks do: the NCCL entries on the
 MPI-session communicator, the one-shot entries on a `MoeCommWorkspace` whose process group
-comes up from rank 0's address broadcast over `MPI.COMM_WORLD`. Every rank regenerates every
-rank's inputs from a shared seed, so each reference is arithmetic rather than a second
-collective.
+comes up from rank 0's address broadcast over the MPI communicator (`MPI.COMM_WORLD` here).
+Every rank regenerates every rank's inputs from a shared seed, so each reference is arithmetic
+rather than a second collective.
 
 - the one-shot entries, bitwise against their references (the combine's norm output within
   one bf16 ulp: the reference's norm is fp64), eager at every cell's counts, ragged counts
