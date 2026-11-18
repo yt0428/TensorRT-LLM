@@ -168,6 +168,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.layer_norm_fp8_block_scale_linear import (
+    layer_norm_fp8_block_scale_linear,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
@@ -1710,8 +1713,11 @@ class DecodeTarget:
         )  # fmt: skip
         if skip_gen:
             return
-        qn = layer_norm(x, ix.q_norm_w, ix.q_norm_b, core.idx_eps)
-        q = torch.reshape(self._linear_fp8(qn, ix.wq_b, ix.wq_b_s), [rows, core.idx_heads, -1])
+        # q_input_norm and wq_b's activation quantization in one launch, then the FP8 GEMM.
+        q = layer_norm_fp8_block_scale_linear(
+            x, ix.q_norm_w, ix.q_norm_b, core.idx_eps, ix.wq_b, ix.wq_b_s
+        )
+        q = torch.reshape(q, [rows, core.idx_heads, -1])
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         weights = torch.empty([rows, core.idx_heads], dtype=torch.float32, device=x.device)
         if core.unfused_glue:
