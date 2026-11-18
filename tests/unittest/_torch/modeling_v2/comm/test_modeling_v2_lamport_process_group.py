@@ -58,7 +58,7 @@ def test_mpi_root_broadcasts_routable_address_for_loopback_hostname(monkeypatch,
         ),
     )
 
-    _lamport.ensure_process_group(rank=0, world=8)
+    assert _lamport.ensure_process_group(rank=0, world=8) is True
 
     listener.bind.assert_called_once_with(("", 0))
     route.connect.assert_called_once_with(("10.255.255.255", 1))
@@ -82,7 +82,7 @@ def test_explicit_rendezvous_environment_skips_discovery(monkeypatch, process_gr
     discover = Mock(side_effect=AssertionError("Explicit rendezvous must not discover an address"))
     monkeypatch.setattr(native_utils, "get_local_ip", discover)
 
-    _lamport.ensure_process_group(rank=3, world=8)
+    assert _lamport.ensure_process_group(rank=3, world=8) is True
 
     discover.assert_not_called()
     assert os.environ["MASTER_ADDR"] == "explicit-master.example"
@@ -99,7 +99,7 @@ def test_mpi_nonroot_uses_broadcast_address(monkeypatch, process_group):
     open_socket = Mock(side_effect=AssertionError("Only rank zero chooses the rendezvous port"))
     monkeypatch.setattr(socket, "socket", open_socket)
 
-    _lamport.ensure_process_group(rank=5, world=8)
+    assert _lamport.ensure_process_group(rank=5, world=8) is True
 
     discover.assert_not_called()
     open_socket.assert_not_called()
@@ -109,3 +109,16 @@ def test_mpi_nonroot_uses_broadcast_address(monkeypatch, process_group):
     process_group.assert_called_once_with(
         backend="nccl", rank=5, world_size=8, device_id=torch.device("cuda", 2)
     )
+
+
+def test_existing_group_is_used_as_is(monkeypatch):
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(dist, "get_rank", lambda: 6)
+    initialize = Mock(side_effect=AssertionError("An existing group must not be replaced"))
+    monkeypatch.setattr(dist, "init_process_group", initialize)
+    monkeypatch.setitem(sys.modules, "mpi4py", None)
+
+    assert _lamport.ensure_process_group(rank=6, world=8) is False
+
+    initialize.assert_not_called()

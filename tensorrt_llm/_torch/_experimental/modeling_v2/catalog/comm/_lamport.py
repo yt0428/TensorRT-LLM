@@ -66,8 +66,8 @@ _FUSED_OPTIONS = dict(
 TWOSHOT_ABOVE = 3072
 
 
-def ensure_process_group(rank: int, world: int) -> None:
-    """Bring up `torch.distributed` for this rank if nothing has yet.
+def ensure_process_group(rank: int, world: int) -> bool:
+    """Bring up `torch.distributed` for this rank if nothing has yet; True if this call did.
 
     `symm_mem.rendezvous` needs a process group. The engine's ranks are
     MPI-spawned and TRT-LLM's collectives use their own transport, so there may
@@ -90,7 +90,7 @@ def ensure_process_group(rank: int, world: int) -> None:
             f"the process group is rank {dist.get_rank()} of {dist.get_world_size()}; "
             f"the collective was built for rank {rank} of {world}"
         )
-        return
+        return False
     if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
         from mpi4py import MPI
 
@@ -115,6 +115,7 @@ def ensure_process_group(rank: int, world: int) -> None:
         world_size=world,
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
+    return True
 
 
 @dataclass(frozen=True)
@@ -309,11 +310,19 @@ def build_moe_comm_workspace(hidden: int, max_rows: int, rank: int, world: int) 
     any graph capture. Allocates `3 * world * max_rows * hidden` bf16 of symmetric memory per
     rank and compiles nothing (the kernels are Triton, compiled on their first launch). Returns
     once every rank's slots hold the sentinel, so no rank's first row lands on unfilled memory.
+
+    A group this call brought up (`ensure_process_group`) is torn down before it returns, and
+    the rendezvous address it set is taken back out of the environment: nothing after the
+    rendezvous uses the group (the kernels reach the peers through `peers` and synchronize
+    in-band), and left up, its NCCL watchdog polls rank 0's store until the process exits, so
+    a rank on another node that outlives rank 0 at shutdown logs the lost store. A group that
+    was already up is left as it is.
     """
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
 
-    ensure_process_group(rank, world)
+    address = {key: os.environ.get(key) for key in ("MASTER_ADDR", "MASTER_PORT")}
+    created = ensure_process_group(rank, world)
     dev = torch.device("cuda", torch.cuda.current_device())
     buffer = symm_mem.empty(
         (_PING_PONG, world, max_rows * hidden), dtype=torch.bfloat16, device=dev
@@ -329,6 +338,13 @@ def build_moe_comm_workspace(hidden: int, max_rows: int, rank: int, world: int) 
     state = torch.zeros(2, dtype=torch.int32, device=dev)
     torch.cuda.synchronize(dev)
     dist.barrier(group=group, device_ids=[dev.index])
+    if created:
+        dist.destroy_process_group()
+        for key, value in address.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return MoeCommWorkspace(
         hidden=hidden,
         max_rows=max_rows,
