@@ -228,7 +228,12 @@ def _recorded(monkeypatch) -> list:
     def decode(q, kv, slot, sched, scale, out):
         calls.append(("decode", q, sched, out))
 
+    def offset(req, sel, ws_off, out):
+        calls.append(("offset", req.tolist(), out))
+        return out.copy_(torch.where(sel >= 0, sel + ws_off[req.long()][:, None], sel))
+
     monkeypatch.setattr(M, "ds_mla_dequant_gather_tiled", gather)
+    monkeypatch.setattr(M, "convert_req_index_to_workspace", offset)
     monkeypatch.setattr(M, "flash_mla_sparse_prefill", prefill)
     monkeypatch.setattr(M, "convert_req_index_to_global", slots)
     monkeypatch.setattr(M, "flash_mla_sparse_decode", decode)
@@ -241,8 +246,9 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
     the first two (rows 0..7), a decode group (7..17) and a workspace group (17..22). Layer 35,
     then 39 (its sharer, selecting nothing): each workspace group gathers its own requests into
     the held rows and attends its rows over them, the two-request group's selections offset by
-    10 for its second request once and reused by 39; the decode group's rows become slots and
-    attend in one sub-batch; and 39 gathers layer 35 again, the step keeping no rows."""
+    10 for its second request once, into a buffer 39 reads again; the decode group's rows
+    become slots and attend in one sub-batch; and 39 gathers layer 35 again, the step keeping
+    no rows."""
     calls = _recorded(monkeypatch)
     pool_row = _OWNERS.index(_SHARED)
     target = _target(40)
@@ -257,6 +263,9 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
     for layer, selects in ((_SHARED, True), (39, False)):
         L = SimpleNamespace(kv_source=_SOURCES[layer], indexer=object() if selects else None)
         target._attn_ctx(step, L, q, out, req_idx, sel, ctx)
+    offsets = [c for c in calls if c[0] == "offset"]
+    assert len(offsets) == 1 and offsets[0][1] == [0] * 5 + [1] * 2
+    calls = [c for c in calls if c[0] != "offset"]
     assert len(calls) == 12
     first = None
     for i, layer in enumerate((_SHARED, 39)):
@@ -268,8 +277,9 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
         assert prefill0[3].tolist() == [[0, 1, -1, 2]] * 5 + [[10, 11, -1, 12]] * 2
         if first is None:
             first = prefill0[3]
+            assert first is offsets[0][2]
         else:
-            assert prefill0[3] is first, f"layer {layer} offset the selections again"
+            assert prefill0[3] is first, f"layer {layer} read another buffer"
         assert slots == ("slots", pool_row, [2] * 10)
         assert decode[0] == "decode" and decode[2] is ctx.sched[10]
         assert _rows_of(decode[1], q) == (7, 17) and _rows_of(decode[3], out) == (7, 17)
@@ -318,6 +328,7 @@ def test_one_group_alone_returns_the_kernel_output(monkeypatch, gen_rows, own):
         return kernel_out if out is None else out
 
     monkeypatch.setattr(M, "ds_mla_dequant_gather_tiled", lambda *args: args[-1])
+    monkeypatch.setattr(M, "convert_req_index_to_workspace", lambda req, sel, off, out: out)
     monkeypatch.setattr(M, "flash_mla_sparse_prefill", prefill)
     target = _target(40)
     step = _host_step([(7, 3), (0, 6)])

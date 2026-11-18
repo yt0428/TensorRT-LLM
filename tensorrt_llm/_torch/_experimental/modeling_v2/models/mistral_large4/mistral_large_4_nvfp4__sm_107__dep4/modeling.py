@@ -88,6 +88,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.triton_wid
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.convert_req_index_to_global import (
     convert_req_index_to_global,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.convert_req_index_to_workspace import (
+    convert_req_index_to_workspace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_mqa_logits import (
     build as build_ix_logits,
 )
@@ -1345,8 +1348,10 @@ class PrefillTarget:
                 g.idx = sel
             elif g.idx is None or selects:
                 # Request-local selections to workspace rows: each request's run starts at its
-                # KV offset in the group.
-                g.idx = torch.where(sel >= 0, sel + g.ws_off[req_idx[q0:q1]][:, None], sel)
+                # KV offset in the group. One buffer per group, rewritten by each selection.
+                g.idx = convert_req_index_to_workspace(
+                    req_idx[q0:q1], sel, g.ws_off, torch.empty_like(sel) if g.idx is None else g.idx
+                )
             if ctx.own_out:
                 return flash_mla_sparse_prefill(fused_q, ws, g.idx, core.softmax_scale, None)
             flash_mla_sparse_prefill(fused_q[q0:q1], ws, g.idx, core.softmax_scale, lat_out[q0:q1])
