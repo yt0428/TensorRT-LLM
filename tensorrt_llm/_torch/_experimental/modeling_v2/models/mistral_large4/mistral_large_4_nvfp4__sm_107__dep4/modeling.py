@@ -1651,12 +1651,15 @@ class DecodeTarget:
         # The attention block's query and latent half (`_attention`) runs beside the indexer on
         # the core's side stream, the one the MoE block's shared expert (`_moe`) runs on; the
         # events fork it from and join it to the main stream. The indexer's key half runs ahead
-        # of it there; its two events fork it and mark its keys and head weights ready.
+        # of it there; its two events fork it and mark its keys and head weights ready. On a
+        # layer without an indexer the latent runs on the main stream instead, and its event
+        # marks it ready for the query half's rope append.
         self._latent_stream = core._side_stream
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
         self._keys_fork = torch.cuda.Event()
         self._keys_ready = torch.cuda.Event()
+        self._latent_ready = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1930,7 +1933,12 @@ class DecodeTarget:
         past the join (recorded on the main stream outside a capture), so the side stream's
         allocator cannot hand its memory out while the selection reads it. Each later use of
         the side stream, the MoE block's shared expert and the next layer's key half, first
-        waits for the main stream past this join, so the uses never overlap."""
+        waits for the main stream past this join, so the uses never overlap.
+
+        On a layer without an indexer the selection is the one slot conversion, so the owner's
+        latent (the kv_a projection and its norm) runs on the main stream ahead of it instead,
+        and the query half waits for it only at the rope append; the latent is read there
+        before the join, and freed after it."""
         core = self.core
         rows = x.shape[0]
         fq = s.fused_q[:, : core.heads]
@@ -1949,9 +1957,16 @@ class DecodeTarget:
             else:
                 kw = self._indexer_keys(step, x, pos, L)
 
+        latent = None
+        latent_on_main = L.owner and L.indexer is None and do_multi_stream() and side is not None
+
         def select():
+            nonlocal latent
             if L.indexer is not None and not skip_gen:
                 self._indexer(step, x, pos, L, kw, keys_ready, topk_buf)
+            if latent_on_main:
+                latent = self._latent(x, L, s.nope_lat)
+                self._latent_ready.record()
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
@@ -1977,8 +1992,13 @@ class DecodeTarget:
                 torch.transpose(fq[..., : core.kv_lora], 0, 1),
             )  # fmt: skip
             if L.owner:
+                if latent_on_main:
+                    self._latent_ready.wait()
+                    lat = latent
+                else:
+                    lat = self._latent(x, L, s.nope_lat)
                 ds_mla_rope_append(
-                    self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
+                    lat, fq, pos, core._rope.indexer, req_idx,
                     step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
                 )  # fmt: skip
 
