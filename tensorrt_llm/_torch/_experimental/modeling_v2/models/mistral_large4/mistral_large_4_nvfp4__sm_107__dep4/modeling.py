@@ -45,14 +45,15 @@ Both kernels take the rank's 64 heads in one call.
 No path is selected by the serving configuration: each step chooses from its own sizes, and
 every buffer is sized from the engine's quantities (the attention metadata's max_num_tokens,
 max_num_requests, max_seq_len and runtime_features). The context rows take one of two paths,
-chosen per step by the rank's own context KV (every context request's cached and new rows):
-while it fits the held workspace, the sparse prefill over those rows dequantized into it; past
-it, each context row as a one-row sequence of the sparse fp8 decode over the pool itself, as
-generation rows always run. The held workspace, allocated on the first context step, has room
-for the most context KV one step can attend, twice over, up to 2**19 rows
+chosen per step from the rank's own context requests' KV (each one's cached and new rows): the
+requests, in order, are grouped while their KV together fits the held workspace, and each
+group's rows run the sparse prefill over that KV dequantized into it; the rows of a request
+whose own KV is past it run as one-row sequences of the sparse fp8 decode over the pool
+itself, as generation rows always do. The held workspace, allocated on the first context step,
+has room for the most context KV one step can attend, twice over, up to 2**19 rows
 (`_ctx_workspace_rows`): a step whose context KV fits twice keeps layer 35's rows beside its
-own for the NoPE layers attending over that latent, a longer one gathers them again for each
-of those layers. An indexer chunk the engine packs past `max_seq_len` keys is scored request
+own for the NoPE layers attending over that latent, any other gathers them again for each of
+those layers. An indexer chunk the engine packs past `max_seq_len` keys is scored request
 by request, the indexer's logits are tiled under a budget from the engine's max_num_tokens and
 max_seq_len (`_prefill_logits_budget`), each tile scored with the CuTe DSL FP8 MQA scorer
 and selected with the self-sampling GVR
@@ -349,13 +350,13 @@ _EXPERT_CALL_TOKENS = {4: 131072, 8: 32768}
 # 1048576's margin spares; so the 131072 rows run in four calls. The chunks give one call's bits
 # (test_modeling_v2_routed_experts.py).
 _EXPERT_CALL_TOKENS_CHUNKED = {4: 32768, 8: 32768}
-# The context path's crossover, chosen once per step on this rank's host ints, and the held
-# context workspace's ceiling (`_ctx_workspace_rows`). A step whose context KV (every context
-# request's cached and new rows) fits the held workspace has it gathered, dequantized, into it
-# (bf16 [rows, 576]) for FlashMLA's sparse prefill; a longer one attends its context rows
-# straight off the pool with the sparse decode kernel, whose cost does not grow with the prefix
-# as the gather's does.
-# capacity: fixed: 2**19 rows, 576 MiB, the gather-vs-decode crossover.
+# The held context workspace's ceiling (`_ctx_workspace_rows`), which bounds the context paths a
+# step chooses once on this rank's host ints. The context requests, in order, are grouped while
+# their KV (cached and new rows) together fits the held workspace, and each group's KV is
+# gathered, dequantized, into it (bf16 [rows, 576]) for FlashMLA's sparse prefill; a request
+# whose own KV is past it attends straight off the pool with the sparse decode kernel, which
+# takes about twice the prefill's time per context row on sm_107.
+# capacity: fixed: 2**19 rows, 576 MiB, the most KV one request attends through the workspace.
 _CTX_WORKSPACE_ROWS = 1 << 19
 # The most context rows one sparse-decode call takes on that path: FlashMLA's decode scheduler
 # exits the process, raising nothing, past 11622 one-row sequences of 64 heads on sm_103.
@@ -1296,52 +1297,54 @@ class PrefillTarget:
                 del logits
 
     def _attn_ctx(self, step, L, fused_q, lat_out, req_idx, topk_buf, ctx):
-        """Sparse MLA over the context rows into `lat_out`, on the step's path (`ctx`).
+        """Sparse MLA over the context rows into `lat_out`, group by group (`ctx.groups`), each
+        group's rows on its own path (`_ctx_workspace`).
 
-        Workspace path: FlashMLA's bf16 sparse prefill over the context requests' latent rows
-        of the source layer, dequantized out of the pool (this step's rows included, so every
-        row is read FP8-rounded) into the held workspace's first rows. A shared source (layer
-        35) is gathered once into the rows the step keeps beside them, when it has them, and
-        read there by every layer that shares it; otherwise each of those layers gathers it
-        again into the first rows. The selections as workspace rows (`ctx.idx`) change only
-        with the selection: a lone request's run starts at row 0, so its selections are
-        already workspace rows; with more, they are offset on a layer that selects and on the
-        step's first layer. Decode path, a step past the held workspace: the selections as
-        pool slots, then FlashMLA's sparse fp8 decode over the pool with every context row a
-        one-row sequence, in the step's sub-batches."""
+        Workspace group: FlashMLA's bf16 sparse prefill over its requests' latent rows of the
+        source layer, dequantized out of the pool (this step's rows included, so every row is
+        read FP8-rounded) into the held workspace's first rows. A shared source (layer 35) is
+        gathered once into the rows the step keeps beside them, when it has them, and read there
+        by every layer that shares it; otherwise each of those layers gathers it again into the
+        first rows. The group's selections as workspace rows (`idx`) change only with the
+        selection: a lone request's run starts at row 0, so its selections are already
+        workspace rows; with more, they are offset on a layer that selects and on the step's
+        first layer. Decode group: the selections as pool slots, then FlashMLA's sparse fp8
+        decode over the pool with every row a one-row sequence, in the group's sub-batches."""
         core = self.core
-        tc = fused_q.shape[0]
         src = L.kv_source
-        if ctx.ws_buf is None:
-            slots = convert_req_index_to_global(
-                req_idx[:tc], step["block_table"], topk_buf[:tc], step["tokens_per_block"],
-                core.idx_topk, core._stride_factor, core._pool_row[src],
-            )  # fmt: skip
-            for lo, hi in ctx.sub_batches:
-                # Past 11622 rows FlashMLA's scheduler exits the process instead of raising.
-                assert hi - lo <= _CTX_DECODE_ROWS, (lo, hi)
-                flash_mla_sparse_decode(
-                    fused_q[lo:hi], step["latent_kv"], slots[lo:hi], ctx.sched[hi - lo],
-                    core.softmax_scale, lat_out[lo:hi],
+        selects = L.indexer is not None and not step["skip_ctx"]
+        for g in ctx.groups:
+            q0, q1 = g.rows
+            sel = topk_buf[q0:q1]
+            if g.ws_buf is None:
+                slots = convert_req_index_to_global(
+                    req_idx[q0:q1], step["block_table"], sel, step["tokens_per_block"],
+                    core.idx_topk, core._stride_factor, core._pool_row[src],
                 )  # fmt: skip
-            return
-        ws = ctx.ws.get(src)
-        if ws is None:
-            keep = core.shared_source[src] and ctx.kept is not None
-            ws = ds_mla_dequant_gather_tiled(
-                step["latent_pool"], core._pool_row[src], ctx.kv_req, ctx.kv_pos,
-                step["block_table"], ctx.kept if keep else ctx.ws_buf,
-            )  # fmt: skip
-            if keep:
-                ctx.ws[src] = ws
-        sel = topk_buf[:tc]
-        if ctx.ws_off is None:
-            ctx.idx = sel
-        elif ctx.idx is None or (L.indexer is not None and not step["skip_ctx"]):
-            # Request-local selections to workspace rows: each request's run starts at its
-            # cumulative KV offset.
-            ctx.idx = torch.where(sel >= 0, sel + ctx.ws_off[req_idx[:tc]][:, None], sel)
-        flash_mla_sparse_prefill(fused_q, ws, ctx.idx, core.softmax_scale, lat_out)
+                for lo, hi in g.sub_batches:
+                    # Past 11622 rows FlashMLA's scheduler exits the process instead of raising.
+                    assert hi - lo <= _CTX_DECODE_ROWS, (lo, hi)
+                    flash_mla_sparse_decode(
+                        fused_q[q0 + lo : q0 + hi], step["latent_kv"], slots[lo:hi],
+                        ctx.sched[hi - lo], core.softmax_scale, lat_out[q0 + lo : q0 + hi],
+                    )  # fmt: skip
+                continue
+            ws = g.ws.get(src)
+            if ws is None:
+                keep = core.shared_source[src] and g.kept is not None
+                ws = ds_mla_dequant_gather_tiled(
+                    step["latent_pool"], core._pool_row[src], g.kv_req, g.kv_pos,
+                    step["block_table"], g.kept if keep else g.ws_buf,
+                )  # fmt: skip
+                if keep:
+                    g.ws[src] = ws
+            if g.ws_off is None:
+                g.idx = sel
+            elif g.idx is None or selects:
+                # Request-local selections to workspace rows: each request's run starts at its
+                # KV offset in the group.
+                g.idx = torch.where(sel >= 0, sel + g.ws_off[req_idx[q0:q1]][:, None], sel)
+            flash_mla_sparse_prefill(fused_q[q0:q1], ws, g.idx, core.softmax_scale, lat_out[q0:q1])
 
     def _attn_gen(self, step, L, fused_q, lat_out, slots, sched):
         """Sparse MLA over the generation rows behind the context rows into `lat_out`: FlashMLA's
@@ -1495,32 +1498,32 @@ class PrefillTarget:
         )
 
     def _ctx_workspace(self, step, tc: int, dev) -> SimpleNamespace:
-        """The context rows' path for the step, chosen once on this rank's host ints from its
-        context KV: every context request's cached prefix and new tokens (the engine's
+        """The context rows' paths for the step, chosen once on this rank's host ints from each
+        context request's KV: its cached prefix and new tokens (the engine's
         `num_ctx_kv_tokens` counts the new ones only). Under attention DP the step holds this
         rank's own requests only and the attention has no collective, so each rank takes its
-        own path; ranks on different paths meet again only at the expert path's collectives.
+        own paths; ranks on different paths meet again only at the expert path's collectives.
 
         The held workspace, bf16 `[core.ctx_workspace_rows, 576]` (`_ctx_workspace_rows`), is
-        allocated on the first context step, whichever path that step takes, and held. The
+        allocated on the first context step, whichever paths that step takes, and held. The
         engine's KV-capacity estimate runs context steps as its profiling forward and sizes the
         pool after their peak memory (`KvCacheCreator.configure_kv_cache_capacity`), so the pool
         is sized with the workspace held. A generation-only engine runs no context step and
         holds none.
 
-        The workspace path, a step whose context KV fits the held rows: request and position
-        per workspace row as the dequantizing gather and the prefill kernel address them, each
-        request's offset, the held workspace's first `n_kv` rows, which every layer's gather
-        rewrites, and, when the context KV fits twice, the next `n_kv` rows (`kept`), where a
-        shared owner's gather stays for the step (`ws`). With more than one context request,
-        each request's int32 offset into the workspace (`ws_off`) and the step's selections
-        offset by it (`idx`, `_attn_ctx`).
-
-        The decode path, a step past the held rows, with no workspace: the context rows'
-        sub-batches of at most `_CTX_DECODE_ROWS`, and one FlashMLA scheduler per sub-batch
-        size, filled by its first call and shared by the step's layers."""
-        # Under KV reuse a context request attends over its cached prefix and its new tokens.
-        n_kv = step["ctx_cached_tokens"] + step["num_ctx_tokens"]
+        The context requests, in order, form groups (`groups`), each over its requests' rows
+        of the step (`rows`). A request whose own KV fits the held rows joins a workspace
+        group, which takes the following requests while their KV together still fits: the
+        whole step is one group when its context KV fits. A workspace group holds its request
+        and position per workspace row as the dequantizing gather and the prefill kernel
+        address them, the held workspace's first rows for its KV, which every layer's gather
+        rewrites, and, when the step is that one group and its KV fits twice, the next as many
+        rows (`kept`), where a shared owner's gather stays for the step (`ws`). Over more than
+        one request it holds each request's int32 offset into the workspace (`ws_off`) and the
+        selections offset by it (`idx`, `_attn_ctx`). A run of requests each past the held
+        rows is a decode group, with no workspace: its rows' sub-batches of at most
+        `_CTX_DECODE_ROWS`, on one FlashMLA scheduler per sub-batch size (`sched`), filled by
+        its first call and shared by the step's layers."""
         if self._ws_buf is None:
             # On the first context step: the KV-capacity estimate's profiling forward is one,
             # so the peak it measures, which sizes the pool, holds this buffer.
@@ -1532,38 +1535,66 @@ class PrefillTarget:
                 f"rows x {self.core.lat_dim} bf16 ({self._ws_buf.nbytes / 2**20:.0f} MiB)"
             )
         held = self._ws_buf.shape[0]
-        if n_kv > held:
-            bounds = [(lo, min(lo + _CTX_DECODE_ROWS, tc)) for lo in range(0, tc, _CTX_DECODE_ROWS)]
-            logger.debug(
-                f"modeling_v2 Mistral Large 4 NVFP4: context KV {n_kv} past the held {held} rows: "
-                f"decode path, {len(bounds)} sub-batches"
-            )
-            return SimpleNamespace(
-                ws_buf=None,
-                sub_batches=bounds,
-                sched={rows: get_mla_metadata()[0] for rows in {hi - lo for lo, hi in bounds}},
-            )
-        ctx = step["num_contexts"]
+        n = step["num_contexts"]
+        # Under KV reuse a context request attends over its cached prefix and its new tokens.
+        kv, new = step["host_cu_ctx_kv"], step["host_cu_ctx_new"]
+        assert new[n] == tc, (new[n], tc)
         cu = step["cu_ctx_kv"]
-        lens = cu[1:] - cu[:-1]
-        kv_req = torch.repeat_interleave(
-            torch.arange(ctx, dtype=torch.int32, device=dev), lens, output_size=n_kv
-        )
-        kv_pos = (torch.arange(n_kv, device=dev) - cu[:-1][kv_req]).to(torch.int32)
-        keep = 2 * n_kv <= held
+        groups, sizes = [], set()
+        r0 = 0
+        while r0 < n:
+            r1 = r0 + 1
+            if kv[r1] - kv[r0] > held:
+                while r1 < n and kv[r1 + 1] - kv[r1] > held:
+                    r1 += 1
+                rows = new[r1] - new[r0]
+                bounds = [
+                    (lo, min(lo + _CTX_DECODE_ROWS, rows))
+                    for lo in range(0, rows, _CTX_DECODE_ROWS)
+                ]
+                sizes.update(hi - lo for lo, hi in bounds)
+                groups.append(
+                    SimpleNamespace(rows=(new[r0], new[r1]), ws_buf=None, sub_batches=bounds)
+                )
+                r0 = r1
+                continue
+            while r1 < n and kv[r1 + 1] - kv[r0] <= held:
+                r1 += 1
+            n_kv = kv[r1] - kv[r0]
+            kv_req = torch.repeat_interleave(
+                torch.arange(r0, r1, dtype=torch.int32, device=dev),
+                cu[r0 + 1 : r1 + 1] - cu[r0:r1],
+                output_size=n_kv,
+            )
+            kv_pos = (torch.arange(kv[r0], kv[r1], device=dev) - cu[:-1][kv_req]).to(torch.int32)
+            keep = r0 == 0 and r1 == n and 2 * n_kv <= held
+            groups.append(
+                SimpleNamespace(
+                    rows=(new[r0], new[r1]),
+                    kv_req=kv_req,
+                    kv_pos=kv_pos,
+                    ws_off=(cu[:-1] - kv[r0]).to(torch.int32) if r1 - r0 > 1 else None,
+                    idx=None,
+                    ws_buf=self._ws_buf[:n_kv],
+                    kept=self._ws_buf[n_kv : 2 * n_kv] if keep else None,
+                    ws={},
+                )
+            )
+            r0 = r1
         logger.debug(
-            f"modeling_v2 Mistral Large 4 NVFP4: context KV {n_kv} of the held {held} rows: "
-            f"workspace path, the shared source {'kept' if keep else 'gathered again'}"
+            f"modeling_v2 Mistral Large 4 NVFP4: context KV {kv[n]} over the held {held} rows: "
+            + ", ".join(
+                f"rows {g.rows[0]}..{g.rows[1]} "
+                + (
+                    f"decode ({len(g.sub_batches)} sub-batches)"
+                    if g.ws_buf is None
+                    else f"workspace ({g.ws_buf.shape[0]} KV rows"
+                    + (", the shared source kept)" if g.kept is not None else ")")
+                )
+                for g in groups
+            )
         )
-        return SimpleNamespace(
-            kv_req=kv_req,
-            kv_pos=kv_pos,
-            ws_off=cu[:-1].to(torch.int32) if ctx > 1 else None,
-            idx=None,
-            ws_buf=self._ws_buf[:n_kv],
-            kept=self._ws_buf[n_kv : 2 * n_kv] if keep else None,
-            ws={},
-        )
+        return SimpleNamespace(groups=groups, sched={rows: get_mla_metadata()[0] for rows in sizes})
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, ctx, tc, skip_ctx, skip_gen):
         """One layer's attention block, both phases, into `s.attn_out` (returned): the query
