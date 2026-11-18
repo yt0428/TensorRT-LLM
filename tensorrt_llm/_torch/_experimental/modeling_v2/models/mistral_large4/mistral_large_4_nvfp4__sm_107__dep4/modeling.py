@@ -171,6 +171,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.layer_norm_fp8_block_scale_linear import (
     layer_norm_fp8_block_scale_linear,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.mla_v_up_fp8_block_scale_linear import (
+    mla_v_up_fp8_block_scale_linear,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
@@ -1885,11 +1888,13 @@ class DecodeTarget:
         residual = h if inputs_embeds is None else h.clone()
         spec_metadata = kwargs.get("spec_metadata")
         for layer_idx, L in enumerate(self._layers):
-            attn_out = self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen)
-            # `residual += wo(attn_out)` in place; `o` is its RMSNorm, written over the
+            # `residual += wo(attention)` in place; `o` is its RMSNorm, written over the
             # projection.
             o, residual = flashinfer_fused_add_rmsnorm(
-                self._linear_fp8(attn_out, L.wo, L.wo_s), residual, L.ffn_norm, core.eps
+                self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen),
+                residual,
+                L.ffn_norm,
+                core.eps,
             )
             mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, padded, pad_rows)
             residual = torch.add(residual, mlp)
@@ -1899,15 +1904,14 @@ class DecodeTarget:
         return x
 
     def _scratch(self, rows: int, dtype, dev) -> SimpleNamespace:
-        """Per-step scratch every layer rewrites in turn: the attention output, the absorbed
-        query at the kernel's 64 heads (this rank's first, the rest zero for the step), a NoPE
-        owner's 576-wide latent rows (the rope key zero for the step), the latent attention
-        output the unfused glue copies FlashMLA's live heads into, and the FlashMLA scheduler
-        the step's first layer fills and the rest share (captured with the step)."""
+        """Per-step scratch every layer rewrites in turn: the absorbed query at the kernel's 64
+        heads (this rank's first, the rest zero for the step), a NoPE owner's 576-wide latent
+        rows (the rope key zero for the step), the latent attention output the unfused glue
+        copies FlashMLA's live heads into, and the FlashMLA scheduler the step's first layer
+        fills and the rest share (captured with the step)."""
         core = self.core
         bf16 = dict(dtype=dtype, device=dev)
         return SimpleNamespace(
-            attn_out=torch.empty([rows, core.heads * core.v_dim], **bf16),
             fused_q=torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16),
             nope_lat=None if core.unfused_glue else torch.zeros([rows, core.lat_dim], **bf16),
             lat_out=(
@@ -1917,10 +1921,11 @@ class DecodeTarget:
         )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
-        """One layer's attention block into `s.attn_out` (returned): the indexer's selection and
-        its pool slots; the query with SSMax, the absorbed query, the owner's rope and
-        fp8_ds_mla append; FlashMLA sparse decode over the pool, and the V up-projection of the
-        kernel's live heads, read in place.
+        """One layer's attention block through `wo` (returned): the indexer's selection and its
+        pool slots; the query with SSMax, the absorbed query, the owner's rope and fp8_ds_mla
+        append; FlashMLA sparse decode over the pool; the V up-projection of the kernel's live
+        heads, read in place, quantized per head as `wo`'s 1x128 blocks in the same launch, and
+        `wo`'s FP8 GEMM.
 
         Under CUDA-graph capture the indexer's key half and then the query half run on the side
         stream beside the selection. The key half writes the indexer's key pool and `kw`, which
@@ -2013,12 +2018,7 @@ class DecodeTarget:
             lat = flash_mla_sparse_decode(
                 s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None
             )[:, : core.heads]
-        bmm_out(
-            torch.transpose(lat, 0, 1),
-            L.v_b_t,
-            torch.transpose(torch.reshape(s.attn_out, [rows, core.heads, core.v_dim]), 0, 1),
-        )
-        return s.attn_out
+        return mla_v_up_fp8_block_scale_linear(lat, L.v_b_t, L.wo, L.wo_s)
 
     def dspark_forward(
         self,
