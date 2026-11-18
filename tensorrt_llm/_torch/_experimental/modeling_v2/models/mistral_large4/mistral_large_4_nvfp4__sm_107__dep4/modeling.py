@@ -323,11 +323,6 @@ _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
 _TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
-# DSpark verification rows on the trtllm indexer_topk_decode op instead of the split radix
-# selector, for old-versus-new comparison (both select the same set up to exact ties; the split
-# selector's tests hold it to the op). Set TRTLLM_MODELING_V2_NATIVE_TOPK_VERIFY=1 in every
-# rank's environment at launch; off by default.
-_NATIVE_TOPK_VERIFY = os.environ.get("TRTLLM_MODELING_V2_NATIVE_TOPK_VERIFY", "0") == "1"
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -337,13 +332,6 @@ _NATIVE_TOPK_VERIFY = os.environ.get("TRTLLM_MODELING_V2_NATIVE_TOPK_VERIFY", "0
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
-# A generation step's query, absorbed query and owner's latent append on the main stream after
-# the indexer's keys, scoring and selection, instead of on the core's side stream beside them
-# (`DecodeTarget._attention`). Both orders run the same ops on the same inputs. The side stream
-# is used only where the engine enables multi-stream, its CUDA-graph warmup and capture
-# (`maybe_execute_in_parallel`). Set TRTLLM_MODELING_V2_SERIAL_INDEXER=1 in every rank's
-# environment at launch; off by default.
-_SERIAL_INDEXER = os.environ.get("TRTLLM_MODELING_V2_SERIAL_INDEXER", "0") == "1"
 # capacity: fixed: by attention-DP world size, the most gathered tokens one router / routing /
 # NVFP4-quantize / expert call takes, the token column those entries are certified to at that
 # world's expert window. At 4 ranks (32 local experts) the gathered set is up to
@@ -373,23 +361,6 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # exits the process, raising nothing, past 11622 one-row sequences of 64 heads on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
-# The DSpark post-target step's torch chains instead of the fused entries, one switch each, for
-# old-versus-new measurement. TRTLLM_MODELING_V2_UNFUSED_DRAFT_ATTENTION=1: each draft layer's
-# attention as the window gather off the paged context, the masking, the key concatenation, the
-# score einsum, the softmax and the value einsum, for triton_draft_attention.
-# TRTLLM_MODELING_V2_UNFUSED_DRAFT_ROPE=1: the query rope, the latent RMSNorm, the rope key and
-# their concatenation as separate ops, in the draft layers and the context features, for
-# triton_latent_tail. TRTLLM_MODELING_V2_UNFUSED_MARKOV=1: the recurrent Markov head's
-# embedding, concatenation, gate chain, logit add and the worker's argmax, for
-# triton_markov_{input,gate,logits}. TRTLLM_MODELING_V2_UNFUSED_LOGITS_SOFTCAP=1: the logits
-# processor's fp32 upcast and tanh_softcap's three ops on the target and draft logits, for
-# triton_widen_softcap. The rope, the Markov head and the soft-cap compute the same bits either
-# way; the RMSNorm and the attention reduce in their own order. Every site is rank-local. Set
-# in the environment at launch; off by default.
-_UNFUSED_DRAFT_ATTENTION = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_DRAFT_ATTENTION", "0") == "1"
-_UNFUSED_DRAFT_ROPE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_DRAFT_ROPE", "0") == "1"
-_UNFUSED_MARKOV = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_MARKOV", "0") == "1"
-_UNFUSED_LOGITS_SOFTCAP = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_LOGITS_SOFTCAP", "0") == "1"
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -914,12 +885,7 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
         lo, hi = _TOPK_VERIFY_COLUMNS
-        if (
-            _NATIVE_TOPK_VERIFY
-            or not _TOPK_DECODE_CUTE_DSL
-            or not lo <= self._max_ctx_len <= hi
-            or self.idx_topk != 2048
-        ):
+        if not _TOPK_DECODE_CUTE_DSL or not lo <= self._max_ctx_len <= hi or self.idx_topk != 2048:
             self._ix_topk_verify = None
         elif self._ix_topk_verify is None:
             self._ix_topk_verify = build_ix_topk_verify(
@@ -997,76 +963,11 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         )
 
 
-def _capped_logits(shell, hidden: torch.Tensor, attn_metadata) -> torch.Tensor:
+def _capped_logits(shell, hidden: torch.Tensor) -> torch.Tensor:
     """The soft-capped fp32 logits of every row of `hidden` through the shell's full-vocabulary
     lm_head, for the target's verified tokens and the draft's tokens alike: the bf16 lm_head
-    output widened and soft-capped in one pass (triton_widen_softcap), or under
-    `_UNFUSED_LOGITS_SOFTCAP` the logits processor's upcast and tanh_softcap."""
-    if _UNFUSED_LOGITS_SOFTCAP:
-        logits = shell.logits_processor(hidden, shell.lm_head, attn_metadata, True)
-        return tanh_softcap(logits, shell.softcap)
+    output widened and soft-capped in one pass (triton_widen_softcap)."""
     return triton_widen_softcap(shell.lm_head(hidden), shell.softcap)
-
-
-def _draft_window(
-    draft,
-    noise_embedding,
-    num_ctx_per_req,
-    ctx_k_cache,
-    ctx_cache_batch_idx,
-    ctx_kv_cache,
-    ctx_page_table,
-) -> SimpleNamespace:
-    """Where `_draft_attention` reads each sequence's last `draft.window` context positions,
-    which of them the sequence has written, and the keys' mask with the block's own appended."""
-    batch, block = noise_embedding.shape[:2]
-    # Gather a bounded window, not every page in the configured context.
-    # Invalid padding slots are masked even if their pages are allocated.
-    lengths = num_ctx_per_req[:batch].long()
-    offsets = torch.arange(draft.window, device=noise_embedding.device)
-    positions = (lengths - draft.window).clamp_min(0)[:, None] + offsets[None, :]
-    valid = positions < lengths[:, None]
-    slots = ctx_cache_batch_idx.long()
-    pages = page_offsets = None
-    if ctx_page_table is not None:
-        page_size = ctx_kv_cache[0].shape[-2]
-        table = ctx_page_table.index_select(0, slots).long()
-        safe_positions = positions.clamp(max=table.shape[1] * page_size - 1)
-        pages = table.gather(1, safe_positions // page_size).clamp_min(0)
-        page_offsets = safe_positions % page_size
-    else:
-        safe_positions = positions.clamp(max=ctx_k_cache.shape[2] - 1)
-    key_valid = torch.cat(
-        (valid, torch.ones(batch, block, dtype=torch.bool, device=valid.device)), dim=1
-    )
-    return SimpleNamespace(
-        valid=valid,
-        key_valid=key_valid,
-        slots=slots,
-        safe_positions=safe_positions,
-        pages=pages,
-        page_offsets=page_offsets,
-    )
-
-
-def _draft_attention(
-    core, window, i, query, block_kv, ctx_k_cache, ctx_kv_cache, ctx_page_table
-) -> torch.Tensor:
-    """Draft layer `i`'s attention as torch ops, under `_UNFUSED_DRAFT_ATTENTION`: the window
-    (`_draft_window`) gathered out of the context and masked, the block's keys appended, then
-    the score einsum, the softmax and the value einsum. Returns `[batch, block, heads, 512]`."""
-    if ctx_page_table is not None:
-        context = ctx_kv_cache[i][:, 0, 0][window.pages, window.page_offsets]
-    else:
-        context = ctx_k_cache[window.slots[:, None], i, window.safe_positions, 0]
-    # Zero masked values as well as scores: 0 * an uninitialized
-    # NaN in the latent pool must not contaminate the weighted sum.
-    context = context.masked_fill(~window.valid.unsqueeze(-1), 0)
-    keys = torch.cat((context, block_kv), dim=1)
-    scores = torch.einsum("bshd,btd->bsht", query, keys).float() * core.softmax_scale
-    scores = scores.masked_fill(~window.key_valid[:, None, None, :], float("-inf"))
-    probabilities = torch.softmax(scores, dim=-1).to(keys.dtype)
-    return torch.einsum("bsht,btc->bshc", probabilities, keys[..., : core.kv_lora])
 
 
 def _dspark_block(
@@ -1075,7 +976,6 @@ def _dspark_block(
     noise_embedding,
     query_positions,
     num_ctx_per_req,
-    ctx_k_cache,
     ctx_cache_batch_idx,
     ctx_kv_cache,
     ctx_page_table,
@@ -1085,26 +985,14 @@ def _dspark_block(
     whole block (non-causal), with all 64 heads. Nothing communicates: the residual adds and
     RMSNorms are the rank's own.
 
-    The context is paged (`DraftModel._paged_ctx_cache`): each layer's attention is
+    The context is always paged (`DraftModel._paged_ctx_cache`): each layer's attention is
     triton_draft_attention over the page table, and its query rope and latent tail are
-    triton_latent_tail, unless `_UNFUSED_DRAFT_ATTENTION` or `_UNFUSED_DRAFT_ROPE` selects the
-    torch chain.
+    triton_latent_tail.
     """
     draft._build_fused_kv_buffers()
     draft._ensure_rope()
     batch, block, hidden = noise_embedding.shape
     rows = batch * block
-    window = None
-    if _UNFUSED_DRAFT_ATTENTION:
-        window = _draft_window(
-            draft,
-            noise_embedding,
-            num_ctx_per_req,
-            ctx_k_cache,
-            ctx_cache_batch_idx,
-            ctx_kv_cache,
-            ctx_page_table,
-        )
     query = torch.empty(
         batch,
         block,
@@ -1126,47 +1014,27 @@ def _dspark_block(
             query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
         )
         kv = cublas_mm(x, layer.kv_a, None, None)
-        if _UNFUSED_DRAFT_ROPE:
-            query[..., core.kv_lora :].copy_(draft._rotate(q[..., core.nope :], query_positions))
-            content = flashinfer_rmsnorm(
-                kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
-            )
-            block_kv = torch.cat(
-                (
-                    content.view(batch, block, core.kv_lora),
-                    draft._rotate(
-                        kv[:, core.kv_lora :].view(batch, block, core.rope_dim), query_positions
-                    ),
-                ),
-                dim=-1,
-            )
-        else:
-            block_kv = triton_latent_tail(
-                kv,
-                layer.kv_norm.view(1, core.kv_lora),
-                core.eps,
-                query_positions.reshape(rows),
-                draft._rope.indexer,
-                kv.new_empty((batch, block, core.lat_dim)),
-                q=q.view(rows, core.heads * core.qk_dim),
-                query=query,
-                nope=core.nope,
-            )
-        if _UNFUSED_DRAFT_ATTENTION:
-            latent = _draft_attention(
-                core, window, i, query, block_kv, ctx_k_cache, ctx_kv_cache, ctx_page_table
-            )
-        else:
-            latent = triton_draft_attention(
-                query,
-                ctx_kv_cache[i][:, 0, 0],
-                ctx_page_table,
-                ctx_cache_batch_idx,
-                num_ctx_per_req,
-                block_kv,
-                core.softmax_scale,
-                draft.window,
-            )
+        block_kv = triton_latent_tail(
+            kv,
+            layer.kv_norm.view(1, core.kv_lora),
+            core.eps,
+            query_positions.reshape(rows),
+            draft._rope.indexer,
+            kv.new_empty((batch, block, core.lat_dim)),
+            q=q.view(rows, core.heads * core.qk_dim),
+            query=query,
+            nope=core.nope,
+        )
+        latent = triton_draft_attention(
+            query,
+            ctx_kv_cache[i][:, 0, 0],
+            ctx_page_table,
+            ctx_cache_batch_idx,
+            num_ctx_per_req,
+            block_kv,
+            core.softmax_scale,
+            draft.window,
+        )
         bmm_out(
             latent.reshape(rows, core.heads, core.kv_lora).transpose(0, 1),
             layer.v_b.transpose(1, 2),
@@ -1755,7 +1623,6 @@ class PrefillTarget:
             noise_embedding,
             query_positions,
             num_ctx_per_req,
-            ctx_k_cache,
             ctx_cache_batch_idx,
             ctx_kv_cache,
             ctx_page_table,
@@ -1777,9 +1644,8 @@ class DecodeTarget:
         self._norm0 = core.w["l0_attn_norm"]
         # The attention block's query and latent half (`_attention`) runs beside the indexer on
         # the core's side stream, the one the MoE block's shared expert (`_moe`) runs on; the
-        # events fork it from and join it to the main stream. Under `_SERIAL_INDEXER` there is
-        # no stream and it runs on the main stream.
-        self._latent_stream = None if _SERIAL_INDEXER else core._side_stream
+        # events fork it from and join it to the main stream.
+        self._latent_stream = core._side_stream
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
 
@@ -2106,7 +1972,6 @@ class DecodeTarget:
             noise_embedding,
             query_positions,
             num_ctx_per_req,
-            ctx_k_cache,
             ctx_cache_batch_idx,
             ctx_kv_cache,
             ctx_page_table,
@@ -2165,7 +2030,7 @@ class DraftModel(nn.Module):
     def logits_processor(self, hidden, lm_head, attn_metadata, gather):
         # The shared-head logits are soft-capped before the RNN bias is added.
         if gather and lm_head is self._shell.lm_head:
-            return _capped_logits(self._shell, hidden, attn_metadata)
+            return _capped_logits(self._shell, hidden)
         logits = self._shell.logits_processor(hidden, lm_head, attn_metadata, gather)
         return tanh_softcap(logits, self._shell.softcap)
 
@@ -2213,20 +2078,6 @@ class DraftModel(nn.Module):
                 w.device,
             )
 
-    def _rotate(self, x, positions):
-        # Called by the `_UNFUSED_DRAFT_ROPE` chains only; triton_latent_tail ropes otherwise.
-        table = self._rope.indexer[positions.long()]
-        cos, sin = table.chunk(2, dim=-1)
-        # One head axis for Q, none for the shared latent K.
-        if x.ndim == positions.ndim + 2:
-            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-        even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
-        return (
-            torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1)
-            .flatten(-2)
-            .to(x.dtype)
-        )
-
     def embed_draft_block(self, anchors, block_size):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
@@ -2246,16 +2097,6 @@ class DraftModel(nn.Module):
         self._build_fused_kv_buffers()
         self._ensure_rope()
         core = self.core
-        if _UNFUSED_DRAFT_ROPE:
-            latent = []
-            for layer in self._layers:
-                kv = cublas_mm(projected_hidden, layer.kv_a, None, None)
-                content = flashinfer_rmsnorm(
-                    kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
-                )
-                rope = self._rotate(kv[:, core.kv_lora :], positions.reshape(-1))
-                latent.append(torch.cat((content, rope), dim=-1))
-            return torch.stack(latent, dim=1).unsqueeze(2), None
         rows = projected_hidden.shape[0]
         out = projected_hidden.new_empty((rows, len(self._layers), 1, core.lat_dim))
         positions = positions.reshape(-1)
@@ -2284,14 +2125,6 @@ class DraftModel(nn.Module):
         vocab_slice=None,
         hidden_states,
     ):
-        if _UNFUSED_MARKOV:
-            return self._markov_chain_logits_unfused(
-                base_logits,
-                first_prev_tokens,
-                argmax_fn=argmax_fn,
-                vocab_slice=vocab_slice,
-                hidden_states=hidden_states,
-            )
         # Under attention DP the lm_head holds the whole vocabulary on every rank, so the worker
         # never slices it and its argmax_fn is a plain argmax: the chain's own argmax stands in
         # for it, fused with the bias add.
@@ -2314,46 +2147,6 @@ class DraftModel(nn.Module):
             bias = cublas_mm(emitted, output.t(), None, None)
             previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
         return refined
-
-    def _markov_chain_logits_unfused(
-        self,
-        base_logits,
-        first_prev_tokens,
-        *,
-        argmax_fn,
-        vocab_slice,
-        hidden_states,
-    ):
-        """`apply_markov_chain_logits` as torch ops and the worker's argmax, under
-        `_UNFUSED_MARKOV`."""
-        w = self.core.w
-        output = w["draft_markov_output"]
-        if vocab_slice is not None:
-            output = output[vocab_slice]
-        previous = first_prev_tokens.long()
-        state = None
-        refined = []
-        for i in range(base_logits.shape[1]):
-            weight = w["draft_markov_embedding"]
-            valid = (previous >= 0) & (previous < weight.shape[0])
-            embedding = nn.functional.embedding(previous.clamp(0, weight.shape[0] - 1), weight)
-            embedding = embedding.masked_fill(~valid.unsqueeze(-1), 0)
-            if state is None:
-                state = torch.zeros_like(embedding)
-            joint = cublas_mm(
-                torch.cat((state, embedding, hidden_states[:, i]), dim=-1),
-                w["draft_joint"].t(),
-                w["draft_joint_bias"],
-                None,
-            )
-            gate, candidate, emitted = joint.chunk(3, dim=-1)
-            gate = torch.sigmoid(gate)
-            state = gate * state + (1 - gate) * torch.tanh(candidate)
-            bias = cublas_mm(torch.tanh(emitted), output.t(), None, None)
-            logits = base_logits[:, i] + bias
-            refined.append(logits)
-            previous = argmax_fn(logits)
-        return torch.stack(refined, dim=1)
 
 
 class _VisionBlock(NamedTuple):
@@ -2751,9 +2544,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Dep4(
             lora_params=lora_params,
             **kwargs,
         )
-        logits = _capped_logits(
-            self, nn.functional.embedding(spec_metadata.gather_ids, hidden), attn_metadata
-        )
+        logits = _capped_logits(self, nn.functional.embedding(spec_metadata.gather_ids, hidden))
         return self.spec_worker(
             input_ids=worker_input_ids,
             position_ids=position_ids,
