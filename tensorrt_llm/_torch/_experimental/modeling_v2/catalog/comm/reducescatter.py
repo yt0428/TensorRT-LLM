@@ -286,13 +286,13 @@ class Reducescatter(OpWrapper):
     Dtypes other than bf16 work and are exercised by the op matrix on the `_pg`
     symbol, but no shipped target reaches them, so they are not cells. The
     ragged cells (`ragged=True`, sm_107) were driven on the MPI-session symbol
-    at world 4 on one VR200 node by `_moe_comm_op_matrix.py`, on partials of
-    small integers whose every sum is exact in bf16: each rank's rows bit for
-    bit. Their rounding on general payloads was not measured apart from the
-    uniform form's. Not certified on the MPI-session symbol: other dtypes and
-    widths, a group other than all four ranks of one node or all eight ranks of
-    two nodes, other world sizes and node counts, rows_per_rank above 32768,
-    and the ragged world-8 cell, not yet driven.
+    by `_moe_comm_op_matrix.py`, at world 4 on one VR200 node and at world 8 on
+    two VR200 nodes of one NVL72 domain, on partials of small integers whose
+    every sum is exact in bf16: each rank's rows bit for bit. Their rounding on
+    general payloads was not measured apart from the uniform form's. Not
+    certified on the MPI-session symbol: other dtypes and widths, a group other
+    than all four ranks of one node or all eight ranks of two nodes, other
+    world sizes and node counts, and rows_per_rank above 32768.
 
     Hard limits (sm_103), the uniform split at width 6144 bf16
       input bytes   4 * rows_per_rank * 12288 vs 2^31   reached at rows_per_rank 43691

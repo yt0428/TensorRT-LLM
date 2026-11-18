@@ -93,7 +93,8 @@ class AllgatherList(OpWrapper):
     15.8 us up to 16 rows per rank, 23.8 at 64, 25.0 at 128, 35.9 at 256 and 64.2 at 512.
     One bf16 all-gather of the `[rows, 6144]` activations takes 9.5 to 11.1, 28.1, 49.5, 65.6
     and 76.0 us there: below 64 rows per rank the four collectives' fixed cost outweighs the
-    smaller payload. The world-8 cells (two nodes) have not been driven.
+    smaller payload. The world-8 cells were driven on two VR200 nodes of one NVL72 domain, bit
+    for bit on all eight ranks.
     """
 
     def __call__(

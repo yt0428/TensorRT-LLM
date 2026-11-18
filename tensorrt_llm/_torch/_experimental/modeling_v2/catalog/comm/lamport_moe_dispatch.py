@@ -108,7 +108,10 @@ class LamportMoeDispatch(OpWrapper):
     back to back in one CUDA graph, the slowest rank's median per call: 4.7 us at 1 row per
     rank, 5.0 at 16, 5.7 at 64, 6.9 at 128 and 13.2 at 512. NCCL's bf16 all-gather of the
     `[rows, 6144]` activations the gather replaced takes 9.5, 11.1, 28.1, 49.5 and 76.0 us
-    there. The world-8 cells (two nodes) have not been driven.
+    there. The world-8 cells were driven on two VR200 nodes of one NVL72 domain (the eight
+    GPUs one MNNVL clique; IMEX channels in the container), bit for bit on all eight ranks; at
+    world 8 the call takes 6.9 us at 1 row per rank, 7.2 at 16, 8.9 at 64, 11.7 at 128 and
+    28.7 at 512, against 18.4, 21.0, 55.7, 102.4 and 160.3 us for the bf16 all-gather.
     """
 
     def __call__(
