@@ -201,7 +201,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream,
+    maybe_execute_in_parallel,
+)
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
@@ -1647,10 +1650,13 @@ class DecodeTarget:
         self._norm0 = core.w["l0_attn_norm"]
         # The attention block's query and latent half (`_attention`) runs beside the indexer on
         # the core's side stream, the one the MoE block's shared expert (`_moe`) runs on; the
-        # events fork it from and join it to the main stream.
+        # events fork it from and join it to the main stream. The indexer's key half runs ahead
+        # of it there; its two events fork it and mark its keys and head weights ready.
         self._latent_stream = core._side_stream
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
+        self._keys_fork = torch.cuda.Event()
+        self._keys_ready = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1694,25 +1700,33 @@ class DecodeTarget:
         flashinfer_rmsnorm(kv, L.kv_norm, core.eps, out=nope_lat[:, : core.kv_lora])
         return nope_lat
 
-    def _indexer(self, step, x, pos, L, topk_buf, skip_gen: bool):
-        """Append this step's keys to the layer's key pool; unless the engine skipped the
-        indexer (every sequence within index_topk), score every sequence's paged keys and
-        select `index_topk` positions per row into `topk_buf`."""
+    def _indexer_keys(self, step, x, pos, L):
+        """The indexer's key half: the wk | weights_proj projection, and this step's keys
+        normalized, roped and appended to the layer's key pool. Returns the projection, whose
+        trailing columns are the head weights the selection reads."""
         core = self.core
         ix = L.indexer
-        rows = x.shape[0]
         table = core._rope.indexer if ix.rope else core._rope.identity
         kw = cublas_mm(x, ix.wk_wp)
         k_pool = step["ix_pools"][L.index]
         # The keys are read in place, the leading columns of `kw`'s rows.
-        k_pool = cute_dsl_indexer_k_cache_update(
+        cute_dsl_indexer_k_cache_update(
             kw[:, : core.idx_dim], ix.k_norm_w, ix.k_norm_b, pos,
             table.view(-1, 2, core.rope_dim // 2), k_pool,
-            step["slot_mapping_fp8"], step["slot_mapping_scale"], rows,
+            step["slot_mapping_fp8"], step["slot_mapping_scale"], x.shape[0],
             is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
         )  # fmt: skip
-        if skip_gen:
-            return
+        return kw
+
+    def _indexer(self, step, x, pos, L, kw, keys_ready, topk_buf):
+        """Score every sequence's paged keys and select `index_topk` positions per row into
+        `topk_buf`: the q side from `x`, the head weights out of `kw` and the keys out of the
+        layer's pool, both `_indexer_keys`'s. `keys_ready`, when the key half ran on the side
+        stream, is the event behind it, waited for once the q side's projection is issued."""
+        core = self.core
+        ix = L.indexer
+        rows = x.shape[0]
+        table = core._rope.indexer if ix.rope else core._rope.identity
         # q_input_norm and wq_b's activation quantization in one launch, then the FP8 GEMM.
         q = layer_norm_fp8_block_scale_linear(
             x, ix.q_norm_w, ix.q_norm_b, core.idx_eps, ix.wq_b, ix.wq_b_s
@@ -1720,6 +1734,8 @@ class DecodeTarget:
         q = torch.reshape(q, [rows, core.idx_heads, -1])
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         weights = torch.empty([rows, core.idx_heads], dtype=torch.float32, device=x.device)
+        if keys_ready is not None:
+            keys_ready.wait()
         if core.unfused_glue:
             q = ssmax_scaling(q, pos, ix.ssmax_s, ix.ssmax_b)
             q_fp8, weights = cute_dsl_indexer_q_side_fused(
@@ -1737,7 +1753,7 @@ class DecodeTarget:
         kv_lens = step["kv_lens_cuda"][:num_gens]
         logits = cute_dsl_fp8_paged_mqa_logits(
             torch.reshape(q_fp8, [num_gens, next_n, core.idx_heads, core.idx_dim]),
-            k_pool,
+            step["ix_pools"][L.index],
             weights,
             kv_lens,
             step["indexer_k_cache_block_offsets"][:num_gens],
@@ -1903,21 +1919,39 @@ class DecodeTarget:
         fp8_ds_mla append; FlashMLA sparse decode over the pool, and the V up-projection of the
         kernel's live heads, read in place.
 
-        Under CUDA-graph capture the query half runs on the side stream beside the selection.
-        The selection writes the indexer's key pool, `topk_buf` and, through the trtllm top-k,
-        the engine's radix arena; the query half writes `s.fused_q`, `s.nope_lat` and, on an
-        owner layer, its row of the latent pool. Neither reads what the other writes, and the
+        Under CUDA-graph capture the indexer's key half and then the query half run on the side
+        stream beside the selection. The key half writes the indexer's key pool and `kw`, which
+        the selection reads only after waiting for it, past its own q_input_norm and wq_b; the
+        selection writes `topk_buf` and, through the trtllm top-k, the engine's radix arena;
+        the query half writes `s.fused_q`, `s.nope_lat` and, on an owner layer, its row of the
+        latent pool. The query half and the selection read nothing the other writes, and the
         decode reads both after the join. A NoPE sharer appends nothing: its decode reads layer
-        35's rows, appended on the side stream and joined in layer 35. Each later use of the
-        side stream, the MoE block's shared expert and the next layer's query half, first waits
-        for the main stream past this join, so the two uses never overlap."""
+        35's rows, appended on the side stream and joined in layer 35. `kw` stays referenced
+        past the join (recorded on the main stream outside a capture), so the side stream's
+        allocator cannot hand its memory out while the selection reads it. Each later use of
+        the side stream, the MoE block's shared expert and the next layer's key half, first
+        waits for the main stream past this join, so the uses never overlap."""
         core = self.core
         rows = x.shape[0]
         fq = s.fused_q[:, : core.heads]
+        side = self._latent_stream
+        kw, keys_ready = None, None
+        if L.indexer is not None:
+            if do_multi_stream() and side is not None:
+                self._keys_fork.record()
+                with torch.cuda.stream(side):
+                    self._keys_fork.wait()
+                    kw = self._indexer_keys(step, x, pos, L)
+                    self._keys_ready.record()
+                keys_ready = self._keys_ready
+                if not torch.cuda.is_current_stream_capturing():
+                    kw.record_stream(torch.cuda.current_stream())
+            else:
+                kw = self._indexer_keys(step, x, pos, L)
 
         def select():
-            if L.indexer is not None:
-                self._indexer(step, x, pos, L, topk_buf, skip_gen)
+            if L.indexer is not None and not skip_gen:
+                self._indexer(step, x, pos, L, kw, keys_ready, topk_buf)
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
