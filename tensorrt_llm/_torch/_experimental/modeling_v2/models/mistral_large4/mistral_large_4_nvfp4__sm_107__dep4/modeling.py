@@ -1854,12 +1854,17 @@ class DecodeTarget:
         scratch = self._scratch(rows, h.dtype, dev)
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
-        residual = h
+        # The attention block adds into the residual in place, so the residual starts in a
+        # buffer of its own, never in a caller's embeddings.
+        residual = h if inputs_embeds is None else h.clone()
         spec_metadata = kwargs.get("spec_metadata")
         for layer_idx, L in enumerate(self._layers):
             attn_out = self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen)
-            residual = torch.add(residual, self._linear_fp8(attn_out, L.wo, L.wo_s))
-            o = flashinfer_rmsnorm(residual, L.ffn_norm, core.eps)
+            # `residual += wo(attn_out)` in place; `o` is its RMSNorm, written over the
+            # projection.
+            o, residual = flashinfer_fused_add_rmsnorm(
+                self._linear_fp8(attn_out, L.wo, L.wo_s), residual, L.ffn_norm, core.eps
+            )
             mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, padded, pad_rows)
             residual = torch.add(residual, mlp)
             x = flashinfer_rmsnorm(residual, L.next_norm, core.eps)
