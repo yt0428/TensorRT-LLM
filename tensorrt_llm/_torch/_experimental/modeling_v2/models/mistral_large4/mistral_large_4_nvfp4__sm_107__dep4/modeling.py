@@ -1700,10 +1700,11 @@ class DecodeTarget:
         rows = x.shape[0]
         table = core._rope.indexer if ix.rope else core._rope.identity
         kw = cublas_mm(x, ix.wk_wp)
-        k = kw[:, : core.idx_dim].contiguous()
         k_pool = step["ix_pools"][L.index]
+        # The keys are read in place, the leading columns of `kw`'s rows.
         k_pool = cute_dsl_indexer_k_cache_update(
-            k, ix.k_norm_w, ix.k_norm_b, pos, table.view(-1, 2, core.rope_dim // 2), k_pool,
+            kw[:, : core.idx_dim], ix.k_norm_w, ix.k_norm_b, pos,
+            table.view(-1, 2, core.rope_dim // 2), k_pool,
             step["slot_mapping_fp8"], step["slot_mapping_scale"], rows,
             is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
         )  # fmt: skip
