@@ -123,8 +123,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     cute_dsl_radix_topk_decode,
     split_radix_topk_decode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
-    ds_mla_dequant_gather,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
+    ds_mla_dequant_gather_tiled,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_rope_append import (
     ds_mla_rope_append,
@@ -1303,8 +1303,11 @@ class PrefillTarget:
         row is read FP8-rounded) into the held workspace's first rows. A shared source (layer
         35) is gathered once into the rows the step keeps beside them, when it has them, and
         read there by every layer that shares it; otherwise each of those layers gathers it
-        again into the first rows. Decode path, a step past the held workspace: the selections
-        as pool slots, then FlashMLA's sparse fp8 decode over the pool with every context row a
+        again into the first rows. The selections as workspace rows (`ctx.idx`) change only
+        with the selection: a lone request's run starts at row 0, so its selections are
+        already workspace rows; with more, they are offset on a layer that selects and on the
+        step's first layer. Decode path, a step past the held workspace: the selections as
+        pool slots, then FlashMLA's sparse fp8 decode over the pool with every context row a
         one-row sequence, in the step's sub-batches."""
         core = self.core
         tc = fused_q.shape[0]
@@ -1325,17 +1328,20 @@ class PrefillTarget:
         ws = ctx.ws.get(src)
         if ws is None:
             keep = core.shared_source[src] and ctx.kept is not None
-            ws = ds_mla_dequant_gather(
+            ws = ds_mla_dequant_gather_tiled(
                 step["latent_pool"], core._pool_row[src], ctx.kv_req, ctx.kv_pos,
                 step["block_table"], ctx.kept if keep else ctx.ws_buf,
             )  # fmt: skip
             if keep:
                 ctx.ws[src] = ws
-        # Request-local selections to workspace rows: each request's run starts at its
-        # cumulative KV offset.
         sel = topk_buf[:tc]
-        idx = torch.where(sel >= 0, sel + ctx.ws_off[req_idx[:tc]][:, None], sel)
-        flash_mla_sparse_prefill(fused_q, ws, idx.to(torch.int32), core.softmax_scale, lat_out)
+        if ctx.ws_off is None:
+            ctx.idx = sel
+        elif ctx.idx is None or (L.indexer is not None and not step["skip_ctx"]):
+            # Request-local selections to workspace rows: each request's run starts at its
+            # cumulative KV offset.
+            ctx.idx = torch.where(sel >= 0, sel + ctx.ws_off[req_idx[:tc]][:, None], sel)
+        flash_mla_sparse_prefill(fused_q, ws, ctx.idx, core.softmax_scale, lat_out)
 
     def _attn_gen(self, step, L, fused_q, lat_out, slots, sched):
         """Sparse MLA over the generation rows behind the context rows into `lat_out`: FlashMLA's
@@ -1506,7 +1512,9 @@ class PrefillTarget:
         per workspace row as the dequantizing gather and the prefill kernel address them, each
         request's offset, the held workspace's first `n_kv` rows, which every layer's gather
         rewrites, and, when the context KV fits twice, the next `n_kv` rows (`kept`), where a
-        shared owner's gather stays for the step (`ws`).
+        shared owner's gather stays for the step (`ws`). With more than one context request,
+        each request's int32 offset into the workspace (`ws_off`) and the step's selections
+        offset by it (`idx`, `_attn_ctx`).
 
         The decode path, a step past the held rows, with no workspace: the context rows'
         sub-batches of at most `_CTX_DECODE_ROWS`, and one FlashMLA scheduler per sub-batch
@@ -1550,7 +1558,8 @@ class PrefillTarget:
         return SimpleNamespace(
             kv_req=kv_req,
             kv_pos=kv_pos,
-            ws_off=cu[:-1],
+            ws_off=cu[:-1].to(torch.int32) if ctx > 1 else None,
+            idx=None,
             ws_buf=self._ws_buf[:n_kv],
             kept=self._ws_buf[n_kv : 2 * n_kv] if keep else None,
             ws={},
