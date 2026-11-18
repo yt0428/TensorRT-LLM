@@ -1464,7 +1464,7 @@ def _mpi_cells() -> List[Tuple[int, Any]]:
     return [
         (i, c)
         for i, c in enumerate(entry.reducescatter.CELLS)
-        if _on_mpi_session(c) and c.spec["world_size"] == WORLD
+        if _on_mpi_session(c) and c.spec["world_size"] == WORLD and not c.spec.get("ragged")
     ]
 
 
