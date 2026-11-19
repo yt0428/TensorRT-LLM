@@ -344,13 +344,13 @@ def _run_one_mpi_rank() -> int:
 
     from mpi4py import MPI
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather_list import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.allgather_list import (  # noqa: E501
         allgather_list,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.lamport_moe_combine import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.lamport_moe_combine import (  # noqa: E501
         lamport_moe_combine,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.lamport_moe_dispatch import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.lamport_moe_dispatch import (  # noqa: E501
         build_moe_comm_workspace,
         lamport_moe_dispatch,
     )

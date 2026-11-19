@@ -157,14 +157,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ssmax_scali
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather_list import allgather_list
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.lamport_moe_combine import (
-    lamport_moe_combine,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.lamport_moe_dispatch import (
-    build_moe_comm_workspace,
-    lamport_moe_dispatch,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
     triton_draft_attention,
@@ -219,6 +211,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.allgather_list import allgather_list
+from .ops.comm.lamport_moe_combine import lamport_moe_combine
+from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5

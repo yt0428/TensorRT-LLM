@@ -21,10 +21,8 @@ itself, which is what lets one CUDA graph capture every collective of a
 forward and still rotate slots on replay. The peer buffers are three slots x
 world x the token budget, so every row count up to the budget fits.
 
-`build_moe_comm_workspace` builds the attention-DP expert path's `MoeCommWorkspace` the same
-way -- the group, the symmetric slots filled with bf16 -0.0, a device slot counter -- for the
-Triton kernels of `lamport_moe_dispatch` and `lamport_moe_combine`, which follow their own
-slot protocol (`_moe_lamport_kernel`) and share nothing with the all-reduce's workspace.
+`ensure_process_group` is also how a target's own symmetric-memory workspaces bring their
+group up (the sm_107 dep4 target's expert-path slots, in that target's `ops/comm`).
 
 Not an entry: it holds what the entry is handed, and no entry owns it.
 """
@@ -295,86 +293,6 @@ def build_workspace(
         fused_quant=fused_quant,
         fused_twoshot=fused_twoshot,
         fused_add2=fused_add2,
-    )
-
-
-@dataclass(frozen=True)
-class MoeCommWorkspace:
-    """The slots the attention-DP expert path's one-shot gather and reduce-scatter move rows
-    through (`lamport_moe_dispatch`, `lamport_moe_combine`; kernels in `_moe_lamport_kernel`).
-
-    `buffer` is this rank's `[3, world, max_rows * hidden]` bf16 symmetric buffer, region `p`
-    of a slot holding what rank `p` sent this rank, every word -0.0 until a row lands on it
-    and again once its receiver has read it. `peers` holds every rank's buffer address, mapped
-    into this rank, in rank order. `state` is the `[2]` int32 device slot counter and its
-    arrival count: every launch of either kernel reads and advances it, so the tensors are
-    shared state although the dataclass is frozen. One workspace per rank per process.
-    """
-
-    hidden: int
-    max_rows: int
-    rank: int
-    world: int
-    #: The most programs one launch takes: the device's SMs, so every program is resident.
-    programs: int
-    buffer: torch.Tensor
-    handle: object
-    peers: torch.Tensor
-    state: torch.Tensor
-
-
-def build_moe_comm_workspace(hidden: int, max_rows: int, rank: int, world: int) -> MoeCommWorkspace:
-    """Bring up the group, pin and rendezvous the slots, fill them not-ready.
-
-    Collective: every rank of the group calls it with the same `hidden` and `max_rows`, outside
-    any graph capture. Allocates `3 * world * max_rows * hidden` bf16 of symmetric memory per
-    rank and compiles nothing (the kernels are Triton, compiled on their first launch). Returns
-    once every rank's slots hold the sentinel, so no rank's first row lands on unfilled memory.
-
-    A group this call brought up (`ensure_process_group`) is torn down before it returns, and
-    the rendezvous address it set is taken back out of the environment: nothing after the
-    rendezvous uses the group (the kernels reach the peers through `peers` and synchronize
-    in-band), and left up, its NCCL watchdog polls rank 0's store until the process exits, so
-    a rank on another node that outlives rank 0 at shutdown logs the lost store. A group that
-    was already up is left as it is.
-    """
-    import torch.distributed as dist
-    import torch.distributed._symmetric_memory as symm_mem
-
-    address = {key: os.environ.get(key) for key in ("MASTER_ADDR", "MASTER_PORT")}
-    created = ensure_process_group(rank, world)
-    dev = torch.device("cuda", torch.cuda.current_device())
-    buffer = symm_mem.empty(
-        (_PING_PONG, world, max_rows * hidden), dtype=torch.bfloat16, device=dev
-    )
-    buffer.view(torch.int16).fill_(_NEG_ZERO_BF16)
-    group = dist.group.WORLD
-    handle = symm_mem.rendezvous(buffer, group=getattr(group, "group_name", group))
-    peers = torch.tensor(
-        [handle.get_buffer(peer, buffer.shape, buffer.dtype).data_ptr() for peer in range(world)],
-        dtype=torch.int64,
-        device=dev,
-    )
-    state = torch.zeros(2, dtype=torch.int32, device=dev)
-    torch.cuda.synchronize(dev)
-    dist.barrier(group=group, device_ids=[dev.index])
-    if created:
-        dist.destroy_process_group()
-        for key, value in address.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    return MoeCommWorkspace(
-        hidden=hidden,
-        max_rows=max_rows,
-        rank=rank,
-        world=world,
-        programs=torch.cuda.get_device_properties(dev).multi_processor_count,
-        buffer=buffer,
-        handle=handle,
-        peers=peers,
-        state=state,
     )
 
 

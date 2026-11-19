@@ -12,8 +12,9 @@ import torch
 import triton
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import _moe_lamport_kernel as _k
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm._lamport import MoeCommWorkspace
+
+from . import _moe_lamport_kernel as _k
+from ._moe_workspace import MoeCommWorkspace
 
 #: The most ranks the kernel's row counts address.
 _MAX_WORLD = 8

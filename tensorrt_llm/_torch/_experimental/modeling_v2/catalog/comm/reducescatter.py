@@ -69,8 +69,8 @@ _DEP8_MOE_LAYERS = 71
 # Mistral Large 4 NVFP4 sm_107 at dep4 and dep8, past the one-shot workspace: the same combine
 # of the runner's partial over every rank's own rows unpadded, `[sum(counts), 6144]` bf16, each
 # rank keeping its `counts[rank]` rows, `sizes=counts` (one ncclReduce per rank in one group
-# when the counts differ), on the MPI-session communicator. `lamport_moe_dispatch`'s matrix
-# drives these cells (`test_modeling_v2_moe_comm.py`), not this entry's own.
+# when the counts differ), on the MPI-session communicator. `_reducescatter_op_matrix.py` drives them
+# (`check_mpi_ragged_cells`).
 _RAGGED_DEP4 = dict(trailing=(6144,), dtype=torch.bfloat16, world_size=4, process_group=None)
 _RAGGED_DEP8 = dict(_RAGGED_DEP4, world_size=8, nodes=2)
 

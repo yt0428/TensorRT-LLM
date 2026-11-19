@@ -5,7 +5,7 @@
 `dispatch_kernel` is `lamport_moe_dispatch`'s gather of every rank's routed-expert inputs, and
 `combine_kernel` is `lamport_moe_combine`'s reduce-scatter of the expert partials with the
 add of the shared expert (and, on request, of the residual and the next layer's RMSNorm).
-Both move rows through a `MoeCommWorkspace` (`_lamport.py`): `[3, world, region]` 16-bit
+Both move rows through a `MoeCommWorkspace` (`_moe_workspace.py`): `[3, world, region]` 16-bit
 words of symmetric memory per rank, region `p` of a slot holding what rank `p` sent this rank.
 
 Lamport readiness, in band: every word of a slot holds bf16 -0.0 (0x8000) until a peer's row

@@ -10,14 +10,12 @@ import torch
 import triton
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import _moe_lamport_kernel as _k
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm._lamport import MoeCommWorkspace
 
-# A target builds the workspace this entry is handed through the entry itself, so `_lamport`
-# stays private to the catalog.
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm._lamport import (
-    build_moe_comm_workspace as build_moe_comm_workspace,
-)
+from . import _moe_lamport_kernel as _k
+from ._moe_workspace import MoeCommWorkspace
+
+# The target builds the workspace this entry is handed through the entry itself.
+from ._moe_workspace import build_moe_comm_workspace as build_moe_comm_workspace
 
 #: The most ranks the kernel's row counts address.
 _MAX_WORLD = 8

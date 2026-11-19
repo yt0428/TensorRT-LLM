@@ -10,9 +10,8 @@ from typing import List, Optional, Sequence
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._utils import mpi_rank
-
-from .._op import Arch, Cell, OpWrapper
 
 # Mistral Large 4 NVFP4 at dep4 and dep8: the routed experts' inputs of every MoE layer (1..71)
 # above the one-shot workspace -- e2m1 codes [rows, 3072] uint8, linear e4m3 scales

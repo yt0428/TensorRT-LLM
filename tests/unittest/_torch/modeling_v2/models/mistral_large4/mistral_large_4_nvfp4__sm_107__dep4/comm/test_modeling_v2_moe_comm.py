@@ -38,8 +38,8 @@ _DROPPED_PREFIXES = ("PMIX_", "PMI_", "OMPI_", "SLURM_", "PRTE_")
 
 
 def _env() -> dict:
-    # tests/unittest/_torch/modeling_v2/comm -> repo root.
-    repo_root = _HERE.parents[4]
+    # tests/unittest/_torch/modeling_v2/models/mistral_large4/<target>/comm -> repo root.
+    repo_root = _HERE.parents[7]
     assert (repo_root / "tensorrt_llm").is_dir(), f"expected the repo root at {repo_root}"
     env = {
         k: v
