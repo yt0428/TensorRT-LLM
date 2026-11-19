@@ -13,9 +13,15 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_wait
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
-from .cute_dsl_fp8_block_scale_linear import cute_dsl_fp8_block_scale_linear
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
+    Arch,
+    Cell,
+    OpWrapper,
+    true_fp32_matmul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
+    cute_dsl_fp8_block_scale_linear,
+)
 
 #: Mistral Large 4 at dep4: 64 heads, the 512-wide latent, v_head_dim 128, wo [6144, 8192].
 HEADS = 64
