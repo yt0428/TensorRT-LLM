@@ -168,9 +168,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear,
     prepare_weight_scale,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.layer_norm_fp8_block_scale_linear import (
-    layer_norm_fp8_block_scale_linear,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.mla_v_up_fp8_block_scale_linear import (
     mla_v_up_fp8_block_scale_linear,
 )
@@ -217,6 +214,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5

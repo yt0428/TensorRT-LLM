@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""VR200 test for the layer_norm_fp8_block_scale_linear catalog entry: its quantized operands
-against the separate `layer_norm` and `fp8_quantize_1x128_packed_ue8m0`, byte for byte, and its
-output against the reference."""
+"""VR200 test for the sm_107 dep4 target's layer_norm_fp8_block_scale_linear entry: its quantized
+operands against the separate `layer_norm` and `fp8_quantize_1x128_packed_ue8m0`, byte for byte,
+and its output against the reference."""
 
 import pytest
 import torch
@@ -10,16 +10,16 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
     prepare_weight_scale,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.layer_norm_fp8_block_scale_linear import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.gemm.layer_norm_fp8_block_scale_linear import (  # noqa: E501
     layer_norm_fp8_block_scale_linear as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.layer_norm_fp8_block_scale_linear import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.gemm.layer_norm_fp8_block_scale_linear import (  # noqa: E501
     layer_norm_fp8_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
 from tensorrt_llm.quantization.utils.fp8_utils import get_col_major_tma_aligned_packed_tensor
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(

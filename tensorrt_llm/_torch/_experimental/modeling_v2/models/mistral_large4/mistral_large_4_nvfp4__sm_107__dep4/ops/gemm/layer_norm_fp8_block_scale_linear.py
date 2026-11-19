@@ -12,10 +12,11 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_wait
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-
-from .._op import Arch, Cell, OpWrapper
-from ..norm.layer_norm import layer_norm
-from .cute_dsl_fp8_block_scale_linear import cute_dsl_fp8_block_scale_linear
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
+    cute_dsl_fp8_block_scale_linear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
 
 #: The one call site's widths: the Mistral Large 4 DSA indexer's q_input_norm over hidden 6144,
 #: feeding its wq_b, 32 heads x 128.
