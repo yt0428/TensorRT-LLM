@@ -16,9 +16,12 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
     flashinfer_fused_add_rmsnorm as op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
 
 __extra_import_path__ = [".."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "flashinfer_fused_add_rmsnorm requires a CUDA device"
 
@@ -46,6 +49,27 @@ def test_certified_cells(cell) -> None:
         assert out_x is x and out_residual is residual, "the op writes in place"
     torch.testing.assert_close(residual, ref_residual)
     torch.testing.assert_close(x, ref_x)
+
+
+@pytest.mark.parametrize("rows", [4, 16, 32, 64, 128])
+def test_matches_the_separate_add_and_rmsnorm(rows) -> None:
+    """The pair it replaces in a decode target, `residual = residual + x` then
+    `rmsnorm(residual)`: the residual is bitwise the bf16 add (the fp32 sum
+    rounded once); the normalized row reads that sum before the rounding, so it
+    differs from normalizing the rounded residual by that rounding and by each
+    side's own output rounding: three bf16 roundings of about 0.42 ulp RMS each,
+    0.73 ulp RMS measured on VR200 at every row count here."""
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    shape = (rows, 6144)
+    # A residual well above the projection added into it, so the add rounds.
+    x = (torch.randn(shape, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+    residual = (torch.randn(shape, generator=g, device="cuda") * 8.0).to(torch.bfloat16)
+    weight = (1.0 + 0.1 * torch.randn(6144, generator=g, device="cuda")).to(torch.bfloat16)
+    expected_residual = torch.add(residual, x)
+    expected_x = flashinfer_rmsnorm(expected_residual, weight, 1e-5)
+    out_x, out_residual = op(x, residual, weight, 1e-5)
+    assert torch.equal(out_residual, expected_residual)
+    assert_within_ulp(out_x, expected_x, element_ulp=2.0, rms_ulp=1.0)
 
 
 def _one(**over):

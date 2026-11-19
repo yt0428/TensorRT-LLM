@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ds_mla_dequant_gather catalog entry: bitwise against the reference
-(e4m3 times a power of two is exact in bf16, and the rope half is a copy)."""
+"""GPU test for the ds_mla_dequant_gather and ds_mla_dequant_gather_tiled catalog entries:
+bitwise against the reference they share (e4m3 times a power of two is exact in bf16, and the
+rope half is a copy)."""
 
 import math
 import zlib
@@ -10,13 +11,18 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
-    ds_mla_dequant_gather as op,
+    ds_mla_dequant_gather,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
+    ds_mla_dequant_gather_tiled,
 )
 
 __extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 assert torch.cuda.is_available(), "ds_mla_dequant_gather requires a CUDA device"
+
+_OPS = (ds_mla_dequant_gather, ds_mla_dequant_gather_tiled)
 
 #: Every pool byte the cell's requests do not hold: NaN as an e4m3 code, as an fp32 tile scale
 #: and as a bf16 rope value, so a read from another page, owner row or offset shows in the bits.
@@ -104,7 +110,7 @@ def _prefix_counts(n: int) -> list[int]:
     return sorted(m for m in counts if 0 < m < n)
 
 
-def _check_prefixes(args, full: torch.Tensor) -> int:
+def _check_prefixes(op, args, full: torch.Tensor) -> int:
     """Each count of `_prefix_counts(N)` gathers the leading kv_req / kv_pos rows into a fresh
     `_UNWRITTEN` buffer: its rows are the full call's leading rows bitwise and the buffer's
     later rows stay unwritten. One sync for all counts; a failure re-runs them one by one to
@@ -127,13 +133,19 @@ def _check_prefixes(args, full: torch.Tensor) -> int:
 
 
 _CELLS = [
-    pytest.param(c, id=c.why[:60], marks=[pytest.mark.large] if c.spec.get("large") else [])
+    pytest.param(
+        op,
+        c,
+        id=f"{type(op).__name__}:{c.why[:60]}",
+        marks=[pytest.mark.large] if c.spec.get("large") else [],
+    )
+    for op in _OPS
     for c in op.CELLS
 ]
 
 
-@pytest.mark.parametrize("cell", _CELLS)
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
+@pytest.mark.parametrize("op,cell", _CELLS)
+def test_certified_cells(op, cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     args, buf = _build(cell.spec, zlib.crc32(cell.why.encode()))
     n = args[2].shape[0]
@@ -145,10 +157,11 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     del ref
     assert _untouched(buf[n:]), "the call wrote rows of the buffer past N"
     if cell.spec.get("prefixes"):
-        assert _check_prefixes(args, out) > 64
+        assert _check_prefixes(op, args, out) > 64
 
 
-def test_is_valid_refuses_a_bf16_pool() -> None:
+@pytest.mark.parametrize("op", _OPS, ids=lambda op: type(op).__name__)
+def test_is_valid_refuses_a_bf16_pool(op) -> None:
     args, _ = _build(dict(cached=[0], new=[64], blocks=4, owners=2, tokens_per_block=32, row=1), 1)
     args = list(args)
     args[0] = args[0].view(torch.bfloat16)
@@ -156,7 +169,8 @@ def test_is_valid_refuses_a_bf16_pool() -> None:
         op.is_valid(*args)
 
 
-def test_is_valid_refuses_an_out_shorter_than_kv_req() -> None:
+@pytest.mark.parametrize("op", _OPS, ids=lambda op: type(op).__name__)
+def test_is_valid_refuses_an_out_shorter_than_kv_req(op) -> None:
     """Unguarded, an `out` of 40 rows for 64 kv_req entries comes back right for its 40 rows,
     and the kernel writes the other 24 past its end: here into the rest of the 64-row buffer
     the test owns, where they are the reference's rows 40..63. Guarded, the call raises
@@ -178,7 +192,8 @@ def test_is_valid_refuses_an_out_shorter_than_kv_req() -> None:
         _assert_bitwise(op(*args), ref)
 
 
-def test_is_valid_refuses_48_out_rows_for_64_kv_req_entries() -> None:
+@pytest.mark.parametrize("op", _OPS, ids=lambda op: type(op).__name__)
+def test_is_valid_refuses_48_out_rows_for_64_kv_req_entries(op) -> None:
     """Unguarded, an `out` of 48 rows for 64 kv_req entries comes back right for its 48 rows
     while the kernel writes the other 16 past its end: here into the rest of the 64-row
     buffer the test owns, so the stray rows land where the test can read them."""

@@ -123,8 +123,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     cute_dsl_radix_topk_decode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
-    ds_mla_dequant_gather,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
+    ds_mla_dequant_gather_tiled,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_rope_append import (
     ds_mla_rope_append,
@@ -1153,7 +1153,7 @@ class PrefillTarget:
         ws = ctx.ws.get(src)
         if ws is None:
             keep = core.shared_source[src] and ctx.kept is not None
-            ws = ds_mla_dequant_gather(
+            ws = ds_mla_dequant_gather_tiled(
                 step["latent_pool"], core._pool_row[src], ctx.kv_req, ctx.kv_pos,
                 step["block_table"], ctx.kept if keep else ctx.ws_buf,
             )  # fmt: skip

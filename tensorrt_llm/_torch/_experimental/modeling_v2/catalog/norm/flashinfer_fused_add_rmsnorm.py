@@ -31,10 +31,13 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The two hidden sizes the shipped targets normalize over, at a decode
-    # shape and a prefill shape. Both targets call this op only on the
-    # residual stream, so there is no third width to cover and no 3-D case:
-    # unlike plain rmsnorm this one never runs on a per-head view.
+    # The hidden sizes the shipped targets normalize over, at decode and
+    # prefill shapes. Every target calls this op only on the residual stream,
+    # so there is no 3-D case: unlike plain rmsnorm this one never runs on a
+    # per-head view. Mistral Large 4's dep4 decode target adds its attention
+    # output into the residual and normalizes for the MLP here, hidden 6144 at
+    # eps 1e-5, on DSpark's four rows per request: 4 rows at batch 1 up to 128
+    # at its largest captured batch, 32.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, gpt-oss-120b hidden",
@@ -47,6 +50,14 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
         Cell(
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="dep4 DSpark decode batch 1, 4 rows: mistral-large-4 hidden 6144 at eps 1e-5",
+            spec=dict(shape=(4, 6144), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="dep4 DSpark decode batch 32, 128 rows: the largest captured batch, hidden 6144",
+            spec=dict(shape=(128, 6144), dtype=torch.bfloat16, eps=1e-5),
         ),
     )
 
