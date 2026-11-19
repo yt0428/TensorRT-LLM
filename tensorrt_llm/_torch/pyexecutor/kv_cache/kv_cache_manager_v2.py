@@ -552,6 +552,26 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
     return reserve, headroom
 
 
+def get_max_admissible_sequences(
+    max_batch_size: int,
+    mapping: Mapping,
+    *,
+    is_disagg: bool,
+    disable_overlap_scheduler: bool,
+) -> int:
+    """Most sequences a manager holds caches for at once, reserved index slots aside.
+
+    With pipeline parallelism every in-flight microbatch holds its sequences. In
+    disaggregated mode up to that many more requests can still be in KV transfer
+    (TRANS_IN_PROGRESS) while holding their index slots, and with the overlap
+    scheduler on (non-PP) a retiring request holds its slot one extra iteration;
+    either doubles the count.
+    """
+    max_num_sequences = max_batch_size * mapping.pp_size
+    needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
+    return max_num_sequences * (2 if needs_extra_leases else 1)
+
+
 def _estimate_cache_size_components(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[int | None],
@@ -1877,7 +1897,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # scheduler on (non-PP), a retiring request holds its lease one extra
         # iteration and needs the same coefficient.
         max_num_sequences = max_batch_size * mapping.pp_size
-        needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
@@ -1896,7 +1915,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
-        self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+        self.max_admissible_sequences = get_max_admissible_sequences(
+            max_batch_size,
+            mapping,
+            is_disagg=is_disagg,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+        )
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
@@ -4698,7 +4722,22 @@ class KVCacheManagerV2(BaseResourceManager):
                     + draft_len
                     + self.num_extra_kv_tokens
                 )
-                if not kv_cache.resize(capacity):
+                # A disagg generation-init request's prompt is history here as
+                # on the target (prepare_disagg_gen_init): a windowed draft
+                # layer then takes only the pages in its window, where without
+                # a history it would take the whole prompt's.
+                history = (
+                    max(kv_cache.history_length, req.prompt_len)
+                    if req.is_disagg_generation_init_state
+                    else None
+                )
+                if history is not None:
+                    capacity = max(capacity, history)
+                if not (
+                    kv_cache.resize(capacity, history)
+                    if history is not None
+                    else kv_cache.resize(capacity)
+                ):
                     raise RuntimeError(
                         f"Draft KV cache context resize failed for request "
                         f"{req.py_request_id}: could not resize to {capacity} tokens"

@@ -502,7 +502,10 @@ def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -
 def dflash_allocated_ctx_limit(
     block_counts: torch.Tensor, page_size: int, block_size: int
 ) -> torch.Tensor:
-    """Context length a request may advertise, given the pages it holds.
+    """Context length a request may advertise, given how far its pages reach.
+
+    ``block_counts`` is one past the last page a row holds, in its slot's
+    columns (``_refresh_ctx_block_tables``).
 
     Leaves ``block_size`` positions of room: the MLA path writes the block's own
     latents at ``ctx_len .. ctx_len + block_size``, so stopping at exactly the
@@ -606,19 +609,32 @@ class DFlashSpecMetadata(SpecMetadata):
             # prefilling, so _store_prefill_context -- the only other assigner --
             # never runs and every request would land on the dummy slot.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            for rid in self.request_ids[num_contexts:]:
+            shifts = {}
+            for i in range(num_contexts, num_seqs):
+                rid = self.request_ids[i]
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    slot = worker._assign_slot(rid)
+                    if slot is None:
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                        continue
+                    # The slot's column 0 is this row's first token, while the
+                    # block-table row numbers pages from the prompt's first.
+                    # Starting the slot on that token's page keeps its columns
+                    # on pages the request holds; a windowed draft pool has
+                    # freed the prompt's early ones.
+                    first_pos = self._first_position(i)
+                    shifts[slot] = 0 if first_pos is None else first_pos // worker._ctx_page_size
+            if shifts:
+                worker._write_slot_block_shift(shifts)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -629,6 +645,12 @@ class DFlashSpecMetadata(SpecMetadata):
                 pin_memory=prefer_pinned(),
             )
             worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+
+    def _first_position(self, row: int) -> Optional[int]:
+        """Position of ``row``'s first token this step, from the host copy, or None."""
+        if self.host_position_ids is None or self.seq_lens is None:
+            return None
+        return int(self.host_position_ids[sum(self.seq_lens[:row])])
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -747,9 +769,16 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
-        # Pages the manager handed this request, per batch row. Saturates at
-        # the table width on the default backend -- dflash_allocated_ctx_limit.
+        # One past the last page the manager handed this request, per batch
+        # row. Saturates at the table width on the default backend --
+        # dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
+        self._ctx_block_cols = None  # arange(max_blocks_per_seq)
+        # Per slot, the page of the request's block-table row its column 0
+        # starts on, and the slots where that is not 0. See
+        # _write_slot_block_shift.
+        self._slot_block_shift = None  # [max_batch+1] long
+        self._slot_block_shift_host = {}
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
         self._ctx_kv_indptr = None
@@ -994,6 +1023,7 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_block_cols = torch.arange(max_blocks, dtype=torch.long, device="cuda")
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
             f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
@@ -1021,12 +1051,21 @@ class DFlashWorker(SpecWorkerBase):
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes.
-        # clone(): .to() is a no-op for an int64 source, and the in-place ops
-        # below would then edit attn_metadata's own tensor.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
-        # Before the clamp erases the placeholders. Informative only on the
-        # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
-        self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
+        encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64)
+        # Column c of a slot is page shift + c // page of the request's row
+        # (_write_slot_block_shift); pages past the row read as unallocated.
+        # The gather copies, so attn_metadata's own tensor is never edited.
+        cols = self._ctx_block_cols[: encoded.size(1)]
+        shift = self._slot_block_shift[self._batch_to_slot[:num_seqs]]
+        index = cols.unsqueeze(0) + shift.unsqueeze(1)
+        past_row = index >= encoded.size(1)
+        encoded = torch.gather(encoded, 1, index.clamp_(max=encoded.size(1) - 1))
+        encoded.masked_fill_(past_row, -1)
+        # Before the clamp erases the placeholders: one past the last page held,
+        # since a windowed pool leaves unallocated pages before the held ones.
+        # Informative only on the python V2 backend; the cpp one already
+        # mapped BAD_PAGE_INDEX to 0.
+        self._ctx_block_counts[:num_seqs].copy_(((encoded >= 0) * (cols + 1)).amax(dim=1))
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
         return True
@@ -1114,6 +1153,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        self._slot_block_shift = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._slot_block_shift_host = {}
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -1310,6 +1351,8 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             clear(slot)
+            if slot in self._slot_block_shift_host:
+                self._write_slot_block_shift({slot: 0})
         return self._req_to_slot[req_id]
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
@@ -1429,6 +1472,30 @@ class DFlashWorker(SpecWorkerBase):
         slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
         vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
         self._ctx_len.index_copy_(
+            0,
+            slots_pinned.to("cuda", non_blocking=True),
+            vals_pinned.to("cuda", non_blocking=True),
+        )
+
+    def _write_slot_block_shift(self, updates: dict[int, int]) -> None:
+        """Set the page each slot's column 0 starts on, in one async scatter.
+
+        A slot assigned at prefill numbers its columns from the prompt's first
+        token, as the request's block-table row does, so it starts on page 0. A
+        disaggregated generation slot starts at the request's first generated
+        token, on the page that holds it; until the request is gone the slot's
+        column ``c`` is page ``shift + c // page_size`` of the row.
+        """
+        for slot, shift in updates.items():
+            if shift:
+                self._slot_block_shift_host[slot] = shift
+            else:
+                self._slot_block_shift_host.pop(slot, None)
+        slots, values = zip(*updates.items())
+        pinned = prefer_pinned()
+        slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
+        vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+        self._slot_block_shift.index_copy_(
             0,
             slots_pinned.to("cuda", non_blocking=True),
             vals_pinned.to("cuda", non_blocking=True),

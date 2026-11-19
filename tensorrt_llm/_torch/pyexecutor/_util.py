@@ -65,7 +65,8 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
+                                           get_max_admissible_sequences)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -1089,6 +1090,7 @@ class KvCacheCreator:
                                 is_draft: bool = False,
                                 mapping=None,
                                 tokens_per_block: Optional[int] = None,
+                                max_batch_size: Optional[int] = None,
                                 include_request_cost: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
@@ -1111,7 +1113,8 @@ class KvCacheCreator:
                 mapping if mapping is not None else self._mapping,
                 tokens_per_block=tokens_per_block,
                 max_seq_len=self._max_seq_len,
-                max_batch_size=self._max_batch_size,
+                max_batch_size=(self._max_batch_size
+                                if max_batch_size is None else max_batch_size),
                 max_num_tokens=self._max_num_tokens,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
@@ -1292,6 +1295,17 @@ class KvCacheCreator:
             draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
                 draft_kv_cache_manager_cls, effective_draft_config,
                 draft_kv_cache_config)
+            # A pool funded only for its windows does not grow with the
+            # target's, so it holds a window for every sequence the managers
+            # admit, plus the CUDA-graph padding request's reserved slot.
+            window_sequences = None
+            if self._get_draft_kv_retention_window(kv_cache_config) is not None:
+                window_sequences = get_max_admissible_sequences(
+                    self._max_batch_size,
+                    draft_mapping,
+                    is_disagg=self._is_disagg,
+                    disable_overlap_scheduler=self._disable_overlap_scheduler,
+                ) + 1
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 return scaled(
@@ -1301,6 +1315,7 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         tokens_per_block=draft_tokens_per_block,
+                        max_batch_size=window_sequences,
                         is_draft=True,
                         include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
@@ -1312,6 +1327,7 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         tokens_per_block=draft_tokens_per_block,
+                        max_batch_size=window_sequences,
                         num_layers=self._get_num_draft_layers(),
                         is_draft=True,
                         include_request_cost=include_request_cost))
@@ -2262,12 +2278,37 @@ class KvCacheCreator:
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
 
+    def _get_draft_kv_retention_window(
+            self, kv_cache_config: KvCacheConfig) -> Optional[int]:
+        """Tokens the separate draft pool keeps per sequence, or None for all.
+
+        A drafter that bounds its own context reads declares
+        ``draft_kv_read_window`` on its config: it reads at most that many
+        trailing positions, so the pool may free the pages before them. The
+        pool keeps two pages more: one because a disaggregated generation slot
+        starts on the page that holds its first token, up to a page before
+        that token (DFlashSpecMetadata.prepare), and one of margin.
+
+        None under block reuse: a pool funded only for the live windows would
+        evict the cached pages the reuse match depends on.
+        """
+        read_window = getattr(
+            self._get_effective_draft_config().pretrained_config,
+            "draft_kv_read_window", None)
+        if read_window is None or kv_cache_config.enable_block_reuse:
+            return None
+        return int(read_window) + 2 * self._get_draft_tokens_per_block()
+
     def _get_draft_max_attention_window(
         self,
         max_seq_len: int,
         kv_cache_config: KvCacheConfig,
     ) -> Optional[List[int]]:
         """Derive the draft manager's per-layer attention windows."""
+        retention_window = self._get_draft_kv_retention_window(kv_cache_config)
+        if retention_window is not None:
+            return _normalize_attention_windows(
+                [retention_window] * self._get_num_draft_layers(), max_seq_len)
         effective_draft_config = self._get_effective_draft_config()
         return _derive_draft_max_attention_window(
             kv_cache_config,

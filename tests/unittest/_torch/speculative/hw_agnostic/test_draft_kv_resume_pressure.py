@@ -50,6 +50,7 @@ class _Req:
         self.lora_task_id = None
         self.cache_salt = None
         self.is_dummy = False
+        self.is_disagg_generation_init_state = False
         self.is_last_context_chunk = True
         self.context_current_position = 0
         self.context_chunk_size = 8

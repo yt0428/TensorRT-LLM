@@ -2484,6 +2484,9 @@ class ModelingV2MistralLarge4Nvfp4Sm107Dep4(
                 modeling_v2_target=None,
             )
             self.draft_model = DraftModel(self, self.draft_config)
+            # The drafter attends only the last `window` rows of its context, so
+            # its pool may drop older pages when nothing reuses them.
+            draft_cfg.draft_kv_read_window = self.draft_model.window
             self.spec_worker = get_spec_worker(
                 self.spec_config,
                 model_config,
