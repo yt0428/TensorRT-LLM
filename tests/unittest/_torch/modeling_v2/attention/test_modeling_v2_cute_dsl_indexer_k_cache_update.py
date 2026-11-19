@@ -118,13 +118,22 @@ def _identity_table(positions: int, device: str | None = None) -> torch.Tensor:
 
 
 def _keys_and_norm(spec, tokens: int, g: torch.Generator):
-    """`(indexer_k, norm_weight, norm_bias)`: bf16 keys (misaligned when the spec says so)."""
+    """`(indexer_k, norm_weight, norm_bias)`: bf16 keys (misaligned when the spec says so; the
+    leading 128 columns of `row_stride`-wide rows when it names one, the rest of each row NaN,
+    so a read past a row's keys reaches the scale)."""
     keys = torch.randn(tokens, HEAD_DIM, generator=g, device="cuda") * 3.0 + 0.5
     if spec["misalign"]:
         storage = torch.empty(tokens * HEAD_DIM + 1, dtype=torch.bfloat16, device="cuda")
         indexer_k = storage[1:].view(tokens, HEAD_DIM)
         indexer_k.copy_(keys)
         assert indexer_k.data_ptr() % 8 != 0
+    elif spec.get("row_stride"):
+        storage = torch.full(
+            (tokens, spec["row_stride"]), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        indexer_k = storage[:, :HEAD_DIM]
+        indexer_k.copy_(keys)
+        assert indexer_k.stride(0) == spec["row_stride"]
     else:
         indexer_k = keys.to(torch.bfloat16)
     norm_weight = 1.0 + 0.1 * torch.randn(HEAD_DIM, generator=g, device="cuda")
@@ -986,17 +995,23 @@ def test_guard_refuses_slots_that_disagree_on_validity() -> None:
             op(*args, is_neox=False, compiled=_compiled(False, False))
 
 
-def _strided_keys(args):
-    """Mistral Large 4's keys as the projection leaves them: the first 128 columns of `[T, 160]`."""
-    kw = torch.zeros(args[0].shape[0], HEAD_DIM + 32, dtype=torch.bfloat16, device="cuda")
-    kw[:, :HEAD_DIM] = args[0]
-    args[0] = kw[:, :HEAD_DIM]
+def test_validate_refuses_keys_whose_columns_are_strided() -> None:
+    """A wider row read in place is the `row_stride` cells'; a key row whose own
+    elements are strided is refused by `validate=True` before any launch."""
+    args, pool, _ = _small()
+    before = pool.clone()
+    kw = torch.zeros(args[0].shape[0], HEAD_DIM, 2, dtype=torch.bfloat16, device="cuda")
+    kw[..., 0] = args[0]
+    args[0] = kw[..., 0]
+    with pytest.raises(ValueError, match="contiguous, non-overlapping rows"):
+        op(*args, is_neox=False, compiled=_compiled(False, False), validate=True)
+    torch.cuda.synchronize()
+    assert torch.equal(pool, before), "a refused call wrote the pool"
 
 
 @pytest.mark.parametrize(
     "mutate, message",
     [
-        (_strided_keys, r"Mismatched indexer_k\.strides\[0\]"),
         (lambda a: a.__setitem__(1, a[1].to(torch.bfloat16)), r"argument #1 .*dtype=float32"),
         (lambda a: a.__setitem__(2, a[2].to(torch.bfloat16)), r"argument #2 .*dtype=float32"),
         (lambda a: a.__setitem__(4, a[4].to(torch.bfloat16)), r"argument #4 .*dtype=float32"),
@@ -1007,7 +1022,6 @@ def _strided_keys(args):
         (lambda a: a.__setitem__(6, a[6][:4]), r"Mismatched slot_mapping_fp8\.shape"),
     ],
     ids=[
-        "strided keys",
         "bf16 norm weight",
         "bf16 norm bias",
         "bf16 table",

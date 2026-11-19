@@ -181,7 +181,8 @@ _ML4_1M_DEP4_BOOT = dict(
 class CuteDslIndexerKCacheUpdate(OpWrapper):
     """Turn this step's pre-norm indexer keys into indexer K cache entries, in place.
 
-    For each of the first `num_tokens` rows of `indexer_k` (`[T, 128]` bf16):
+    For each of the first `num_tokens` rows of `indexer_k` (`[T, 128]` bf16, its
+    rows at any stride, each row contiguous):
 
     1. LayerNorm over the row (`eps = 1e-6`, fp32 `norm_weight` / `norm_bias`),
        rounded to bf16;
@@ -706,6 +707,26 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
             spec=dict(_ML4_1M_DEP4_BOOT, tokens=16, pad_rows=15, layer=42),
         ),
         Cell(
+            why="dep4 decode keys read in place, the leading 128 columns of the indexer "
+            "projection's 192-wide row: DSpark batch 16 (64 rows) captured on a V2 view",
+            spec=dict(_ML4_1M_V2, blocks=1100, tokens=64, graph=True, row_stride=192, layer=20),
+        ),
+        Cell(
+            why="dep4 decode keys at row stride 192, DSpark batch 1 (4 rows) captured on a V2 "
+            "view, its last row padding at slot -1",
+            spec=dict(_ML4_1M_V2, blocks=1100, tokens=4, graph=True, row_stride=192, pad_rows=1),
+        ),
+        Cell(
+            why="keys at row stride 192 past the 2-row launcher's last count (1025 rows): the "
+            "8-row launcher",
+            spec=dict(_ML4_1M_V2, blocks=1100, tokens=1025, row_stride=192),
+        ),
+        Cell(
+            why="keys at an odd row stride (130): rows 4-byte aligned only, the scalar-load "
+            "launcher",
+            spec=dict(_ML4_1M_V2, blocks=1100, tokens=33, row_stride=130),
+        ),
+        Cell(
             why="dep4 1M mixed step on a V2 view (pool row 18): the large manager cell's 3 "
             "chunks and 13 decode rows in pre-merge",
             spec=dict(
@@ -766,7 +787,8 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     launchers once; a target builds them on its first forward (the pool
     layout is an engine value) and passes the result as `compiled`. `__call__`
     picks the launcher on the host: 2 rows per CTA up to 1024 tokens, 8 above,
-    and 8-byte loads when `indexer_k` is 8-byte aligned. There is no stock-op
+    and 8-byte loads when every row of `indexer_k` is 8-byte aligned (its base
+    and its row stride). There is no stock-op
     fallback; every row count runs the kernel. Metadata consumed: none beyond
     the arguments (the slot mappings and positions are the caller's).
 
@@ -835,11 +857,13 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     small result can land several e4m3 steps away (measured: 3 steps on one
     code of a 32768-row step). The test bounds each code by that chain.
 
+    The keys' row stride is a runtime value: the leading 128 columns of a wider
+    row, such as dep4's `kw[:, :128]` of its `[T, 192]` wk|weights_proj output,
+    are read in place (the `row_stride` cells; `validate=True` refuses a view
+    whose rows overlap or whose last dim is not contiguous).
+
     Refused by the compiled launcher itself, before any launch and with
-    `validate` off (measured): `indexer_k` that is not row-contiguous, such as
-    the first 128 columns of a `[T, 160]` wk|weights_proj output, raises
-    `ValueError: Mismatched indexer_k.strides[0] on argument #0 ... expected to
-    be 128` -- copy the keys contiguous first; fp32 `norm_weight`, `norm_bias`
+    `validate` off (measured): fp32 `norm_weight`, `norm_bias`
     and `rotary_cos_sin`, int32 `position_ids` and int64 slot mappings are
     enforced (`Mismatched Tensor on argument #N ... expected dtype=...`);
     `position_ids` must have exactly `indexer_k`'s rows (`Mismatched
@@ -857,8 +881,8 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     of more than 1048576 rows; NeoX rope; more than 32768
     rows; strided pools past 18432 blocks; rebuilt V2 views past 147456
     blocks, and manager views past 144472 slots (dep4's manager cells reach
-    77621); the scalar-load launchers on a V2 view (the target's keys are a
-    fresh contiguous copy, 8-byte aligned).
+    77621); the scalar-load launchers on a V2 view at a contiguous row stride
+    (the targets' keys are 8-byte aligned, at row stride 128 or 192).
 
     Hard limits (sm_103)
       slot offset  contiguous launchers: int64 slot + int64 column, added to

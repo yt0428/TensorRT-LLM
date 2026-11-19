@@ -4,7 +4,7 @@
 
 The backend sequence this kernel replaces is:
 
-    indexer_k BF16 [T, 128]
+    indexer_k BF16 [T, 128] (rows at any stride, the last dim contiguous)
       -> LayerNorm over the indexer-K row
       -> RoPE on the first 64 K lanes
       -> TRT-LLM fused FP8 cat/scale
@@ -180,7 +180,7 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
         input_ptr = indexer_k.iterator
         weight_ptr = norm_weight.iterator
         bias_ptr = norm_bias.iterator
-        row_base = token_idx * _FUSED_CAT_HEAD_DIM
+        row_base = token_idx * indexer_k.stride[0]
 
         # Physical lane i owns dimensions 4*i..4*i+3 and
         # 64+4*i..64+4*i+3.
@@ -704,11 +704,14 @@ def compile_indexer_k_norm_rope_fp8_cache_update(
     sym_cache_stride_0 = cute.sym_int64(symbol="indexer_k_cache_update_stride_0")
     sym_cache_stride_1 = cute.sym_int64(symbol="indexer_k_cache_update_stride_1")
     sym_cache_stride_2 = cute.sym_int64(symbol="indexer_k_cache_update_stride_2")
+    sym_input_stride = cute.sym_int32(symbol="indexer_k_cache_update_input_stride")
 
-    fake_indexer_k = make_fake_compact_tensor(
+    # The keys may be the leading 128 columns of a wider row (a projection whose output
+    # carries more than the keys), so the row stride is a runtime value.
+    fake_indexer_k = make_fake_tensor(
         cutlass.BFloat16,
         (sym_num_tokens, _FUSED_CAT_HEAD_DIM),
-        stride_order=(1, 0),
+        stride=(sym_input_stride, 1),
         assumed_align=8 if vectorized_loads else 2,
     )
     fake_norm_weight = make_fake_compact_tensor(
@@ -791,6 +794,19 @@ def _require_cuda_contiguous(torch, tensor, name: str, dtype) -> None:
         raise ValueError(f"{name} must be contiguous")
 
 
+def _require_cuda_rows(torch, tensor, name: str, dtype) -> None:
+    """A 2-D tensor whose rows are contiguous and do not overlap; the row stride is free."""
+    if tensor.dtype != dtype:
+        raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
+    if not tensor.is_cuda:
+        raise TypeError(f"{name} must be a CUDA tensor")
+    if tensor.ndim != 2 or tensor.stride(1) != 1 or tensor.stride(0) < tensor.shape[1]:
+        raise ValueError(
+            f"{name} must be 2-D with contiguous, non-overlapping rows, got shape "
+            f"{tuple(tensor.shape)} and strides {tuple(tensor.stride())}"
+        )
+
+
 def _require_current_cuda_device(
     torch,
     tensors: tuple[tuple["torch.Tensor", str], ...],
@@ -805,9 +821,8 @@ def _require_current_cuda_device(
 
 
 def _can_vectorize_loads(indexer_k) -> bool:
-    """Return whether the packed indexer-K input load is naturally aligned."""
-    input_address = indexer_k.data_ptr()
-    return input_address % 8 == 0
+    """Return whether every row's packed indexer-K input load is naturally aligned."""
+    return indexer_k.data_ptr() % 8 == 0 and (indexer_k.stride(0) * 2) % 8 == 0
 
 
 def _select_rows_per_block(num_tokens: int) -> int:
@@ -880,7 +895,7 @@ def _require_indexer_k_cache_update_inputs(
     slot_mapping_fp8,
     slot_mapping_scale,
 ) -> None:
-    _require_cuda_contiguous(torch, indexer_k, "indexer_k", torch.bfloat16)
+    _require_cuda_rows(torch, indexer_k, "indexer_k", torch.bfloat16)
     _require_cuda_contiguous(torch, norm_weight, "norm_weight", torch.float32)
     _require_cuda_contiguous(torch, norm_bias, "norm_bias", torch.float32)
     _require_cuda_contiguous(torch, position_ids, "position_ids", torch.int32)
