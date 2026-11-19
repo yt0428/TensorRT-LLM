@@ -68,7 +68,8 @@ class FlashMlaSparsePrefill(OpWrapper):
     `kv`: bf16 `[N, 576]` (the dequantized fp8_ds_mla rows, `ds_mla_dequant_gather`).
     `indices`: int32 `[rows, topk]` rows of `kv`, -1 padded. `q`: bf16 `[rows, h_q, 576]`,
     h_q 64 or 128 (fewer real heads first, zeros after; `out` names how many are kept).
-    Writes `out` (bf16 `[rows, h_out, 512]`) and returns it.
+    Writes `out` (bf16 `[rows, h_out, 512]`) and returns it; with `out` None, returns the
+    kernel's own output (bf16 `[rows, h_q, 512]`, every head), copied nowhere.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -859,7 +860,10 @@ class FlashMlaSparsePrefill(OpWrapper):
     the generation rows behind it make any other count in 1..32768: the sweep.
     Every call allocates the kernel's own [rows, h_q, 512] bf16 output and fp32 max_logits
     and lse [rows, h_q], whatever h_out is: 2164260864 B (2.02 GiB) at 32768 x 64,
-    541065216 B at 8192 x 64; a caller budgets it beside the workspace and the scratch.
+    541065216 B at 8192 x 64; a caller budgets it beside the workspace and the scratch. A call
+    without `out` returns that output itself, which is bitwise what a call with `out` copies
+    into it (`test_kernel_output_without_out`), and skips the copy: 1 GiB read and written at
+    16384 x 64, 130 - 160 us of the call on sm_107.
     The kernel takes s_kv from kv.shape[0], and an index at or past it answers bitwise as -1
     does: the row is skipped and not read (measured at N, at the buffer's last row and at
     2**31 - 1, with NaN rows past N). A kv view cut short of the step's KV (N from the new
@@ -899,12 +903,14 @@ class FlashMlaSparsePrefill(OpWrapper):
         kv: torch.Tensor,
         indices: torch.Tensor,
         softmax_scale: float,
-        out: torch.Tensor,
+        out: torch.Tensor | None,
     ) -> torch.Tensor:
         rows = q.shape[0]
         o = _flash_mla_sparse_fwd(
             q, kv.view(-1, 1, D_QK), indices.view(rows, 1, indices.shape[-1]), softmax_scale, D_NOPE
         )[0]
+        if out is None:
+            return o
         out.copy_(o[:, : out.shape[1]])
         return out
 
@@ -914,11 +920,13 @@ class FlashMlaSparsePrefill(OpWrapper):
         kv: torch.Tensor,
         indices: torch.Tensor,
         softmax_scale: float,
-        out: torch.Tensor,
+        out: torch.Tensor | None,
     ) -> torch.Tensor:
-        """fp32 softmax over the valid rows; a new tensor shaped like `out`."""
-        h_out = out.shape[1]
-        res = torch.zeros(out.shape, dtype=torch.float32, device=q.device)
+        """fp32 softmax over the valid rows; a new tensor shaped like `out`, or like the
+        kernel's own output (`[rows, h_q, 512]`) without one."""
+        shape = (q.shape[0], q.shape[1], D_NOPE) if out is None else out.shape
+        h_out = shape[1]
+        res = torch.zeros(shape, dtype=torch.float32, device=q.device)
         k_all = kv.float()
         with true_fp32_matmul():
             for r in range(q.shape[0]):
@@ -929,7 +937,7 @@ class FlashMlaSparsePrefill(OpWrapper):
                 k = k_all[idx]
                 s = (q[r, :h_out].float() @ k.T) * softmax_scale
                 res[r] = torch.softmax(s, -1) @ k[:, :D_NOPE]
-        return res.to(out.dtype)
+        return res.to(q.dtype)
 
     def is_valid(
         self,
@@ -937,9 +945,9 @@ class FlashMlaSparsePrefill(OpWrapper):
         kv: torch.Tensor,
         indices: torch.Tensor,
         softmax_scale: float,
-        out: torch.Tensor,
+        out: torch.Tensor | None,
     ) -> None:
-        if q.shape[1] not in KERNEL_HEADS or out.shape[1] > q.shape[1]:
+        if q.shape[1] not in KERNEL_HEADS or (out is not None and out.shape[1] > q.shape[1]):
             raise ValueError(f"h_q must be one of {KERNEL_HEADS} and cover out's heads")
         if indices.dtype != torch.int32:
             raise ValueError("indices must be int32")

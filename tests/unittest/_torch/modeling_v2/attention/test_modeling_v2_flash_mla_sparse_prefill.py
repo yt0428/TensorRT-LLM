@@ -565,3 +565,28 @@ def test_sweep_sees_a_wrong_row_and_a_stray_write_at_8_heads() -> None:
 
     with pytest.raises(AssertionError, match="past its own"):
         _sweep(q, kv, idx, out, range(1, 65), call=spill)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        dict(rows=8192, kv_len=[8192], h_q=64, h_out=64, topk=2048),
+        dict(rows=2348, kv_len=[300, 3076, 5186], new=[300, 2047, 1], h_q=64, h_out=16, topk=2048),
+    ],
+    ids=["dep4_64_heads", "three_requests_16_of_64"],
+)
+def test_kernel_output_without_out(spec) -> None:
+    """Without `out` the call returns the kernel's own output, every one of its h_q heads,
+    bitwise what a call with `out` copies of it (its first h_out heads) and within the band of
+    the reference; the guard admits it."""
+    q, kv, idx, out = _build(spec, 17)
+    want = op(q, kv, idx, SCALE, out)
+    with validating(op):
+        own = op(q, kv, idx, SCALE, None)
+    assert own.shape == (spec["rows"], spec["h_q"], 512) and own.dtype == torch.bfloat16
+    assert own.data_ptr() != out.data_ptr()
+    assert bool((_bits(own[:, : spec["h_out"]]) == _bits(want)).all())
+    rows = torch.arange(0, spec["rows"], 37, device="cuda")
+    ref = op.reference(q[rows], kv, idx[rows], SCALE, None)
+    assert ref.shape == (rows.numel(), spec["h_q"], 512)
+    _assert_close(own[rows, : spec["h_out"]], ref[:, : spec["h_out"]])
