@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU certification matrix for the attention-DP expert path's collectives on sm_107:
-`lamport_moe_dispatch`, `lamport_moe_combine`, `allgather_list`, and the ragged cells of
-`reducescatter`.
+`lamport_moe_dispatch`, `lamport_moe_combine` and `allgather_list`. The ragged cells of the
+shared `reducescatter` are driven by its own matrix (`_reducescatter_op_matrix.py`).
 
 Every rank runs under MPI, as a dep4 or dep8 engine's ranks do: the NCCL entries on the
 MPI-session communicator, the one-shot entries on a `MoeCommWorkspace` whose process group
@@ -16,9 +16,7 @@ rather than a second collective.
   one combine per MoE layer at every graph batch, replayed on new rows between eager calls;
 - a long call sequence whose counts change call to call (eager and replayed), so every slot of
   the rotation is reused many times over;
-- `allgather_list` bitwise against the concatenations, uniform and ragged;
-- `reducescatter`'s ragged cells on payloads whose every partial sum is exact in bf16, so the
-  NCCL reduction's order does not matter, bitwise.
+- `allgather_list` bitwise against the concatenations, uniform and ragged.
 
 Two jobs, both this file:
 
@@ -72,7 +70,6 @@ WS: Any = None
 dispatch: Any = None
 combine: Any = None
 gather_list: Any = None
-rs: Any = None
 DRIVEN: Dict[str, int] = {}
 
 
@@ -96,20 +93,12 @@ def _dispatch_inputs(n: int, seed: int, rank: int, bits: bool = False):
     return codes, scales, ids, weights
 
 
-def _combine_inputs(counts, seed: int, rank: int, bits: bool = False, exact: bool = False):
+def _combine_inputs(counts, seed: int, rank: int, bits: bool = False):
     """Rank `rank`'s partial over every rank's rows, and its own rows' shared output and
-    residual. `bits`: partials of every bf16 pattern. `exact`: small integers, whose sums in
-    any order are exact in bf16."""
+    residual. `bits`: partials of every bf16 pattern."""
     g = _gen(seed, rank)
     total, n = sum(counts), counts[rank]
-    if exact:
-        partial = torch.randint(-8, 9, (total, HIDDEN), device="cuda", generator=g).to(
-            torch.bfloat16
-        )
-    else:
-        partial = (torch.randn((total, HIDDEN), device="cuda", generator=g) * 0.3).to(
-            torch.bfloat16
-        )
+    partial = (torch.randn((total, HIDDEN), device="cuda", generator=g) * 0.3).to(torch.bfloat16)
     if bits:
         words = torch.arange(total * HIDDEN, device="cuda", dtype=torch.int64) + rank * 7
         partial.view(torch.int16).view(-1)[:] = (words % 65536 - 32768).to(torch.int16)
@@ -324,31 +313,10 @@ def check_allgather_list_cells() -> None:
         DRIVEN[cell.why] = 1
 
 
-def check_reducescatter_ragged_cells() -> None:
-    cells = [c for c in rs.CELLS if c.spec.get("ragged") and c.spec["world_size"] == WORLD]
-    assert cells, "no ragged reducescatter cell at this world"
-    for cell in cells:
-        spec = cell.spec
-        patterns = list(_sweep(spec)) if "sweep" in spec else [spec["counts"]]
-        for i, counts in enumerate(patterns):
-            seed = cell.seed_base() + i
-            sizes = None if len(set(counts)) == 1 else list(counts)
-            partial = _combine_inputs(counts, seed, RANK, exact=True)[0]
-            out = rs(partial, sizes, GROUP)
-            lo = sum(counts[:RANK])
-            blocks = [
-                _combine_inputs(counts, seed, r, exact=True)[0][lo : lo + counts[RANK]]
-                for r in range(WORLD)
-            ]
-            _bitwise(out, rs.reference(blocks), f"reducescatter {counts}")
-        DRIVEN[cell.why] = 1
-
-
 # ---------------------------------------------------------------------------- the job
 
 MPI_CHECKS: List[Callable[[], None]] = [
     check_allgather_list_cells,
-    check_reducescatter_ragged_cells,
     check_one_shot_eager_cells,
     check_one_shot_graph_cells,
     check_slot_rotation_sequence,
@@ -368,7 +336,7 @@ def _validating(entry_obj) -> None:
 
 
 def _run_one_mpi_rank() -> int:
-    global RANK, WORLD, NODES, GROUP, MPI_COMM, WS, dispatch, combine, gather_list, rs
+    global RANK, WORLD, NODES, GROUP, MPI_COMM, WS, dispatch, combine, gather_list
     faulthandler.dump_traceback_later(MPI_DEADLINE_S, exit=True)
     RANK = int(os.environ["OMPI_COMM_WORLD_RANK"])
     WORLD = int(os.environ["OMPI_COMM_WORLD_SIZE"])
@@ -386,21 +354,13 @@ def _run_one_mpi_rank() -> int:
         build_moe_comm_workspace,
         lamport_moe_dispatch,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import (
-        reducescatter,
-    )
     from tensorrt_llm._utils import mpi_comm
 
     MPI_COMM = mpi_comm()
     NODES = len(set(MPI_COMM.allgather(socket.gethostname())))
     GROUP = list(range(WORLD))
-    dispatch, combine, gather_list, rs = (
-        lamport_moe_dispatch,
-        lamport_moe_combine,
-        allgather_list,
-        reducescatter,
-    )
-    for e in (dispatch, combine, gather_list, rs):
+    dispatch, combine, gather_list = lamport_moe_dispatch, lamport_moe_combine, allgather_list
+    for e in (dispatch, combine, gather_list):
         _validating(e)
     WS = build_moe_comm_workspace(HIDDEN, 512, RANK, WORLD)
 
@@ -421,7 +381,6 @@ def _run_one_mpi_rank() -> int:
         if RANK == 0:
             print(f"[mpi] {check.__name__}: {time.monotonic() - started:.1f}s", flush=True)
     every = [c.why for e in (dispatch, combine, gather_list) for c in _cells(e)]
-    every += [c.why for c in rs.CELLS if c.spec.get("ragged") and c.spec["world_size"] == WORLD]
     missing = [w for w in every if w not in DRIVEN]
     assert not missing, f"cells not driven: {missing}"
     print(f"[mpi rank {RANK}] {len(DRIVEN)} cells passed at world {WORLD} on {NODES} node(s)")

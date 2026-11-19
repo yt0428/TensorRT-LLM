@@ -20,7 +20,8 @@ That runs two jobs, in this order, and both must exit 0:
   `reducescatter_pg` symbol on a boxed c10d group;
 - the MPI-session job: the same number of ranks started by `mpirun`, every
   `MPI_CHECKS` entry. It drives the cells that state `process_group=None` at
-  that world size, through `torch.ops.trtllm.reducescatter` on the
+  that world size (the ragged ones, every rank passing its own count, with
+  `check_mpi_ragged_cells`), through `torch.ops.trtllm.reducescatter` on the
   communicator the MPI session builds -- the symbol and communicator a dep4
   world launched under mpirun reaches. Its `mpirun` gets an environment with
   the launching allocation's PMI/PMIx/Open MPI/Slurm variables removed, so it
@@ -1468,6 +1469,30 @@ def _mpi_cells() -> List[Tuple[int, Any]]:
     ]
 
 
+def _ragged_cells() -> List[Tuple[int, Any]]:
+    """(index, cell) of every ragged cell at this job's world size: every rank passes its own
+    row count, as the sm_107 Mistral Large 4 combine does past its all-to-all."""
+    return [
+        (i, c)
+        for i, c in enumerate(entry.reducescatter.CELLS)
+        if c.spec.get("ragged") and c.spec["world_size"] == WORLD
+    ]
+
+
+def _ragged_counts(spec: Dict[str, Any]) -> List[Tuple[int, ...]]:
+    """A ragged cell's count patterns: its `counts`, or each `sweep` count on one rank against
+    `others` on the rest, every rank taking the swept count in turn."""
+    if "counts" in spec:
+        return [tuple(spec["counts"])]
+    lo, hi, step = spec["sweep"]
+    others = spec["others"]
+    return [
+        tuple(mine if q == r else others[(q - r - 1) % len(others)] for q in range(WORLD))
+        for mine in range(lo, hi + 1, step)
+        for r in range(WORLD)
+    ]
+
+
 def _mpi_sync() -> None:
     """Every rank's device work done, then every rank here."""
     torch.cuda.synchronize()
@@ -1969,9 +1994,50 @@ def check_mpi_round_trip_through_a_gather_in_one_graph() -> None:
     _mpi_sync()
 
 
+def check_mpi_ragged_cells() -> None:
+    """Every ragged cell, bitwise the reference at each count pattern it names.
+
+    Every rank's input holds every rank's rows in rank order, `sum(counts)` of them, and this
+    rank's slice of the sum is rows [lo, lo + counts[RANK]) of each. The payload's partial
+    sums are exact in bf16, so the order of NCCL's per-rank reductions does not show. A
+    mismatch is agreed across the ranks before any rank raises.
+    """
+    for i, cell in _ragged_cells():
+        spec = cell.spec
+        assert spec.get("nodes", 1) == NODES, (spec, NODES)
+        assert len(spec["trailing"]) == 1 and spec["dtype"] is torch.bfloat16, spec
+        width = spec["trailing"][0]
+        patterns = _ragged_counts(spec)
+        bad = []
+        before = dict(SEEN)
+        _mpi_sync()
+        for k, counts in enumerate(patterns):
+            seed = 30000 + 97 * i + k
+            total, lo = sum(counts), sum(counts[:RANK])
+            sizes = None if len(set(counts)) == 1 else list(counts)
+            out = entry.reducescatter(
+                _payload(RANK, (total, width), seed), sizes, GROUP,
+                process_group=spec["process_group"],
+            )  # fmt: skip
+            ref = entry.reducescatter.reference(
+                [_payload(r, (total, width), seed)[lo : lo + counts[RANK]] for r in range(WORLD)]
+            )
+            if out.shape != ref.shape or bool(_differs(out, ref)):
+                bad.append(k)
+        torch.cuda.synchronize()
+        failing = sorted({k for got in MPI_COMM.allgather(bad) for k in got})
+        if failing:
+            raise AssertionError(
+                f"{cell.why}: {len(failing)} of {len(patterns)} count patterns differ from the "
+                f"reference on some rank, the first {patterns[failing[0]]}"
+            )
+        _account(i, before)
+        _mpi_sync()
+
+
 def check_mpi_every_cell_was_driven() -> None:
     """Each MPI-session cell ran through the entry's own `__call__` and `reference`."""
-    for i, cell in _mpi_cells():
+    for i, cell in [*_mpi_cells(), *_ragged_cells()]:
         calls, refs = DRIVEN.get(i, [0, 0])
         assert calls > 0 and refs > 0, (
             f"cell {cell.why!r}: the entry's __call__ / reference ran {calls} / {refs} times"
@@ -1986,6 +2052,7 @@ MPI_CHECKS = (
     check_mpi_graph_cells,
     check_mpi_sum_is_the_ring_chain,
     check_mpi_round_trip_through_a_gather_in_one_graph,
+    check_mpi_ragged_cells,
     check_mpi_every_cell_was_driven,
 )
 
@@ -2030,7 +2097,8 @@ def _run_one_mpi_rank() -> int:
             print(f"[mpi] {check.__name__}: {time.monotonic() - started:.1f}s", flush=True)
     _mpi_sync()
     print(
-        f"[mpi rank {RANK}] {len(MPI_CHECKS)} checks passed over {len(_mpi_cells())} cells at "
+        f"[mpi rank {RANK}] {len(MPI_CHECKS)} checks passed over "
+        f"{len(_mpi_cells()) + len(_ragged_cells())} cells at "
         f"world {WORLD} on {NODES} node(s); peak allocated "
         f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, reserved "
         f"{torch.cuda.max_memory_reserved() / 2**30:.2f} GiB",

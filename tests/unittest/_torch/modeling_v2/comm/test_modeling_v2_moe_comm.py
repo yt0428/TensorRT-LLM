@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Collected entry point for the attention-DP expert path's collectives on sm_107:
-`lamport_moe_dispatch`, `lamport_moe_combine`, `allgather_list` and `reducescatter`'s ragged
-cells.
+`lamport_moe_dispatch`, `lamport_moe_combine` and `allgather_list`.
 
 The matrix is `_moe_comm_op_matrix.py` beside this file, which drives those entries' `CELLS`
 in two jobs, one test each:
