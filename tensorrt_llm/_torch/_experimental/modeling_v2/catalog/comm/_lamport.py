@@ -21,6 +21,9 @@ itself, which is what lets one CUDA graph capture every collective of a
 forward and still rotate slots on replay. The peer buffers are three slots x
 world x the token budget, so every row count up to the budget fits.
 
+`ensure_process_group` is also how a target's own symmetric-memory workspaces bring their
+group up (the sm_107 dep4 target's expert-path slots, in that target's `ops/comm`).
+
 Not an entry: it holds what the entry is handed, and no entry owns it.
 """
 
@@ -61,8 +64,20 @@ _FUSED_OPTIONS = dict(
 TWOSHOT_ABOVE = 3072
 
 
-def ensure_process_group(rank: int, world: int) -> None:
-    """Bring up `torch.distributed` for this rank if nothing has yet.
+def _rendezvous_env_describes(rank: int, world: int) -> bool:
+    """Whether the environment's rendezvous address is this group's: all four variables set,
+    `RANK` this rank, `WORLD_SIZE` this group's size and `MASTER_PORT` a port number."""
+    if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
+        return False
+    try:
+        int(os.environ["MASTER_PORT"])
+        return int(os.environ["RANK"]) == rank and int(os.environ["WORLD_SIZE"]) == world
+    except ValueError:
+        return False
+
+
+def ensure_process_group(rank: int, world: int) -> bool:
+    """Bring up `torch.distributed` for this rank if nothing has yet; True if this call did.
 
     `symm_mem.rendezvous` needs a process group. The engine's ranks are
     MPI-spawned and TRT-LLM's collectives use their own transport, so there may
@@ -70,13 +85,18 @@ def ensure_process_group(rank: int, world: int) -> None:
 
     * A group is already up (the engine brought one up, or a test launcher
       did): it has to be this rank in a group of `world`, and is used as is.
-    * The rendezvous address is in the environment (`MASTER_ADDR`,
-      `MASTER_PORT`, `RANK`, `WORLD_SIZE`): the group comes up from it.
-      MPI is not touched.
+    * The rendezvous address in the environment describes this group
+      (`MASTER_ADDR`, `MASTER_PORT`, `RANK` this rank, `WORLD_SIZE` this
+      group's size): the group comes up from it. MPI is not touched.
     * Otherwise (the engine under MPI): rank 0 draws a free port and the
-      address is broadcast over `MPI.COMM_WORLD`, as TRT-LLM's MegaMoE path
-      does. Only this case needs MPI, so only it checks that `COMM_WORLD` is
-      the TP group.
+      address is broadcast over the engine's MPI communicator,
+      `tensorrt_llm._utils.mpi_comm()`, as TRT-LLM's MegaMoE path does over
+      its world. That communicator is `MPI.COMM_WORLD`, or this server's part
+      of it when one MPI world holds several (a disaggregated launch's context
+      and generation servers each `set_mpi_comm` their own), and a launcher's
+      `RANK` / `WORLD_SIZE` then describe the whole world, not this group.
+      Only this case needs MPI, so only it checks that the communicator is the
+      group.
     """
     import torch.distributed as dist
 
@@ -85,12 +105,15 @@ def ensure_process_group(rank: int, world: int) -> None:
             f"the process group is rank {dist.get_rank()} of {dist.get_world_size()}; "
             f"the collective was built for rank {rank} of {world}"
         )
-        return
-    if not all(os.environ.get(k) for k in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")):
-        from mpi4py import MPI
+        return False
+    if not _rendezvous_env_describes(rank, world):
+        from tensorrt_llm._utils import mpi_comm
 
-        comm = MPI.COMM_WORLD
-        assert comm.Get_size() == world and comm.Get_rank() == rank, (comm.Get_size(), world)
+        comm = mpi_comm()
+        assert comm.Get_size() == world and comm.Get_rank() == rank, (
+            f"the engine's MPI communicator is rank {comm.Get_rank()} of {comm.Get_size()}; "
+            f"the collective was built for rank {rank} of {world}"
+        )
         addr = None
         if rank == 0:
             import socket
@@ -110,6 +133,7 @@ def ensure_process_group(rank: int, world: int) -> None:
         world_size=world,
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
+    return True
 
 
 @dataclass(frozen=True)

@@ -236,7 +236,11 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
     - Under MPI, every rank must bring the group up the same way:
       `ensure_process_group` takes the rendezvous address from the
       environment when `MASTER_ADDR`, `MASTER_PORT`, `RANK` and `WORLD_SIZE`
-      are all set, and broadcasts rank 0's otherwise. The two-node session
+      are all set and `RANK` / `WORLD_SIZE` are this rank and the group's
+      size, and broadcasts rank 0's over the engine's MPI communicator
+      otherwise. The measurement below predates the size and rank test,
+      which sends the per-node values it describes to the broadcast on every
+      rank. The two-node session
       the world-8 cells ran on sets all four in each node's environment (on
       the first node: `MASTER_ADDR` that node, `MASTER_PORT` 64710, `RANK`
       0, `WORLD_SIZE` 2). Measured: with them removed on the first node

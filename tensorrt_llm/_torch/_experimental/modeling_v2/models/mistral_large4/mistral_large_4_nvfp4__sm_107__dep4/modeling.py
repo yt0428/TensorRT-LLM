@@ -27,12 +27,16 @@ routed experts -- all 64 heads, the latent, the indexer, the dense layer-0 MLP, 
 expert and the full-vocabulary `lm_head` -- and holds the KV of its own requests only. Nothing
 before the routed experts communicates. The routed experts are expert parallel,
 `n_routed_experts / moe_ep_size` of the 128 per rank (32 at dep4, 16 at dep8): each MoE layer
-zero-pads the rank's rows to the largest rank's count, gathers every rank's rows before the
-router (so every rank routes the identical token set and the windows tile the expert ids
-exactly once), runs the router, the routing, the NVFP4 quantization and this rank's window over
-the gathered rows in calls of at most `expert_call_tokens` rows, and reduce-scatters the partial
-sums back to each rank's own rows. Every rank issues the same collective sequence whatever its
-batch -- one gather and one reduce-scatter per MoE layer, of the same size -- in the prefill and
+runs the router, the routing and the NVFP4 quantization on the rank's own rows, gathers every
+rank's codes, scales, expert ids and weights unpadded (so every rank holds the identical token
+set and the windows tile the expert ids exactly once), runs this rank's window over the
+gathered rows in calls of at most `expert_call_tokens` rows, and reduce-scatters the partial
+sums back to each rank's own rows, adding the shared expert. While no rank holds more than
+`_ONE_SHOT_ROWS` rows both collectives are the one-shot Lamport kernels over symmetric memory
+(`lamport_moe_dispatch`, `lamport_moe_combine`, which on a decode step also adds the residual
+and applies the next layer's norm); past it, NCCL with every rank's own row count. Every rank
+issues the same collective sequence whatever its batch -- one gather and one reduce-scatter
+per MoE layer, chosen from `all_rank_num_tokens`, which every rank shares -- in the prefill and
 the decode target alike.
 
 The absorbed form throughout: `fused_q = [q_nope @ W_UK | rope(q_pe)]` (576 wide) against the
@@ -157,7 +161,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ssmax_scali
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
     triton_draft_attention,
@@ -215,6 +218,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.allgather_list import allgather_list
+from .ops.comm.lamport_moe_combine import lamport_moe_combine
+from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
 from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 from .ops.gemm.mla_v_up_fp8_block_scale_linear import mla_v_up_fp8_block_scale_linear
 
@@ -341,14 +347,14 @@ _TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
 # TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
 # It sets the core's `unfused_glue`, which every site reads.
 _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
-# capacity: fixed: by attention-DP world size, the most gathered tokens one router / routing /
-# NVFP4-quantize / expert call takes, the token column those entries are certified to at that
-# world's expert window. At 4 ranks (32 local experts) the gathered set is up to
-# 4 x max_num_tokens = 131072 rows, one call per MoE layer. At 8 ranks (16 local experts) it is
-# up to 8 x max_num_tokens = 262144 rows, in calls of 32768: the call bounds the runner's
-# workspace, whose FC2 rows at 32768 tokens and top-4 stay below 2^31 bytes. A larger gathered
-# set runs in chunks of this many rows, whose boundaries depend on the gathered row count alone,
-# the same on every rank. A world size not listed here is refused.
+# capacity: fixed: by attention-DP world size, the most gathered tokens one expert call takes,
+# the token column the runner is certified to at that world's expert window. At 4 ranks (32
+# local experts) the gathered set is up to 4 x max_num_tokens = 131072 rows, one call per MoE
+# layer. At 8 ranks (16 local experts) it is up to 8 x max_num_tokens = 262144 rows, in calls of
+# 32768: the call bounds the runner's workspace, whose FC2 rows at 32768 tokens and top-4 stay
+# below 2^31 bytes. A larger gathered set runs in chunks of this many rows, whose boundaries
+# depend on the gathered row count alone, the same on every rank. A world size not listed here
+# is refused.
 _EXPERT_CALL_TOKENS = {4: 131072, 8: 32768}
 # capacity: fixed: by attention-DP world size, the calls of an engine under chunked prefill,
 # whose steps attend a cached prefix up to max_seq_len and hold the large context workspace:
@@ -358,6 +364,12 @@ _EXPERT_CALL_TOKENS = {4: 131072, 8: 32768}
 # 1048576's margin spares; so the 131072 rows run in four calls. The chunks give one call's bits
 # (test_modeling_v2_routed_experts.py).
 _EXPERT_CALL_TOKENS_CHUNKED = {4: 32768, 8: 32768}
+# capacity: fixed: the most rows one rank holds that the expert path's collectives move through
+# the one-shot workspace (`lamport_moe_dispatch`, `lamport_moe_combine`): every decode graph up
+# to 128 DSpark rows per rank, and the small eager steps beside them. Its slots are 3 x world x
+# 512 x 6144 bf16 of symmetric memory, 72 MiB per rank at four ranks and 144 MiB at eight. A step
+# whose largest rank holds more rows gathers and reduce-scatters through NCCL.
+_ONE_SHOT_ROWS = 512
 # The held context workspace's ceiling (`_ctx_workspace_rows`), which bounds the context paths a
 # step chooses once on this rank's host ints. The context requests, in order, are grouped while
 # their KV (cached and new rows) together fits the held workspace, and each group's KV is
@@ -453,27 +465,82 @@ def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict
     )
 
 
-def _padded_rows(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> int:
-    """The row count every rank pads its block to before the expert path's collectives: the
-    largest rank's count this step. Every rank reads the same list, so every rank's collectives
-    move the same bytes; this rank's own entry must be the rows it holds, or its block would
+def _rank_counts(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> tuple[int, ...]:
+    """Every rank's row count this step, in rank order: the gathered set's layout and the size
+    every rank's expert-path collectives are chosen by. Every rank reads the same list, so every
+    rank's collectives agree; this rank's own entry must be the rows it holds, or its rows would
     be cut or overrun."""
     counts = step["all_rank_num_tokens"]
     assert len(counts) == len(core.dp_group) and counts[core.dp_rank] == rows, (
         f"rank {core.dp_rank} holds {rows} rows; all_rank_num_tokens is {counts}"
     )
-    return max(counts)
+    return tuple(counts)
 
 
-def _padding_rows(counts: list[int], padded: int, device) -> torch.Tensor | None:
-    """Which of the gathered rows are padding: bool `[len(counts) * padded]` on `device`, or None
-    when no rank pads (every count is `padded`). Rank r's segment is rows `[r * padded,
-    (r + 1) * padded)`, its first `counts[r]` its own and the rest the zero rows `_moe` pads it
-    with, at `[r * padded + counts[r], (r + 1) * padded)`. Built from the step's host counts."""
-    if all(n == padded for n in counts):
-        return None
-    own = torch.tensor(counts, dtype=torch.int64, device=device)
-    return (torch.arange(padded, device=device)[None, :] >= own[:, None]).reshape(-1)
+def _own_expert_inputs(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
+    """The routed experts' inputs of this rank's own rows: the router's fp32 logits through
+    the renormalized top-k routing (expert ids int32, weights bf16), and the rows' NVFP4 codes
+    with their linear e4m3 scales under the layer's static global scale. Both are row-wise, so
+    a row's routing and codes do not depend on which rows share its call, except through the
+    router GEMM's row count, which may pick another tactic and round a logit differently."""
+    logits = cublas_mm(o, m.router, None, torch.float32)
+    ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
+    codes, scales = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+    return codes, scales, ids, weights
+
+
+def _one_shot(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]) -> bool:
+    """Whether this step's expert-path collectives are the one-shot kernels: no rank holds more
+    rows than the workspace. A function of `counts` alone, the same on every rank."""
+    return max(counts) <= core.moe_comm.max_rows
+
+
+def _dispatch(core: "MistralLarge4Dep4ModelingV2", inputs: tuple, counts: tuple[int, ...]):
+    """Every rank's routed-expert inputs, unpadded in rank order: the one-shot gather, or one
+    NCCL group over the four tensors (ragged when the counts differ)."""
+    if _one_shot(core, counts):
+        return lamport_moe_dispatch(*inputs, counts, core.moe_comm)
+    codes, scales, ids, weights = inputs
+    sizes = None if len(set(counts)) == 1 else list(counts)
+    codes, scales, ids, weights = allgather_list(
+        [codes, scales.view(codes.shape[0], -1), ids, weights], sizes, core.dp_group, core.dp_pg
+    )
+    return codes, scales.view(-1), ids, weights
+
+
+def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.Tensor:
+    """This rank's expert window over every gathered row, in calls of at most
+    `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial. A row
+    whose experts all lie outside the window comes back +0.0."""
+    codes, scales, ids, weights = gathered
+    total = codes.shape[0]
+    sf_row = scales.numel() // total
+    call = core.expert_call_tokens
+    routed_all = (
+        None if total <= call else codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
+    )
+    for lo in range(0, total, call):
+        hi = min(lo + call, total)
+        part = fp4_block_scale_moe_runner(
+            None, None, codes[lo:hi], scales[lo * sf_row : hi * sf_row].view(torch.float8_e4m3fn),
+            m.fc1_w, m.fc1_s, None, None, None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate,
+            m.out2, core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
+            core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
+            topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
+            tune_max_num_tokens=core.expert_tune_tokens,
+        )[0]  # fmt: skip
+        if routed_all is None:
+            routed_all = part
+        else:
+            routed_all[lo:hi].copy_(part)
+    return routed_all
+
+
+def _nccl_combine(core: "MistralLarge4Dep4ModelingV2", routed_all, counts: tuple[int, ...]):
+    """This rank's rows of the windows' summed partials through NCCL, ragged when the counts
+    differ."""
+    sizes = None if len(set(counts)) == 1 else list(counts)
+    return reducescatter(routed_all, sizes, core.dp_group, core.dp_pg)
 
 
 def _ctx_kv_offsets(md: TrtllmAttentionMetadata, num_contexts: int) -> dict:
@@ -795,11 +862,14 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._ix_logits = None
         self._side_stream: torch.cuda.Stream | None = None
         self.dp_pg = None
+        # The expert path's one-shot slots (`build_moe_comm_workspace`), built at load.
+        self.moe_comm = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
         """Derive what the weights fix, build the kernels, the side stream (the shared expert's,
-        and the decode attention's query half) and the communicator handle, then the targets.
+        and the decode attention's query half), the communicator handle and the expert path's
+        one-shot workspace, then the targets.
 
         Named for the shell hook that drives it. Everything compiles here or on the first
         (eager) step: a first compile inside a CUDA-graph capture breaks the graph. The side
@@ -812,6 +882,10 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         # MPI session's, or the tensor-parallel process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.dp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+        # Collective: every rank builds it with the same arguments, outside any capture.
+        self.moe_comm = build_moe_comm_workspace(
+            self.hidden, _ONE_SHOT_ROWS, self.dp_rank, len(self.dp_group)
+        )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -1375,60 +1449,33 @@ class PrefillTarget:
         act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
         return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
 
-    def _moe(self, o, L, padded: int, pad_rows: torch.Tensor | None = None):
+    def _moe(self, o, L, counts: tuple[int, ...]):
         """A MoE layer's MLP on this rank's own rows: the shared expert on its own rows, on the
         side stream, beside the routed experts over every rank's gathered rows.
 
-        The rows are zero-padded to `padded` (the largest rank's count) and gathered before the
-        router, so every rank routes the identical `world_size * padded` rows. Router, routing,
-        NVFP4 quantization and this rank's expert window (32 experts at 4 ranks, 16 at 8) run
-        over them in chunks of at most `expert_call_tokens`, each writing its rows of one
-        output, which the reduce-scatter sums over the windows and splits back to `padded` rows
-        per rank. The padding rows (`pad_rows`, `_padding_rows`) take expert id -1 after the
-        routing, so no rank's window holds them and no expert computes them; their output rows
-        come back +0.0 and are dropped. Without `pad_rows` they route to experts 0..3 (an exact
-        tie at +0.0) and contribute zero."""
+        The router, the routing and the NVFP4 quantization run on this rank's own rows; their
+        codes, scales, ids and weights are gathered from every rank unpadded (`counts`, every
+        rank's rows), so every rank holds the identical rows in rank order. This rank's expert
+        window (32 experts at 4 ranks, 16 at 8) runs over them in calls of at most
+        `expert_call_tokens`, and the reduce-scatter sums the windows' partials back to this
+        rank's rows and adds the shared expert's: one-shot while no rank holds more than the
+        workspace (`_one_shot`), NCCL past it."""
         core = self.core
         m = L.moe
-        rows = o.shape[0]
         side = core._side_stream
         main = torch.cuda.current_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        o_pad = o if rows == padded else nn.functional.pad(o, [0, 0, 0, padded - rows])
-        o_all = allgather(o_pad, None, core.dp_group, core.dp_pg)
-        total = o_all.shape[0]
-        call = core.expert_call_tokens
-        routed_all = None if total <= call else torch.empty_like(o_all)
-        for lo in range(0, total, call):
-            hi = min(lo + call, total)
-            x = o_all[lo:hi]
-            logits = cublas_mm(x, m.router, None, torch.float32)
-            ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-            if pad_rows is not None:
-                # Every routing kernel of the pre-routed runner drops a slot whose id lies
-                # outside the rank's window (the small-batch kernels test `expertIdx > -1`, the
-                # others a signed `id - first_expert >= 0`), so -1 is local to no rank: the
-                # padding rows reach no expert's GEMMs, and the finalize writes a row with no
-                # local slot as +0.0. The router, the routing and the quantization still run
-                # over every row, so the call's shapes, tile and tactic are the same.
-                ids.masked_fill_(pad_rows[lo:hi, None], -1)
-            # One NVFP4 quantization under the layer's static scale serves every expert on
-            # every rank: the windows' partials sum.
-            xq, xs = fp4_quantize(x, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
-            part = fp4_block_scale_moe_runner(
-                None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None,
-                None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2,
-                core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
-                core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
-                topk_weights=weights, topk_ids=ids, tune_max_num_tokens=core.expert_tune_tokens,
-            )[0]  # fmt: skip
-            if routed_all is None:
-                routed_all = part
-            else:
-                routed_all[lo:hi].copy_(part)
-        routed = reducescatter(routed_all, None, core.dp_group, core.dp_pg)[:rows]
+        routed_all = _routed_experts(
+            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        )
+        if _one_shot(core, counts):
+            main.wait_stream(side)
+            return lamport_moe_combine(
+                routed_all, shared, None, None, core.eps, counts, core.moe_comm
+            )
+        routed = _nccl_combine(core, routed_all, counts)
         main.wait_stream(side)
         return torch.add(routed, shared)
 
@@ -1468,9 +1515,7 @@ class PrefillTarget:
         # The slot mappings and windows follow the prepared token order; a padded input
         # would scatter keys into stale slots.
         assert rows == step["num_tokens"], (rows, step["num_tokens"])
-        padded = _padded_rows(core, step, rows)
-        # The gathered rows that are another rank's padding (or this one's), once per step.
-        pad_rows = _padding_rows(step["all_rank_num_tokens"], padded, dev)
+        counts = _rank_counts(core, step, rows)
         tc = step["num_ctx_tokens"]
         gen = rows - tc
         skip_ctx = step["skip_ctx"]
@@ -1490,7 +1535,7 @@ class PrefillTarget:
             )
             residual = torch.add(residual, self._linear_fp8(attn_out, L.wo, L.wo_s))
             o = flashinfer_rmsnorm(residual, L.ffn_norm, core.eps)
-            mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, padded, pad_rows)
+            mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, counts)
             residual = torch.add(residual, mlp)
             x = flashinfer_rmsnorm(residual, L.next_norm, core.eps)
             if spec_metadata is not None:
@@ -1835,64 +1880,39 @@ class DecodeTarget:
         act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
         return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
 
-    def _moe(self, o, L, padded: int, pad_rows: torch.Tensor | None = None):
-        """A MoE layer's MLP on this rank's own rows: the shared expert on its own rows, on the
-        side stream, beside the routed experts over every rank's gathered rows.
+    def _moe(self, o, L, residual, counts: tuple[int, ...]):
+        """A MoE layer's MLP on this rank's own rows, added to `residual`, and the next layer's
+        input norm: `(x, residual)`. The shared expert runs on its own rows on the side stream,
+        beside the routed experts over every rank's gathered rows.
 
-        The rows are zero-padded to `padded` (the largest rank's count) and gathered before the
-        router, so every rank routes the identical `world_size * padded` rows. Router, routing,
-        NVFP4 quantization and this rank's expert window (32 experts at 4 ranks, 16 at 8) run
-        over them in chunks of at most `expert_call_tokens`, each writing its rows of one
-        output, which the reduce-scatter sums over the windows and splits back to `padded` rows
-        per rank. Beside a
-        prefilling peer this rank's few rows gather up to `world_size * max_num_tokens`, so the
-        chunking is this target's too. The padding rows (`pad_rows`, `_padding_rows`) take
-        expert id -1 after the routing, so no rank's window holds them and no expert computes
-        them; their output rows come back +0.0 and are dropped. Without `pad_rows` they route
-        to experts 0..3 (an exact tie at +0.0) and contribute zero."""
+        The router, the routing and the NVFP4 quantization run on this rank's own rows; their
+        codes, scales, ids and weights are gathered from every rank unpadded (`counts`), so
+        every rank holds the identical rows in rank order -- beside a prefilling peer up to
+        `world_size * max_num_tokens` of them, so the expert calls' chunking is this target's
+        too. While no rank holds more than the workspace (`_one_shot`, every captured decode
+        graph) the reduce-scatter is the one-shot kernel that also adds the shared expert and
+        `residual` (in place) and applies the next layer's norm; past it, NCCL and the adds and
+        norm as separate ops."""
         core = self.core
         m = L.moe
-        rows = o.shape[0]
         side = core._side_stream
         main = torch.cuda.current_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        o_pad = o if rows == padded else nn.functional.pad(o, [0, 0, 0, padded - rows])
-        o_all = allgather(o_pad, None, core.dp_group, core.dp_pg)
-        total = o_all.shape[0]
-        call = core.expert_call_tokens
-        routed_all = None if total <= call else torch.empty_like(o_all)
-        for lo in range(0, total, call):
-            hi = min(lo + call, total)
-            x = o_all[lo:hi]
-            logits = cublas_mm(x, m.router, None, torch.float32)
-            ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-            if pad_rows is not None:
-                # Every routing kernel of the pre-routed runner drops a slot whose id lies
-                # outside the rank's window (the small-batch kernels test `expertIdx > -1`, the
-                # others a signed `id - first_expert >= 0`), so -1 is local to no rank: the
-                # padding rows reach no expert's GEMMs, and the finalize writes a row with no
-                # local slot as +0.0. The router, the routing and the quantization still run
-                # over every row, so the call's shapes, tile and tactic are the same.
-                ids.masked_fill_(pad_rows[lo:hi, None], -1)
-            # One NVFP4 quantization under the layer's static scale serves every expert on
-            # every rank: the windows' partials sum.
-            xq, xs = fp4_quantize(x, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
-            part = fp4_block_scale_moe_runner(
-                None, None, xq, xs.view(torch.float8_e4m3fn), m.fc1_w, m.fc1_s, None, None,
-                None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate, m.out2,
-                core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
-                core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
-                topk_weights=weights, topk_ids=ids, tune_max_num_tokens=core.expert_tune_tokens,
-            )[0]  # fmt: skip
-            if routed_all is None:
-                routed_all = part
-            else:
-                routed_all[lo:hi].copy_(part)
-        routed = reducescatter(routed_all, None, core.dp_group, core.dp_pg)[:rows]
+        routed_all = _routed_experts(
+            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        )
+        if _one_shot(core, counts):
+            main.wait_stream(side)
+            x = lamport_moe_combine(
+                routed_all, shared, residual, L.next_norm, core.eps, counts, core.moe_comm
+            )
+            return x, residual
+        routed = _nccl_combine(core, routed_all, counts)
         main.wait_stream(side)
-        return torch.add(routed, shared)
+        residual = torch.add(residual, torch.add(routed, shared))
+        return flashinfer_rmsnorm(residual, L.next_norm, core.eps), residual
 
     def forward(
         self,
@@ -1920,15 +1940,7 @@ class DecodeTarget:
         )
         # Every rank's count, frozen into a capture: the engine replays a decode graph only
         # when every rank is generation-only at the same padded batch, the counts it captured.
-        padded = _padded_rows(core, step, rows)
-        # The gathered rows that are padding, in an eager step beside a prefilling peer. A
-        # captured step takes none: the engine replays a decode graph only when every rank
-        # decodes at the captured batch, every count equal, so a graph pads nothing.
-        pad_rows = (
-            None
-            if torch.cuda.is_current_stream_capturing()
-            else _padding_rows(step["all_rank_num_tokens"], padded, dev)
-        )
+        counts = _rank_counts(core, step, rows)
         # A separate graph is captured for steps whose sequences all fit in index_topk, so
         # this host branch is a per-capture constant.
         skip_gen = step["skip_gen"]
@@ -1954,9 +1966,11 @@ class DecodeTarget:
                 L.ffn_norm,
                 core.eps,
             )
-            mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, padded, pad_rows)
-            residual = torch.add(residual, mlp)
-            x = flashinfer_rmsnorm(residual, L.next_norm, core.eps)
+            if L.moe is None:
+                residual = torch.add(residual, self._dense(o, L))
+                x = flashinfer_rmsnorm(residual, L.next_norm, core.eps)
+            else:
+                x, residual = self._moe(o, L, residual, counts)
             if spec_metadata is not None:
                 spec_metadata.maybe_capture_hidden_states(layer_idx, residual)
         return x

@@ -66,6 +66,13 @@ _DEP8_COMBINE = dict(
 # count 1..16 -- and the combines one captured decode step issues.
 _DEP8_GRAPH_ROWS = tuple(range(1, 17))
 _DEP8_MOE_LAYERS = 71
+# Mistral Large 4 NVFP4 sm_107 at dep4 and dep8, past the one-shot workspace: the same combine
+# of the runner's partial over every rank's own rows unpadded, `[sum(counts), 6144]` bf16, each
+# rank keeping its `counts[rank]` rows, `sizes=counts` (one ncclReduce per rank in one group
+# when the counts differ), on the MPI-session communicator. `_reducescatter_op_matrix.py` drives them
+# (`check_mpi_ragged_cells`).
+_RAGGED_DEP4 = dict(trailing=(6144,), dtype=torch.bfloat16, world_size=4, process_group=None)
+_RAGGED_DEP8 = dict(_RAGGED_DEP4, world_size=8, nodes=2)
 
 
 class Reducescatter(OpWrapper):
@@ -78,14 +85,16 @@ class Reducescatter(OpWrapper):
     every rank; `input` is left untouched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-    # deepseek-r1 and Mistral Large 4 NVFP4 at dep4 and dep8 are the callers, and
-    # all pass `sizes=None`: they pad to a common height first. The row counts
-    # are the full heights an attention-DP step reduces, which is the rank count
-    # times a slice. The first three cells drove the `_pg` symbol (a boxed c10d
-    # group); every cell stating `process_group=None` drove the MPI-session
-    # symbol, at the world size it states.
+    # deepseek-r1 and Mistral Large 4 NVFP4 at dep4 and dep8 are the callers. The
+    # sm_103 ones pass `sizes=None`: they pad to a common height first, and the
+    # row counts are the full heights an attention-DP step reduces, which is the
+    # rank count times a slice. The sm_107 Mistral Large 4 target passes every
+    # rank's own count past its one-shot workspace (the `ragged=True` cells). The
+    # first three cells drove the `_pg` symbol (a boxed c10d group); every cell
+    # stating `process_group=None` drove the MPI-session symbol, at the world
+    # size it states.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one row per rank after the split, hidden 7168",
@@ -195,6 +204,25 @@ class Reducescatter(OpWrapper):
             "is fresh",
             spec=dict(rows_per_rank=32768, payload="random", **_DEP8_COMBINE),
         ),
+        Cell(
+            why="sm_107 dep4 MoE combine beside a prefilling peer, unpadded: ragged counts, one "
+            "ncclReduce per rank in one group",
+            spec=dict(_RAGGED_DEP4, counts=(16352, 1, 64, 16), ragged=True),
+        ),
+        Cell(
+            why="sm_107 dep4 MoE combine at max_num_tokens on one rank, the one-row dummy on the "
+            "rest, unpadded",
+            spec=dict(_RAGGED_DEP4, counts=(32768, 1, 1, 1), ragged=True),
+        ),
+        Cell(
+            why="sm_107 dep4 MoE combine, ragged counts swept: one rank's count from 1 to 2048 "
+            "at a stride of 97 against 1, 513 and 4096",
+            spec=dict(_RAGGED_DEP4, sweep=(1, 2048, 97), others=(1, 513, 4096), ragged=True),
+        ),
+        Cell(
+            why="sm_107 dep8 MoE combine over two nodes beside a prefilling peer, unpadded",
+            spec=dict(_RAGGED_DEP8, counts=(16352, 1, 64, 16, 1, 600, 3, 17), ragged=True),
+        ),
     )
 
     note = """
@@ -255,12 +283,16 @@ class Reducescatter(OpWrapper):
     (77.2 s), so the world-8 cells too keep every value to 2048 and a stride
     above it.
 
-    The ragged form and dtypes other than bf16 work and are exercised by the op
-    matrix on the `_pg` symbol, but no shipped target reaches them, so they are
-    not cells. Not certified on the MPI-session symbol: a ragged `sizes`, other
-    dtypes and widths, a group other than all four ranks of one node or all
-    eight ranks of two nodes, other world sizes and node counts, and
-    rows_per_rank above 32768.
+    Dtypes other than bf16 work and are exercised by the op matrix on the `_pg`
+    symbol, but no shipped target reaches them, so they are not cells. The
+    ragged cells (`ragged=True`, sm_107) were driven on the MPI-session symbol
+    by `_moe_comm_op_matrix.py`, at world 4 on one VR200 node and at world 8 on
+    two VR200 nodes of one NVL72 domain, on partials of small integers whose
+    every sum is exact in bf16: each rank's rows bit for bit. Their rounding on
+    general payloads was not measured apart from the uniform form's. Not
+    certified on the MPI-session symbol: other dtypes and widths, a group other
+    than all four ranks of one node or all eight ranks of two nodes, other
+    world sizes and node counts, and rows_per_rank above 32768.
 
     Hard limits (sm_103), the uniform split at width 6144 bf16
       input bytes   4 * rows_per_rank * 12288 vs 2^31   reached at rows_per_rank 43691
