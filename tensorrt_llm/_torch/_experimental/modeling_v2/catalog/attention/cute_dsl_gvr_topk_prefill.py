@@ -24,8 +24,16 @@ GVR_WORKSPACE_BYTES = WS_BYTES
 
 
 #: The engine's row-count tiers (`_prefill_tier`): a launch of at most 148 rows (tier 0), of
-#: 149..296 (tier 1) or of more (tier 2); the smallest row count of each.
+#: 149..296 (tier 1) or of more (tier 2); the smallest row count of each. A call's `tier0_rows`
+#: raises the tier-0 bound (see `TIER0_ROWS`).
 _TIER_ROWS = (1, 149, 297)
+
+#: The engine's default tier-0 bound: one 1024-thread CTA per row, one wave on sm_103's 148 SMs.
+#: An sm_107 caller passes its SM count (212): launches of 149..212 rows then run the tier-0 plan
+#: in one wave rather than the 512-thread tier-1 plan, which leaves every SM one CTA of 16 warps
+#: and runs latency-bound (measured on sm_107: 212-row tiles at 306384 keys take 33.4 us on tier
+#: 0, 57.0 us on tier 1). The selected set does not depend on the plan; the order does.
+TIER0_ROWS = 148
 #: The widths whose tier-0 launches the engine compiles apart (its power-of-two bucket of the
 #: width, capped at 32768): (2048, 4096], (4096, 8192], (8192, 8448] (8449..16384 take tier 1's
 #: plan at top_k 2048) and from 16385 on, one each.
@@ -100,10 +108,11 @@ class CuteDslGvrTopkPrefill(OpWrapper):
 
     `output_indices` (`[rows, top_k]` int32, contiguous, 16-byte aligned) is written in place
     and returned; `workspace` is the caller's `gvr_workspace` slab, or None for the engine's
-    per-device one.
+    per-device one. `tier0_rows` raises the engine's tier-0 bound (`TIER0_ROWS`); the set is
+    the same on every plan, the order a fixed function of the input per plan.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # The dep4 target's calls (dep8 alike), one per query tile of an indexer
     # prefill block, on fp8_mqa_logits' row-padded output: at the 1M envelope
@@ -261,6 +270,41 @@ class CuteDslGvrTopkPrefill(OpWrapper):
             "against its own 1048500 keys",
             spec=dict(blocks=([(1048400, 100, None)],), values="ties", **_INDEXER),
         ),
+        # The sm_107 dep4 target's calls: tiles of at most 212 rows (one tier-0 wave) from
+        # 131072 keys on, `tier0_rows` 212.
+        Cell(
+            why="sm_107 dep4 1M, a 212-row tile of a 16384-token chunk after 290000 cached keys: "
+            "tier 0 at 212 rows",
+            spec=dict(
+                blocks=([(290000, 16384, 212)],), values="logits", tier0_rows=212, **_INDEXER
+            ),
+        ),
+        Cell(
+            why="sm_107 dep4 1M, the 161-row budget tile after 400000 cached keys: tier 0",
+            spec=dict(
+                blocks=([(400000, 16384, 161)],), values="distinct", tier0_rows=212, **_INDEXER
+            ),
+        ),
+        Cell(
+            why="sm_107 dep4 1M, a 212-row tile after 150000 cached keys with tied scores",
+            spec=dict(blocks=([(150000, 16384, 212)],), values="ties", tier0_rows=212, **_INDEXER),
+        ),
+        Cell(
+            why="sm_107 dep4 1M, a 212-row tile after 114688 cached keys with narrow scores",
+            spec=dict(
+                blocks=([(114688, 16384, 212)],), values="narrow", tier0_rows=212, **_INDEXER
+            ),
+        ),
+        Cell(
+            why="sm_107 dep4 1M, 212 rows over two packed requests' windows (140000 + 9000 "
+            "cached keys): tier 0",
+            spec=dict(
+                blocks=([(140000, 8192, 112), (9000, 8192, 100)],),
+                values="spread",
+                tier0_rows=212,
+                **_INDEXER,
+            ),
+        ),
     )
 
     note = """
@@ -299,6 +343,7 @@ class CuteDslGvrTopkPrefill(OpWrapper):
         output_indices: torch.Tensor,
         top_k: int,
         workspace: Optional[torch.Tensor] = None,
+        tier0_rows: int = TIER0_ROWS,
     ) -> torch.Tensor:
         if input_values.shape[1] <= top_k:
             # Every window lies inside the block, so every row is short: the identity, then -1.
@@ -313,6 +358,7 @@ class CuteDslGvrTopkPrefill(OpWrapper):
             output_indices,
             workspace=workspace,
             deterministic=True,
+            tier0_rows=tier0_rows,
         )
         return output_indices
 
@@ -324,10 +370,11 @@ class CuteDslGvrTopkPrefill(OpWrapper):
         output_indices: torch.Tensor,
         top_k: int,
         workspace: Optional[torch.Tensor] = None,
+        tier0_rows: int = TIER0_ROWS,
     ) -> torch.Tensor:
         """A fresh `[rows, top_k]` int32 selection.
 
-        `output_indices` and `workspace` are not read. A long row holds `torch.topk`'s
+        `output_indices`, `workspace` and `tier0_rows` are not read. A long row holds `torch.topk`'s
         winners in descending score order; the engine promises its own fixed order and keeps
         the lowest columns among keys tied at the k-th score, so the set is exact only on
         rows without such a tie.
@@ -357,6 +404,7 @@ class CuteDslGvrTopkPrefill(OpWrapper):
         output_indices: torch.Tensor,
         top_k: int,
         workspace: Optional[torch.Tensor] = None,
+        tier0_rows: int = TIER0_ROWS,
     ) -> None:
         # k is the output's width: a wider buffer selects more than top_k per row.
         assert output_indices.shape[1] == top_k, (

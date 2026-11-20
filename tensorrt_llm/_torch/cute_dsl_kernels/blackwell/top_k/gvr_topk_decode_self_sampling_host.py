@@ -760,6 +760,10 @@ _VARLEN_CACHE = {}
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+# Default row bound of the tier-0 plan: one 1024-thread CTA per row, one wave on 148 SMs. A
+# caller on a GPU with more SMs passes its own bound (`tier0_rows`) to keep launches of up to
+# one wave there on that plan; the tier-1 / tier-2 bands are unchanged above it.
+_PREFILL_TIER0_ROWS = 148
 # The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
 # gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
 # path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
@@ -775,8 +779,8 @@ def _prefill_scpb_tier1(k: int) -> int:
     return 8192 if k > 1024 else 4096
 
 
-def _prefill_tier(rows: int, n_env: int, k: int) -> int:
-    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+def _prefill_tier(rows: int, n_env: int, k: int, tier0_rows: int = _PREFILL_TIER0_ROWS) -> int:
+    tier = 0 if rows <= max(tier0_rows, _PREFILL_TIER0_ROWS) else 1 if rows <= 296 else 2
     if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
         tier = 1
     return tier
@@ -1671,12 +1675,15 @@ def run_prefill(
     workspace: torch.Tensor | None = None,
     deterministic: bool = False,
     sorting: str | None = None,
+    tier0_rows: int = _PREFILL_TIER0_ROWS,
 ) -> None:
     """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
     No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
-    ``deterministic`` / ``sorting`` as in ``run_varlen``."""
+    ``deterministic`` / ``sorting`` as in ``run_varlen``. Launches of at most
+    ``tier0_rows`` rows (at least 148) take the tier-0 plan; the selected set does
+    not depend on the plan."""
     det = _check_det_args(deterministic, sorting)
     if logits.dtype is not _F32:
         raise RuntimeError(
@@ -1745,7 +1752,7 @@ def run_prefill(
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0, n_env, k)
+        tier = _prefill_tier(r1 - r0, n_env, k, tier0_rows)
         lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, det))
         if lc is None:
             if _is_capturing():
@@ -1769,12 +1776,13 @@ def prefill_ready(
     indices: torch.Tensor,
     max_row_len: int | None = None,
     deterministic: bool = False,
+    tier0_rows: int = _PREFILL_TIER0_ROWS,
 ) -> bool:
     """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
     without compiling — the same (tier, k, envelope bucket) keys it looks up, so
     a caller can route around the engine under CUDA graph capture. Host-only.
-    Pass the same ``max_row_len`` as the ``run_prefill`` call (the envelope
-    bucket, and with it the tier, is derived from it)."""
+    Pass the same ``max_row_len`` and ``tier0_rows`` as the ``run_prefill`` call
+    (the envelope bucket, and with it the tier, is derived from them)."""
     num_rows = logits.shape[0]
     if num_rows == 0:
         return True
@@ -1784,7 +1792,7 @@ def prefill_ready(
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k, tier0_rows)
         if _prefill_cache_key(tier, k, n_bucket, bool(deterministic)) not in _PREFILL_CACHE:
             return False
     return True

@@ -321,6 +321,13 @@ _NVFP4_SF_LINEAR = False
 # 1 GiB tile (1 << 28) left a dep4 rank under the 2%-of-device free-memory margin at 0.9 of free
 # memory to KV at max_seq_len 1048576.
 _PREFILL_LOGITS_CEILING = 1 << 26
+# From this many keys on, a prefill block's query tiles hold at most one row per SM: the GVR
+# top-k then runs every tile as one wave of its 1024-thread tier-0 plan (`_select_ctx` passes
+# the SM count as its `tier0_rows`), one CTA of 32 warps per row, instead of the latency-bound
+# 512- and 256-thread plans the budget's 219- to 403-row tiles take. Below it the per-row work is
+# too short for that plan to pay: at 93384 keys the 718-row budget tile on the 256-thread plan
+# is the fastest per row.
+_TOPK_WAVE_TILE_KEYS = 1 << 17
 # The decode indexer's CuTe DSL selectors, False for the trtllm indexer_topk_decode op alone; the
 # scorer's column count is the engine's max_seq_len, so each selector is built for an engine
 # whose width it serves (`_derive_first_step`). next_n 1: cute_dsl_radix_topk_decode, one CTA
@@ -851,6 +858,7 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         # prefill logits budget, the held context workspace's rows, the most gathered rows one
         # expert-path call takes and the MoE autotuner's largest bucket.
         self.prefill_logits_budget = 0
+        self.topk_wave_rows = 0
         self.ctx_workspace_rows = 0
         self.expert_call_tokens = 0
         self.expert_tune_tokens = 0
@@ -940,6 +948,8 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         # The indexer's prefill logits budget and the held context workspace's rows, from the
         # engine's max_num_tokens, max_num_requests, max_seq_len and runtime features.
         self.prefill_logits_budget = _prefill_logits_budget(md.max_num_tokens, md.max_seq_len)
+        # One wave of the prefill top-k's tier-0 plan: a CTA per SM (`_TOPK_WAVE_TILE_KEYS`).
+        self.topk_wave_rows = torch.cuda.get_device_properties(dev).multi_processor_count
         self.ctx_workspace_rows = _ctx_workspace_rows(md)
         # The expert path's calls at this world size: the smaller ones under chunked prefill,
         # the engines whose steps attend a cached prefix up to max_seq_len and hold the large
@@ -1285,7 +1295,8 @@ class PrefillTarget:
         """Plan the context rows and key windows scored by each query tile.
 
         The engine's chunk and query-split mappings determine each block's rows,
-        keys and window offsets. Tiles stay within the prefill logits budget.
+        keys and window offsets. Tiles stay within the prefill logits budget, and
+        from `_TOPK_WAVE_TILE_KEYS` keys on within one top-k wave of rows.
         The plan is reused across indexer layers within this step."""
         core = self.core
         chunks = step["indexer_prefill_chunks"]
@@ -1314,6 +1325,8 @@ class PrefillTarget:
                 if n_k > 0:
                     shift = k_token_start - chunk.k_token_start
                     tile = max(1, core.prefill_logits_budget // n_k)
+                    if n_k >= _TOPK_WAVE_TILE_KEYS:
+                        tile = min(tile, core.topk_wave_rows)
                     for lo in range(token_start, token_end, tile):
                         hi = min(lo + tile, token_end)
                         # The windows are the chunk's own, indexed from its first row and key.
@@ -1373,8 +1386,9 @@ class PrefillTarget:
                     q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke, compiled=core._ix_logits
                 )
                 cute_dsl_gvr_topk_prefill(
-                    logits, ks, ke, topk_buf[lo:hi], core.idx_topk, self._gvr_ws
-                )
+                    logits, ks, ke, topk_buf[lo:hi], core.idx_topk, self._gvr_ws,
+                    tier0_rows=core.topk_wave_rows,
+                )  # fmt: skip
                 # Freed before the next tile's is allocated: one tile is live at a time.
                 del logits
 
