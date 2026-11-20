@@ -9,6 +9,10 @@ One UMMA tile is 128 keys (M) by 4 query rows x 32 heads (N = 128), K = 128, FP8
 an FP32 accumulator in tensor memory. The keys sit on the TMEM lanes, so a thread owns one key
 and reduces the 32 heads of a row in registers: no cross-thread reduction. The epilogue loads
 `rows_per_load` rows of the accumulator at a time and the row's head weights from shared memory.
+The relu of `relu_fadd_chains` of the row's four FMA chains (heads h, h+1, h+2, h+3 for h = 0,
+4, ..) runs as x + |x| = 2 relu(x), an FADD on the FMA pipe, beside the other chains' max(x, 0)
+on the ALU pipe; those chains are halved before the final sum. Every partial sum of such a chain
+is exactly twice the max(x, 0) one, so the logits do not depend on the split.
 
 Work: the query rows come in blocks of 4 and the keys in blocks of 128, grouped into splits of
 `kv_per_split` key blocks. A work item is one (query block, split); the persistent CTAs take
@@ -16,12 +20,15 @@ items round robin. An item scores only the key blocks that meet the union of its
 and writes -inf over the rest of its split, so every logit of `[rows, n_k]` is written once and
 the tiles outside every window cost a store, not an MMA.
 
-Warp roles (384 threads), as the paged decode kernel (`fp8_paged_mqa_logits.py`):
-  warps 0-7   two math warpgroups; group g reduces the key blocks c_lo + g, c_lo + g + 2, ...
-  warp 8      TMA: the item's queries and head weights, then group 0's keys and key scales
-  warp 9      TMA: group 1's keys and key scales
-  warps 10-11 UMMA for groups 0 and 1
-Each group has its own key pipeline and two accumulator stages (4 x 128 TMEM columns).
+Warp roles (128 x (2 W + 1) threads, W = `wgs_per_group`), as the paged decode kernel
+(`fp8_paged_mqa_logits.py`) for W = 1:
+  warps 0 .. 8W-1   two groups of W math warpgroups; group g reduces the key blocks c_lo + g,
+                    c_lo + g + 2, ..., each of its warpgroups 4 / W of the block's 4 rows
+  warp 8W           TMA: the item's queries and head weights, then group 0's keys and key scales
+  warp 8W + 1       TMA: group 1's keys and key scales
+  warps 8W + 2, +3  UMMA for groups 0 and 1
+Each group has its own key pipeline and two accumulator stages (4 x 128 TMEM columns). The
+epilogue is CUDA-core bound, so more warpgroups per group hide more of its latency.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 HEADS = 32
@@ -46,23 +54,73 @@ BLOCK_KV = 128
 _RND_RN = "rn"
 
 
+def _twice_relu(a):
+    """a + |a| = 2 relu(a), exact: one FADD with an |.| operand, on the FMA pipe."""
+    return cutlass.Float32(
+        prims.inline_ptx_hl(
+            "{\n\t.reg .f32 t;\n\tabs.f32 t, {$r0};\n\tadd.rn.f32 {$w0}, {$r0}, t;\n\t}",
+            write_only_types=[cutlass.Float32],
+            read_only_args=[a],
+        )
+    )
+
+
+def _relu(a, twice: bool):
+    """At trace time: 2 relu(a) on the FMA pipe when `twice`, else max(a, 0) on the ALU pipe."""
+    if twice:
+        return _twice_relu(a)
+    return cutlass.max(a, cutlass.Float32(0.0))
+
+
 class Fp8MqaLogitsPrefillKernel:
     """Ragged FP8 MQA logits over gathered keys, one persistent launch."""
 
-    def __init__(self, num_kv_stages: int = 4, num_q_stages: int = 2, rows_per_load: int = 2):
+    def __init__(
+        self,
+        num_kv_stages: int = 4,
+        num_q_stages: int = 2,
+        rows_per_load: int = 1,
+        wgs_per_group: int = 2,
+        relu_fadd_chains: int = 1,
+    ):
         self.num_kv_stages = num_kv_stages
         self.num_q_stages = num_q_stages
-        # Query rows per TMEM load, 32 accumulator columns each.
-        if BLOCK_Q % rows_per_load:
-            raise ValueError(f"rows_per_load must divide {BLOCK_Q}, got {rows_per_load}")
+        # Two groups of 1 or 2 warpgroups beside the producer / UMMA warpgroup: at most 640
+        # threads, so a math thread keeps 112 registers.
+        if wgs_per_group not in (1, 2):
+            raise ValueError(f"wgs_per_group must be 1 or 2, got {wgs_per_group}")
+        self.wgs_per_group = wgs_per_group
+        # Query rows per math warpgroup, and per TMEM load (32 accumulator columns each).
+        self.rows_per_wg = BLOCK_Q // wgs_per_group
+        if self.rows_per_wg % rows_per_load:
+            raise ValueError(
+                f"rows_per_load must divide {self.rows_per_wg} rows per warpgroup, "
+                f"got {rows_per_load}"
+            )
         self.rows_per_load = rows_per_load
+        # Shared memory: the query and key stages (16 KiB of e4m3 plus 512 bytes of fp32 each),
+        # under SM100's 227 KiB per CTA with a KiB left for the barriers.
+        stage_bytes = BLOCK_KV * HEAD_DIM + BLOCK_KV * 4
+        if (num_q_stages + 2 * num_kv_stages) * stage_bytes > (227 - 1) * 1024:
+            raise ValueError(
+                f"{num_q_stages} query and 2 x {num_kv_stages} key stages exceed shared memory"
+            )
+        if not 0 <= relu_fadd_chains <= 4:
+            raise ValueError(f"relu_fadd_chains must be in [0, 4], got {relu_fadd_chains}")
+        self.relu_fadd_chains = relu_fadd_chains
+        self.math_warps = 8 * wgs_per_group
+        # Every thread starts with the launch's even share of the register file; the producer /
+        # UMMA warpgroup drops to 24 and the math threads take what it frees (setmaxnreg.inc
+        # draws only on registers another warpgroup released): 240 at 384 threads, 112 at 640.
+        launch_regs = 65536 // (32 * self.math_warps + 128) // 8 * 8
+        self.math_regs = launch_regs + (launch_regs - 24) * 128 // (32 * self.math_warps) // 8 * 8
         self.num_umma_stages = 2
         self.N = BLOCK_Q * HEADS
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (BLOCK_KV, self.N)
-        self.threads_per_cta = 384
+        self.threads_per_cta = 32 * self.math_warps + 128
 
     def _setup_mma(self, ab_dtype, a_major, b_major):
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -246,14 +304,15 @@ class Fp8MqaLogitsPrefillKernel:
         tidx, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         warpgroup_idx = warp_idx // 4
-        is_math_warp = warp_idx < 8
+        mw = self.math_warps
+        is_math_warp = warp_idx < mw
 
-        if warp_idx == 8:
+        if warp_idx == mw:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_s)
-        if warp_idx == 9:
+        if warp_idx == mw + 1:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_s)
 
@@ -262,12 +321,12 @@ class Fp8MqaLogitsPrefillKernel:
 
         # --- pipelines ---
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        # Queries + weights: both math warpgroups consume (and release) every staged block.
+        # Queries + weights: every math warpgroup consumes (and releases) every staged block.
         q_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.q_mbar.data_ptr(),
             num_stages=self.num_q_stages,
             producer_group=prod_group,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 8),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, mw),
             tx_count=self.num_q_tma_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             tidx=tidx,
@@ -275,7 +334,7 @@ class Fp8MqaLogitsPrefillKernel:
         )
         # Keys + scales, per group: the UMMA warp waits, the group's math warps release once
         # the accumulator (hence the MMA's reads) is done.
-        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
+        kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, mw // 2)
         kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.kv_mbar_0.data_ptr(),
             num_stages=self.num_kv_stages,
@@ -300,7 +359,7 @@ class Fp8MqaLogitsPrefillKernel:
             barrier_storage=storage.umma_mbar_0.data_ptr(),
             num_stages=self.num_umma_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 16 * mw),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
@@ -308,13 +367,13 @@ class Fp8MqaLogitsPrefillKernel:
             barrier_storage=storage.umma_mbar_1.data_ptr(),
             num_stages=self.num_umma_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 16 * mw),
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
 
         # TMEM: math warp 0 allocates and frees (the last reader); the UMMA warps retrieve.
-        tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=320)
+        tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * mw + 64)
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -402,7 +461,7 @@ class Fp8MqaLogitsPrefillKernel:
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        if warp_idx == 8:
+        if warp_idx == mw:
             cute.arch.warpgroup_reg_dealloc(24)
             q_prod = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_q_stages
@@ -442,7 +501,7 @@ class Fp8MqaLogitsPrefillKernel:
                         kb = kb + 2
                 item = item + num_ctas
 
-        elif warp_idx == 9:
+        elif warp_idx == mw + 1:
             cute.arch.warpgroup_reg_dealloc(24)
             kv_prod = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_kv_stages
@@ -468,9 +527,9 @@ class Fp8MqaLogitsPrefillKernel:
                     kb = kb + 2
                 item = item + num_ctas
 
-        elif warp_idx == 10 or warp_idx == 11:
+        elif warp_idx == mw + 2 or warp_idx == mw + 3:
             cute.arch.warpgroup_reg_dealloc(24)
-            group = warp_idx - 10
+            group = warp_idx - (mw + 2)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             q_cons = pipeline.make_pipeline_state(
@@ -499,7 +558,7 @@ class Fp8MqaLogitsPrefillKernel:
                 )  # fmt: skip
 
         elif is_math_warp:
-            cute.arch.warpgroup_reg_alloc(240)
+            cute.arch.warpgroup_reg_alloc(self.math_regs)
             tmem.allocate(cols_per_group * 2)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -512,20 +571,18 @@ class Fp8MqaLogitsPrefillKernel:
             umma_cons = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_umma_stages
             )
-            if warpgroup_idx == 0:
-                self._math_loop(
-                    cute.make_tensor(tmem_ptr, tCtAcc_fake.layout), copy_atom_t2r, epi_sub, sW,
-                    sS_0, q_pipeline, kv_pipeline_0, umma_pipeline_0, q_cons, kv_cons, umma_cons,
-                    0, tidx % 128, cta, num_ctas, num_items, mStarts, mEnds, mLogits, num_rows,
-                    num_keys, num_kb, kv_per_split, num_splits,
-                )  # fmt: skip
-            else:
-                self._math_loop(
-                    cute.make_tensor(tmem_ptr + cols_per_group, tCtAcc_fake.layout),
-                    copy_atom_t2r, epi_sub, sW, sS_1, q_pipeline, kv_pipeline_1, umma_pipeline_1,
-                    q_cons, kv_cons, umma_cons, 1, tidx % 128, cta, num_ctas, num_items, mStarts, mEnds,
-                    mLogits, num_rows, num_keys, num_kb, kv_per_split, num_splits,
-                )  # fmt: skip
+            # Warpgroup w is part w % W of group w // W: one copy of the code per group (the
+            # parts differ only in their rows), so the instruction cache holds both.
+            for g in cutlass.range_constexpr(2):
+                if warpgroup_idx // self.wgs_per_group == g:
+                    self._math_loop(
+                        cute.make_tensor(tmem_ptr + g * cols_per_group, tCtAcc_fake.layout),
+                        copy_atom_t2r, epi_sub, sW, (sS_0, sS_1)[g], q_pipeline,
+                        (kv_pipeline_0, kv_pipeline_1)[g], (umma_pipeline_0, umma_pipeline_1)[g],
+                        q_cons, kv_cons, umma_cons, g, warpgroup_idx % self.wgs_per_group,
+                        tidx % 128, cta, num_ctas, num_items, mStarts, mEnds, mLogits, num_rows,
+                        num_keys, num_kb, kv_per_split, num_splits,
+                    )  # fmt: skip
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
         else:
@@ -607,6 +664,7 @@ class Fp8MqaLogitsPrefillKernel:
         kv_cons,
         umma_cons,
         group: cutlass.Constexpr[int],
+        part,
         local_tidx,
         cta,
         num_ctas,
@@ -620,21 +678,28 @@ class Fp8MqaLogitsPrefillKernel:
         kv_per_split,
         num_splits,
     ):
-        """One group's epilogue: per key block, relu, the head weights' FMA and the key scale
-        for each of the 4 rows, masked to the row's window; -inf over the group's share of the
-        split's key blocks outside the scored range."""
+        """One warpgroup's epilogue, part `part` of group `group`: per key block, relu, the head
+        weights' FMA and the key scale for each of its rows, masked to the row's window; -inf
+        over its rows of the group's share of the split's key blocks outside the scored range."""
         acc_ref = tCtAcc[(None, None, None, 0)][((None, None), 0, 0)]
         acc_ref_epi = cute.flat_divide(acc_ref, epi_sub)
         t2r_ref = tcgen05.make_tmem_copy(copy_atom_t2r, acc_ref_epi[(None, None, 0, 0)])
         tTR_cC = t2r_ref.get_slice(local_tidx).partition_D(cute.make_identity_tensor(epi_sub))
         m_coord = tTR_cC[0][0]
         tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-        # One row's head weights, copied from shared memory per row: the item's 128 weights held
-        # in registers beside the accumulator rows leave the epilogue short of registers.
+        # One row's head weights, copied from shared memory per row: a warpgroup's rows' weights
+        # held in registers beside the accumulator rows leave the epilogue short of registers.
         w_reg = cute.make_rmem_tensor(HEADS, cutlass.Float32)
         neg_inf = cutlass.Float32(-float("inf"))
         zero = cutlass.Float32(0.0)
+        half = cutlass.Float32(0.5)
         rows_per_load = self.rows_per_load
+        fadd_chains = self.relu_fadd_chains
+        # This warpgroup's rows of the query block, and its TMEM loads of them.
+        rows_per_wg = self.rows_per_wg
+        loads_per_wg = rows_per_wg // rows_per_load
+        row_lo = part * rows_per_wg
+        load_lo = part * loads_per_wg
 
         item = cta
         while item < num_items:
@@ -643,12 +708,12 @@ class Fp8MqaLogitsPrefillKernel:
             )
             row0 = qb * BLOCK_Q
             # The rows' windows (a row past num_rows reads the last row's and stores nothing).
-            starts = [cutlass.Int32(0)] * BLOCK_Q
-            ends = [cutlass.Int32(0)] * BLOCK_Q
-            for t in cutlass.range_constexpr(BLOCK_Q):
-                r = cutlass.min(row0 + t, num_rows - 1)
-                starts[t] = mStarts[r]
-                ends[t] = mEnds[r]
+            starts = [cutlass.Int32(0)] * rows_per_wg
+            ends = [cutlass.Int32(0)] * rows_per_wg
+            for tl in cutlass.range_constexpr(rows_per_wg):
+                r = cutlass.min(row0 + row_lo + tl, num_rows - 1)
+                starts[tl] = mStarts[r]
+                ends[tl] = mEnds[r]
             if c_hi > c_lo:
                 q_pipeline.consumer_wait(q_cons)
                 q_stage = q_cons.index
@@ -664,15 +729,16 @@ class Fp8MqaLogitsPrefillKernel:
                     t2r = tcgen05.make_tmem_copy(copy_atom_t2r, acc_epi[(None, None, 0, 0)])
                     tTR = t2r.get_slice(local_tidx).partition_S(acc_epi)
                     key = kb * BLOCK_KV + m_coord
-                    for i in cutlass.range_constexpr(BLOCK_Q // rows_per_load):
-                        cute.copy(t2r, tTR[(None, None, None, 0, i)], tTR_rAcc)
+                    for il in cutlass.range_constexpr(loads_per_wg):
+                        cute.copy(t2r, tTR[(None, None, None, 0, load_lo + il)], tTR_rAcc)
                         cute.arch.fence_view_async_tmem_load()
-                        if i == BLOCK_Q // rows_per_load - 1:
+                        if il == loads_per_wg - 1:
                             umma_pipeline.consumer_release(umma_cons)
                             umma_cons.advance()
                         v = tTR_rAcc.load()
                         for u in cutlass.range_constexpr(rows_per_load):
-                            t = i * rows_per_load + u
+                            tl = il * rows_per_load + u
+                            t = row_lo + tl
                             cute.autovec_copy(
                                 cute.local_tile(sW[(None, q_stage)], (HEADS,), (t,)), w_reg
                             )
@@ -682,10 +748,10 @@ class Fp8MqaLogitsPrefillKernel:
                             s1y = zero
                             for h in cutlass.range_constexpr(0, HEADS, 4):
                                 c = u * HEADS + h
-                                a0 = cutlass.max(v[c], zero)
-                                a1 = cutlass.max(v[c + 1], zero)
-                                a2 = cutlass.max(v[c + 2], zero)
-                                a3 = cutlass.max(v[c + 3], zero)
+                                a0 = _relu(v[c], fadd_chains > 0)
+                                a1 = _relu(v[c + 1], fadd_chains > 1)
+                                a2 = _relu(v[c + 2], fadd_chains > 2)
+                                a3 = _relu(v[c + 3], fadd_chains > 3)
                                 w = h
                                 s0x, s0y = cute.arch.fma_packed_f32x2(
                                     (a0, a1), (w_reg[w], w_reg[w + 1]), (s0x, s0y), rnd=_RND_RN
@@ -693,8 +759,17 @@ class Fp8MqaLogitsPrefillKernel:
                                 s1x, s1y = cute.arch.fma_packed_f32x2(
                                     (a2, a3), (w_reg[w + 2], w_reg[w + 3]), (s1x, s1y), rnd=_RND_RN
                                 )
+                            # The FADD chains hold twice their sums: halving them is exact.
+                            if cutlass.const_expr(fadd_chains > 0):
+                                s0x = s0x * half
+                            if cutlass.const_expr(fadd_chains > 1):
+                                s0y = s0y * half
+                            if cutlass.const_expr(fadd_chains > 2):
+                                s1x = s1x * half
+                            if cutlass.const_expr(fadd_chains > 3):
+                                s1y = s1y * half
                             score = ((s0x + s0y) + (s1x + s1y)) * scale
-                            if (key < starts[t]) | (key >= ends[t]):
+                            if (key < starts[tl]) | (key >= ends[tl]):
                                 score = neg_inf
                             if (row0 + t < num_rows) & (key < num_keys):
                                 mLogits[(row0 + t, key)] = score
@@ -707,8 +782,8 @@ class Fp8MqaLogitsPrefillKernel:
                 if (kb < c_lo) | (kb >= c_hi):
                     key = kb * BLOCK_KV + m_coord
                     if key < num_keys:
-                        for t in cutlass.range_constexpr(BLOCK_Q):
-                            if row0 + t < num_rows:
-                                mLogits[(row0 + t, key)] = neg_inf
+                        for tl in cutlass.range_constexpr(rows_per_wg):
+                            if row0 + row_lo + tl < num_rows:
+                                mLogits[(row0 + row_lo + tl, key)] = neg_inf
                 kb = kb + 2
             item = item + num_ctas
