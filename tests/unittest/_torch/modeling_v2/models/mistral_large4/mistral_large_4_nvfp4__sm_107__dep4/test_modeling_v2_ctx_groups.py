@@ -14,7 +14,9 @@ one workspace group whose KV fits twice; otherwise every sharer gathers them aga
 context rows alone that is one workspace group returns the prefill kernel's own output, which
 the V up-projection reads in place of the latent scratch (`own_out`).
 
-Host only, with stand-ins for the kernels: the groups, their rows, request and position per
+Host only, with stand-ins for the kernels: the held workspace's rows for an engine's
+max_num_tokens, max_num_requests, max_seq_len and runtime features (room for a request at
+max_seq_len, within 2**19..2**20 rows), the groups, their rows, request and position per
 workspace row, offsets, kept rows and sub-batches over a 40-row held workspace, and which
 kernel each group's rows reach, with which slices, and which steps return the kernel's own
 output.
@@ -207,6 +209,34 @@ def test_groups_by_request_kv(contexts, expected):
         else:
             assert g.kept is None
     assert sorted(ctx.sched) == sorted(sizes)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "features, tokens, requests, max_seq_len, rows",
+    [
+        ((False, False), 32768, 16, 32768, 65536),
+        ((True, True), 32768, 16, 32768, 1 << 19),
+        ((False, True), 16384, 64, 32768, 1 << 19),
+        ((True, True), 16384, 32, 600000, 600000),
+        ((True, True), 16384, 32, 1048576, 1 << 20),
+        ((True, False), 16384, 32, 2097152, 1 << 20),
+        ((True, True), 16, 1, 300000, 1 << 19),
+    ],
+    ids=["32k_new_only", "32k_chunked", "32k_reuse", "600k", "1m", "2m_capped", "short_step"],
+)
+def test_workspace_rows_fit_a_request_at_max_seq_len(features, tokens, requests, max_seq_len, rows):
+    """The held workspace has room for the most context KV one step attends, twice over, up to
+    the engine's max_seq_len within 2**19..2**20 rows: an engine of max_seq_len 32768 keeps the
+    2**19 rows sixteen of its requests fill, one of max_seq_len 1048576 holds 2**20 so that a
+    request at max_seq_len fits whole, and one past 2**20 stops there."""
+    md = SimpleNamespace(
+        runtime_features=SimpleNamespace(chunked_prefill=features[0], cache_reuse=features[1]),
+        max_num_tokens=tokens,
+        max_num_requests=requests,
+        max_seq_len=max_seq_len,
+    )
+    assert M._ctx_workspace_rows(md) == rows
 
 
 def _recorded(monkeypatch) -> list:

@@ -78,7 +78,8 @@ class DsMlaDequantGatherTiled(DsMlaDequantGather):
     # spec: as `ds_mla_dequant_gather`'s. The sm_107 dep4, tep4 and tp4 targets' cells, plus
     # the dep4 context steps of an AgentX prefill chunk: 16384 new rows behind a cached prefix
     # of 0, 100000 and 300000 tokens (the workspace path through N = 316384, the shared
-    # source kept beside the step's rows through N = 2**18).
+    # source kept beside the step's rows through N = 2**18), and the dep4 workspace of an
+    # engine at max_seq_len 1048576, 2**20 rows: one request at max_seq_len fills it.
     CELLS: tuple[Cell, ...] = (
         *(
             c
@@ -132,6 +133,24 @@ class DsMlaDequantGatherTiled(DsMlaDequantGather):
                 tokens_per_block=32,
                 row=62,
                 out_rows=524288,
+                table_rows=16,
+                table_width=32772,
+                far=True,
+                large=True,
+            ),
+        ),
+        Cell(
+            why="1M dep4 boot-sized pool, large: one request at max_seq_len, 1032192 cached + "
+            "16384 new (N = 2**20, the 2**20-row buffer whole), its 32768 pages the pool's top "
+            "ones, row 62",
+            spec=dict(
+                cached=[1032192],
+                new=[16384],
+                blocks=74183,
+                owners=63,
+                tokens_per_block=32,
+                row=62,
+                out_rows=1048576,
                 table_rows=16,
                 table_width=32772,
                 far=True,

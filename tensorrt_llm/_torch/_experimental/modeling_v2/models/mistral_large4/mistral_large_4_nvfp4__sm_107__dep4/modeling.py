@@ -54,10 +54,11 @@ requests, in order, are grouped while their KV together fits the held workspace,
 group's rows run the sparse prefill over that KV dequantized into it; the rows of a request
 whose own KV is past it run as one-row sequences of the sparse fp8 decode over the pool
 itself, as generation rows always do. The held workspace, allocated on the first context step,
-has room for the most context KV one step can attend, twice over, up to 2**19 rows
-(`_ctx_workspace_rows`): a step whose context KV fits twice keeps layer 35's rows beside its
-own for the NoPE layers attending over that latent, any other gathers them again for each of
-those layers. An indexer chunk the engine packs past `max_seq_len` keys is scored request
+has room for the most context KV one step can attend, twice over, up to the engine's
+max_seq_len within 2**19..2**20 rows (`_ctx_workspace_rows`), so up to max_seq_len 1048576 every
+request fits it whole: a step whose context KV fits twice keeps layer 35's rows beside its own
+for the NoPE layers attending over that latent, any other gathers them again for each of those
+layers. An indexer chunk the engine packs past `max_seq_len` keys is scored request
 by request, the indexer's logits are tiled under a budget from the engine's max_num_tokens and
 max_seq_len (`_prefill_logits_budget`), each tile scored with the CuTe DSL FP8 MQA scorer
 and selected with the self-sampling GVR
@@ -375,9 +376,15 @@ _ONE_SHOT_ROWS = 512
 # their KV (cached and new rows) together fits the held workspace, and each group's KV is
 # gathered, dequantized, into it (bf16 [rows, 576]) for FlashMLA's sparse prefill; a request
 # whose own KV is past it attends straight off the pool with the sparse decode kernel, which
-# takes about twice the prefill's time per context row on sm_107.
-# capacity: fixed: 2**19 rows, 576 MiB, the most KV one request attends through the workspace.
+# takes about twice the prefill's time per context row on sm_107. The ceiling follows the
+# engine's max_seq_len between these two, so that a request at max_seq_len fits whole.
+# capacity: fixed: 2**19 rows (576 MiB), the ceiling of an engine whose max_seq_len is shorter:
+# sixteen requests of max_seq_len 32768 hold it.
 _CTX_WORKSPACE_ROWS = 1 << 19
+# capacity: fixed: 2**20 rows (1.125 GiB), one request at max_seq_len 1048576; the rows the
+# gather and the sparse prefill are certified to (`ds_mla_dequant_gather_tiled`,
+# `flash_mla_sparse_prefill` and `convert_req_index_to_workspace`, their 2**20-row cells).
+_CTX_WORKSPACE_MAX_ROWS = 1 << 20
 # The most context rows one sparse-decode call takes on that path: FlashMLA's decode scheduler
 # exits the process, raising nothing, past 11622 one-row sequences of 64 heads on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
@@ -419,10 +426,13 @@ def _most_ctx_kv(md) -> int:
 def _ctx_workspace_rows(md) -> int:
     """The held context workspace's rows: the most context KV one step can attend
     (`_most_ctx_kv`) twice over, a step's rows and a shared owner's (layer 35's) kept beside
-    them, up to `_CTX_WORKSPACE_ROWS`. At max_num_tokens 32768 with neither chunked prefill nor
-    block reuse that is 65536 rows, the two `[32768, 576]` gathers a step there makes; with either,
-    at 16 requests of max_seq_len 32768 or more, 2**19."""
-    return min(2 * _most_ctx_kv(md), _CTX_WORKSPACE_ROWS)
+    them, up to the engine's max_seq_len within `_CTX_WORKSPACE_ROWS` and
+    `_CTX_WORKSPACE_MAX_ROWS`, so that a request at max_seq_len up to 1048576 fits whole. At
+    max_num_tokens 32768 with neither chunked prefill nor block reuse that is 65536 rows, the
+    two `[32768, 576]` gathers a step there makes; with either, 2**19 at 16 requests of
+    max_seq_len 32768, and 2**20 at max_seq_len 1048576."""
+    ceiling = min(max(md.max_seq_len, _CTX_WORKSPACE_ROWS), _CTX_WORKSPACE_MAX_ROWS)
+    return min(2 * _most_ctx_kv(md), ceiling)
 
 
 def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict:

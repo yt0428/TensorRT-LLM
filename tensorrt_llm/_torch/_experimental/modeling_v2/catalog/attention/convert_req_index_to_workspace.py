@@ -80,6 +80,11 @@ class ConvertReqIndexToWorkspace(OpWrapper):
             spec=dict(kv=[262144, 262144], new=[64, 64], topk=2048),
         ),
         Cell(
+            why="the largest offsets at max_seq_len 1048576: two requests of 524288 KV rows, "
+            "the second's run at row 524288 of the 2**20-row workspace",
+            spec=dict(kv=[524288, 524288], new=[64, 64], topk=2048),
+        ),
+        Cell(
             why="topk past one program's block and not a multiple of it: 3000 selections",
             spec=dict(kv=[5000, 4000], new=[33, 17], topk=3000),
         ),
@@ -102,8 +107,9 @@ class ConvertReqIndexToWorkspace(OpWrapper):
 
     Hard limits (sm_107)
       sel, out    r * row stride + c, int64 in the kernel     not reached (32768 x 2048)
-      values      int32: a workspace row is below 2**19, so sel + off < 2**20 in every
-                  cell; no overflow check (an offset past 2**31 - topk would wrap)
+      values      int32: a workspace row is below 2**20 (the dep4 workspace at max_seq_len
+                  1048576), so sel + off < 2**21 in every cell; no overflow check (an
+                  offset past 2**31 - topk would wrap)
       req_id      read as given: a row whose request id is past ws_off's length reads
                   past ws_off (not checked: `is_valid` does no device reads)
     """
