@@ -102,6 +102,33 @@ def test_certified_cells(cell, compiled, certifying) -> None:  # noqa: F811 — 
     assert float(relative_rms) <= _ULPS * 2**-23
 
 
+#: Epilogue layouts other than the default build's: one math warpgroup per group (the 384-thread
+#: kernel), every chain's relu on the ALU pipe or on the FMA pipe, more rows per TMEM load.
+_LAYOUTS = (
+    dict(wgs_per_group=1, rows_per_load=2, relu_fadd_chains=0),
+    dict(wgs_per_group=1, rows_per_load=4, relu_fadd_chains=4),
+    dict(wgs_per_group=2, rows_per_load=2, relu_fadd_chains=2),
+)
+
+
+@pytest.mark.parametrize(
+    "options", _LAYOUTS, ids=[",".join(f"{k}={v}" for k, v in o.items()) for o in _LAYOUTS]
+)
+def test_layouts_score_bitwise_alike(options, compiled) -> None:
+    """How the epilogue splits a query block's rows over warpgroups, and each row's relu over
+    the ALU and FMA pipes, moves no bit: every layout's logits are the default build's."""
+    other = build(torch.cuda.current_device(), **options)
+    for spec in (
+        dict(m=515, n=100515, causal=True),
+        dict(m=1031, n=40000, packed=True),
+        dict(m=17, n=2051),
+    ):
+        args = _inputs(spec, 7)
+        expected = op(*args, compiled=compiled)
+        actual = op(*args, compiled=other)
+        assert torch.equal(actual.view(torch.int32), expected.view(torch.int32)), spec
+
+
 _TOPK_CELLS = [cell for cell in op.CELLS if cell.spec.get("causal") or cell.spec.get("packed")]
 
 
