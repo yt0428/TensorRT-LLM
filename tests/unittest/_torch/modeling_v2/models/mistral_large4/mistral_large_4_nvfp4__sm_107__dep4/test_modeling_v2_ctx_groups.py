@@ -3,42 +3,45 @@
 """The Mistral-Large-4-1T-A52B NVFP4 sm_107 dep4 target's context rows, request group by group.
 
 `PrefillTarget._ctx_workspace` groups the step's context requests, in order, on this rank's
-host ints: a request whose own KV (cached and new rows) fits the held workspace joins a
+host ints: a request whose own KV (cached and new rows) fits the context workspace joins a
 workspace group, which takes the requests after it while their KV together still fits; a run of
-requests each past the held rows is a decode group. `PrefillTarget._attn_ctx` runs each group's
-rows on its path: the workspace group's KV gathered, dequantized, into the held workspace's
-first rows (`ds_mla_dequant_gather_tiled`) for FlashMLA's bf16 sparse prefill; the decode
-group's rows as one-row sequences of FlashMLA's sparse fp8 decode over the pool, in sub-batches
-of at most `_CTX_DECODE_ROWS`. Layer 35's rows are kept beside the step's only when the step is
-one workspace group whose KV fits twice; otherwise every sharer gathers them again. A step of
-context rows alone that is one workspace group returns the prefill kernel's own output, which
-the V up-projection reads in place of the latent scratch (`own_out`).
+requests each past the workspace's rows is a decode group. `PrefillTarget._attn_ctx` runs each
+group's rows on its path: the workspace group's KV gathered, dequantized, into the first rows
+of the layer's workspace (`ds_mla_dequant_gather_tiled`) for FlashMLA's bf16 sparse prefill,
+layer 35's again for each sharer; the decode group's rows as one-row sequences of FlashMLA's
+sparse fp8 decode over the pool, in sub-batches of at most `_CTX_DECODE_ROWS`. A step of context
+rows alone that is one workspace group returns the prefill kernel's own output, which the V
+up-projection reads in place of a latent output (`own_out`); any other step's prefill output is
+copied into the latent output in calls of at most `_CTX_PREFILL_OUT_ROWS` rows.
+`PrefillTarget._attention` takes the layer's absorbed query and whole workspace as one
+allocation, the attention output over the query's first bytes.
 
-Host only, with stand-ins for the kernels: the held workspace's rows for an engine's
+Host only, with stand-ins for the kernels: the workspace's rows for an engine's
 max_num_tokens, max_num_requests, max_seq_len and runtime features (room for a request at
 max_seq_len, within 2**19..2**20 rows), the groups, their rows, request and position per
-workspace row, offsets, kept rows and sub-batches over a 40-row held workspace, and which
-kernel each group's rows reach, with which slices, and which steps return the kernel's own
-output.
+workspace row, offsets and sub-batches over a 40-row workspace, which kernel each group's rows
+reach, with which slices, which steps return the kernel's own output, and the attention
+block's buffers.
 
 On one sm_107 GPU, over a 63-owner fp8_ds_mla pool (every byte 0xFF, a NaN in every field, but
 the owner rows of layers 1, 35 and 36), queries at all 64 heads and selections shaped like the
-indexer's, steps over an 8192-row held workspace: one group fitting twice and once, three
-requests in two workspace groups, five alternating workspace and decode groups, and a decode
-group of two sub-batches behind a workspace group. For layers 1, 35, 36 and 39 (35's sharer), in
-that order on one step's groups:
+indexer's, steps over an 8192-row workspace refilled with NaN before every layer: one small
+group and one near the workspace's rows, three requests in two workspace groups, five
+alternating workspace and decode groups, and a decode group of two sub-batches behind a
+workspace group. For layers 1, 35, 36 and 39 (35's sharer), in that order on one step's groups:
 
 * every workspace group's request rows are bitwise the sparse prefill over that request's own KV
   read straight from the pool, as on a step of that request alone, and every decode group's
   rows bitwise the sparse decode over the group's own rows in its sub-batches, as on a step of
   those requests alone;
 * the step agrees within relative L2 1e-3 with the sparse decode over all of its context rows,
-  the target's computation for a step past the held rows before it grouped requests;
+  the target's computation for a step past its workspace rows before it grouped requests;
 * sampled rows are within relative L2 1e-2 of an fp32 softmax over the selected keys read
   straight from the pool;
 
 and on a step that is one workspace group, the kernel's own output and the copy of it the step
-makes with a generation row behind it are bitwise the same, as are their V up-projections.
+makes with a generation row behind it, in calls of 384 rows, are bitwise the same, as are their
+V up-projections.
 """
 
 from __future__ import annotations
@@ -80,7 +83,7 @@ _OWNERS = [i for i in range(_LAYERS) if _SOURCES[i] == i]
 _WRITTEN = (1, 35, 36)
 _RUN = (1, 35, 36, 39)
 _SUB = M._CTX_DECODE_ROWS
-#: The GPU steps' held workspace, small enough that a few thousand rows cross it.
+#: The GPU steps' workspace rows, small enough that a few thousand rows cross them.
 _HELD = 8192
 _BLOCKS = 1200
 _TABLE = (16, 1024)
@@ -120,14 +123,12 @@ def _host_step(contexts) -> dict:
 
 
 def _target(held: int) -> M.PrefillTarget:
-    """A prefill target over what its context workspace and attention read off the core: a held
-    workspace of `held` rows, layer 35 the one shared source, and the 63-owner pool's
-    addressing."""
+    """A prefill target over what its context workspace and attention read off the core: a
+    workspace of `held` rows and the 63-owner pool's addressing."""
     target = M.PrefillTarget.__new__(M.PrefillTarget)
     target.core = SimpleNamespace(
         lat_dim=_LAT_DIM,
         ctx_workspace_rows=held,
-        shared_source=[i == _SHARED for i in range(_LAYERS)],
         softmax_scale=_SCALE,
         idx_topk=_TOPK,
         _stride_factor=len(_OWNERS) * _TPB,
@@ -151,7 +152,7 @@ def _rows_of(view: torch.Tensor, base: torch.Tensor) -> tuple[int, int]:
 @pytest.mark.parametrize(
     "contexts, expected",
     [
-        ([(7, 3), (0, 6)], [((0, 9), "kept", 16)]),
+        ([(7, 3), (0, 6)], [((0, 9), "workspace", 16)]),
         ([(20, 5), (10, 5)], [((0, 10), "workspace", 40)]),
         ([(31, 10)], [((0, 10), "decode", [(0, 10)])]),
         ([(30, 10), (0, 1)], [((0, 10), "workspace", 40), ((10, 11), "workspace", 1)]),
@@ -168,21 +169,19 @@ def _rows_of(view: torch.Tensor, base: torch.Tensor) -> tuple[int, int]:
             ],
         ),
     ],
-    ids=["fits_twice", "fits_once", "one_past", "exact_then_one", "three_in_two", "alternating"],
+    ids=["small", "fits", "one_past", "exact_then_one", "three_in_two", "alternating"],
 )
 def test_groups_by_request_kv(contexts, expected):
-    """Over a held workspace of 40 rows: the requests, in order, join a workspace group while
-    their KV together fits (40 rows exactly included), a request past 40 rows alone, or with the
-    ones past it after it, is a decode group, in sub-batches from its first row. Every workspace
-    group starts at the held buffer's first row and addresses its own requests (the step's
-    request ids) at their own positions; one over several requests holds each request's offset
-    in the group. Only a step that is one group fitting twice keeps rows after its own."""
+    """Over a workspace of 40 rows: the requests, in order, join a workspace group while their KV
+    together fits (40 rows exactly included), a request past 40 rows alone, or with the ones past
+    it after it, is a decode group, in sub-batches from its first row. Every workspace group
+    holds its KV's row count, the workspace's first rows, and addresses its own requests (the
+    step's request ids) at their own positions; one over several requests holds each request's
+    offset in the group."""
     target = _target(40)
     step = _host_step(contexts)
     tc = step["num_ctx_tokens"]
     ctx = target._ctx_workspace(step, tc, torch.device("cpu"))
-    buf = target._ws_buf
-    assert buf.shape == (40, _LAT_DIM) and buf.dtype == torch.bfloat16
     kv = [c + n for c, n in contexts]
     starts = _cumsum(kv).tolist()
     new_starts = _cumsum([n for _, n in contexts]).tolist()
@@ -191,12 +190,12 @@ def test_groups_by_request_kv(contexts, expected):
     sizes = set()
     for g, (rows, kind, shape) in zip(ctx.groups, expected):
         if kind == "decode":
-            assert g.ws_buf is None and not hasattr(g, "kv_req")
+            assert g.n_kv is None and not hasattr(g, "kv_req")
             assert g.sub_batches == shape
             sizes.update(hi - lo for lo, hi in shape)
             continue
         reqs = [r for r in range(len(contexts)) if rows[0] <= new_starts[r] < rows[1]]
-        assert _rows_of(g.ws_buf, buf) == (0, shape) and g.ws == {} and g.idx is None
+        assert g.n_kv == shape and g.idx is None
         assert g.kv_req.tolist() == [r for r in reqs for _ in range(kv[r])]
         assert g.kv_pos.tolist() == [p for r in reqs for p in range(kv[r])]
         if len(reqs) == 1:
@@ -204,10 +203,6 @@ def test_groups_by_request_kv(contexts, expected):
         else:
             assert g.ws_off.dtype == torch.int32
             assert g.ws_off[reqs].tolist() == [starts[r] - starts[reqs[0]] for r in reqs]
-        if kind == "kept":
-            assert _rows_of(g.kept, buf) == (shape, 2 * shape)
-        else:
-            assert g.kept is None
     assert sorted(ctx.sched) == sorted(sizes)
 
 
@@ -215,21 +210,22 @@ def test_groups_by_request_kv(contexts, expected):
 @pytest.mark.parametrize(
     "features, tokens, requests, max_seq_len, rows",
     [
-        ((False, False), 32768, 16, 32768, 65536),
+        ((False, False), 32768, 16, 32768, 32768),
         ((True, True), 32768, 16, 32768, 1 << 19),
         ((False, True), 16384, 64, 32768, 1 << 19),
         ((True, True), 16384, 32, 600000, 600000),
         ((True, True), 16384, 32, 1048576, 1 << 20),
         ((True, False), 16384, 32, 2097152, 1 << 20),
-        ((True, True), 16, 1, 300000, 1 << 19),
+        ((True, True), 16, 1, 300000, 300000),
     ],
     ids=["32k_new_only", "32k_chunked", "32k_reuse", "600k", "1m", "2m_capped", "short_step"],
 )
 def test_workspace_rows_fit_a_request_at_max_seq_len(features, tokens, requests, max_seq_len, rows):
-    """The held workspace has room for the most context KV one step attends, twice over, up to
-    the engine's max_seq_len within 2**19..2**20 rows: an engine of max_seq_len 32768 keeps the
-    2**19 rows sixteen of its requests fill, one of max_seq_len 1048576 holds 2**20 so that a
-    request at max_seq_len fits whole, and one past 2**20 stops there."""
+    """The workspace has room for the most context KV one step attends, up to the engine's
+    max_seq_len within 2**19..2**20 rows: an engine of max_seq_len 32768 keeps the 2**19 rows
+    sixteen of its requests fill, one of max_seq_len 1048576 takes 2**20 so that a request at
+    max_seq_len fits whole, and one past 2**20 stops there; a step that attends less (new rows
+    only, or one request) takes that much."""
     md = SimpleNamespace(
         runtime_features=SimpleNamespace(chunked_prefill=features[0], cache_reuse=features[1]),
         max_num_tokens=tokens,
@@ -272,27 +268,27 @@ def _recorded(monkeypatch) -> list:
 
 @pytest.mark.cpu_only
 def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
-    """A step of requests of 15 + 5, 41 and 10 KV rows over 40 held rows: a workspace group over
-    the first two (rows 0..7), a decode group (7..17) and a workspace group (17..22). Layer 35,
-    then 39 (its sharer, selecting nothing): each workspace group gathers its own requests into
-    the held rows and attends its rows over them, the two-request group's selections offset by
-    10 for its second request once, into a buffer 39 reads again; the decode group's rows
-    become slots and attend in one sub-batch; and 39 gathers layer 35 again, the step keeping
-    no rows."""
+    """A step of requests of 15 + 5, 41 and 10 KV rows over a 40-row workspace: a workspace group
+    over the first two (rows 0..7), a decode group (7..17) and a workspace group (17..22). Layer
+    35, then 39 (its sharer, selecting nothing): each workspace group gathers its own requests
+    into the workspace's first rows and attends its rows over them, the two-request group's
+    selections offset by 10 for its second request once, into a buffer 39 reads again; the
+    decode group's rows become slots and attend in one sub-batch; and 39 gathers layer 35
+    again."""
     calls = _recorded(monkeypatch)
     pool_row = _OWNERS.index(_SHARED)
     target = _target(40)
     contexts = [(5, 5), (3, 2), (31, 10), (5, 5)]
     step = _host_step(contexts)
     ctx = target._ctx_workspace(step, 22, torch.device("cpu"))
-    buf = target._ws_buf
+    buf = torch.empty(40, _LAT_DIM, dtype=torch.bfloat16)
     assert [g.rows for g in ctx.groups] == [(0, 7), (7, 17), (17, 22)]
     req_idx = torch.tensor([0] * 5 + [1] * 2 + [2] * 10 + [3] * 5, dtype=torch.int32)
     sel = torch.tensor([[0, 1, -1, 2]] * 22, dtype=torch.int32)
     q, out = torch.empty(22, 1), torch.empty(22, 1)
     for layer, selects in ((_SHARED, True), (39, False)):
         L = SimpleNamespace(kv_source=_SOURCES[layer], indexer=object() if selects else None)
-        target._attn_ctx(step, L, q, out, req_idx, sel, ctx)
+        target._attn_ctx(step, L, q, out, req_idx, sel, ctx, buf)
     offsets = [c for c in calls if c[0] == "offset"]
     assert len(offsets) == 1 and offsets[0][1] == [0] * 5 + [1] * 2
     calls = [c for c in calls if c[0] != "offset"]
@@ -316,12 +312,11 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
         assert gather2[:3] == ("gather", pool_row, [3] * 10)
         assert _rows_of(gather2[3], buf) == (0, 10)
         assert _rows_of(prefill2[1], q) == (17, 22) and prefill2[3].tolist() == sel[17:].tolist()
-    assert all(g.ws == {} for g in ctx.groups if g.ws_buf is not None)
 
 
 @pytest.mark.cpu_only
 def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
-    """A 20000-row request past the held rows behind a 5-row one that fits: the decode group's
+    """A 20000-row request past the workspace's rows behind a 5-row one that fits: the decode group's
     rows 5..20005 attend in sub-batches of 8192, 8192 and 3616 from its first row, on those
     sizes' schedulers, and nothing of its KV is gathered."""
     calls = _recorded(monkeypatch)
@@ -335,7 +330,7 @@ def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
     sel = torch.zeros(20005, 4, dtype=torch.int32)
     q, out = torch.empty(20005, 1), torch.empty(20005, 1)
     L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
-    target._attn_ctx(step, L, q, out, req_idx, sel, ctx)
+    target._attn_ctx(step, L, q, out, req_idx, sel, ctx, torch.empty(40, _LAT_DIM))
     gathers = [c for c in calls if c[0] == "gather"]
     assert [kv_req for _, _, kv_req, _ in gathers] == [[0] * 10]
     decodes = [c for c in calls if c[0] == "decode"]
@@ -347,8 +342,8 @@ def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
 @pytest.mark.parametrize("gen_rows, own", [(0, True), (2, False)], ids=["ctx_alone", "gen_behind"])
 def test_one_group_alone_returns_the_kernel_output(monkeypatch, gen_rows, own):
     """A step that is one workspace group (16 KV rows over 40): with its context rows alone the
-    prefill writes no latent scratch and its own output is returned for the V up-projection;
-    with generation rows behind them the prefill writes the scratch's context rows, which are
+    prefill takes no latent output and its own output is returned for the V up-projection; with
+    generation rows behind them the prefill writes the latent output's context rows, which are
     returned."""
     prefills = []
     kernel_out = torch.empty(9, 1)
@@ -365,15 +360,113 @@ def test_one_group_alone_returns_the_kernel_output(monkeypatch, gen_rows, own):
     step["num_tokens"] += gen_rows
     ctx = target._ctx_workspace(step, 9, torch.device("cpu"))
     assert ctx.own_out is own
-    lat_out = torch.empty(9, 1)
+    lat_out = None if own else torch.empty(9, 1)
     L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
     req_idx = torch.tensor([0] * 3 + [1] * 6, dtype=torch.int32)
     sel = torch.zeros(9, 4, dtype=torch.int32)
-    got = target._attn_ctx(step, L, torch.empty(9, 1), lat_out, req_idx, sel, ctx)
+    ws = torch.empty(40, _LAT_DIM)
+    got = target._attn_ctx(step, L, torch.empty(9, 1), lat_out, req_idx, sel, ctx, ws)
     if own:
         assert prefills == [None] and got is kernel_out
     else:
         assert _rows_of(prefills[0], lat_out) == (0, 9) and got is lat_out
+
+
+@pytest.mark.cpu_only
+def test_copied_prefill_runs_in_bounded_calls(monkeypatch):
+    """With generation rows behind a two-request group's 9 context rows, the prefill's output is
+    copied into the latent output in calls of at most `_CTX_PREFILL_OUT_ROWS` rows (4 here):
+    rows 0..4, 4..8 and 8..9, each with its rows' queries and offset selections over the one
+    gather of the group's 16 KV rows."""
+    calls = _recorded(monkeypatch)
+    monkeypatch.setattr(M, "_CTX_PREFILL_OUT_ROWS", 4)
+    target = _target(40)
+    step = _host_step([(7, 3), (0, 6)])
+    step["num_tokens"] += 2
+    ctx = target._ctx_workspace(step, 9, torch.device("cpu"))
+    assert not ctx.own_out
+    ws = torch.empty(40, _LAT_DIM, dtype=torch.bfloat16)
+    req_idx = torch.tensor([0] * 3 + [1] * 6, dtype=torch.int32)
+    sel = torch.tensor([[0, 1, -1, 2]] * 9, dtype=torch.int32)
+    q, out = torch.empty(9, 1), torch.empty(9, 1)
+    L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
+    assert target._attn_ctx(step, L, q, out, req_idx, sel, ctx, ws) is out
+    (gather,) = [c for c in calls if c[0] == "gather"]
+    assert _rows_of(gather[3], ws) == (0, 16)
+    (offset,) = [c for c in calls if c[0] == "offset"]
+    prefills = [c for c in calls if c[0] == "prefill"]
+    bounds = [(0, 4), (4, 8), (8, 9)]
+    assert [_rows_of(c[1], q) for c in prefills] == bounds
+    assert [_rows_of(c[4], out) for c in prefills] == bounds
+    assert [_rows_of(c[3], offset[2]) for c in prefills] == bounds
+    assert all(c[2] is gather[3] for c in prefills)
+    assert torch.cat([c[3] for c in prefills]).tolist() == (
+        [[0, 1, -1, 2]] * 3 + [[10, 11, -1, 12]] * 6
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("gen_rows", [0, 2], ids=["ctx_alone", "gen_behind"])
+def test_attention_buffers_are_one_allocation(monkeypatch, gen_rows):
+    """`_attention` on a step of one workspace group (9 context rows, 16 KV rows over a 40-row
+    workspace): the absorbed query at all 64 heads and the whole workspace behind it are one
+    allocation, and the attention output the V up-projection writes is its first bytes. With
+    the context rows alone the context attention takes no latent output and the V
+    up-projection reads the prefill kernel's own; with generation rows behind them both phases
+    write one latent output of the layer's own, outside that allocation."""
+    target = _target(40)
+    core = target.core
+    core.heads, core.qk_dim, core.kv_lora, core.v_dim, core.unfused_glue = (
+        _HEADS, 128, _NOPE, 128, False,
+    )  # fmt: skip
+    tc = 9
+    rows = tc + gen_rows
+    step = _host_step([(7, 3), (0, 6)])
+    step["num_tokens"] += gen_rows
+    ctx = target._ctx_workspace(step, tc, torch.device("cpu"))
+    seen = {"bmm": []}
+    kernel_out = torch.empty(tc, _HEADS, _NOPE, dtype=torch.bfloat16)
+
+    def attn_ctx(step_, L_, fused_q, lat_out, req_idx, topk_buf, ctx_, ws_rows):
+        seen.update(ctx_q=fused_q, ctx_out=lat_out, ws=ws_rows)
+        return kernel_out if lat_out is None else lat_out
+
+    def attn_gen(step_, L_, fused_q, lat_out, slots, sched):
+        seen.update(gen_q=fused_q, gen_out=lat_out)
+
+    monkeypatch.setattr(
+        target, "_linear_fp8", lambda x, w, w_s: torch.zeros(x.shape[0], _HEADS * 128)
+    )
+    monkeypatch.setattr(target, "_attn_ctx", attn_ctx)
+    monkeypatch.setattr(target, "_attn_gen", attn_gen)
+    monkeypatch.setattr(M, "ssmax_scaling_fused_q", lambda *args: None)
+    monkeypatch.setattr(M, "convert_req_index_to_global", lambda *args: None)
+    monkeypatch.setattr(M, "bmm_out", lambda a, b, out: seen["bmm"].append((a, out)))
+    L = SimpleNamespace(
+        wq=None, wq_s=None, ssmax_s=None, ssmax_b=None, rope=True, indexer=None, nope=64,
+        k_b=None, owner=False, kv_source=_SOURCES[1], v_b_t=None,
+    )  # fmt: skip
+    s = SimpleNamespace(nope_lat=None, sched=None)
+    attn = target._attention(
+        step, L, torch.zeros(rows, 8), torch.zeros(rows), torch.zeros(rows, dtype=torch.int32),
+        torch.zeros(rows, 4, dtype=torch.int32), s, ctx, tc, False, False,
+    )  # fmt: skip
+    q, ws = seen["ctx_q"], seen["ws"]
+    assert q.shape == (tc, _HEADS, _LAT_DIM) and ws.shape == (40, _LAT_DIM)
+    assert q.untyped_storage().data_ptr() == ws.untyped_storage().data_ptr()
+    assert ws.data_ptr() - q.data_ptr() == rows * _HEADS * _LAT_DIM * 2
+    assert attn.shape == (rows, _HEADS * 128) and attn.data_ptr() == q.data_ptr()
+    (absorb_a, absorb_out), (v_a, v_out) = seen["bmm"]
+    assert absorb_out.data_ptr() == q.data_ptr() and v_out.data_ptr() == attn.data_ptr()
+    if gen_rows == 0:
+        assert seen["ctx_out"] is None and "gen_q" not in seen
+        assert v_a.data_ptr() == kernel_out.data_ptr()
+        return
+    lat = seen["ctx_out"]
+    assert lat.untyped_storage().data_ptr() != q.untyped_storage().data_ptr()
+    assert seen["gen_out"].data_ptr() == lat.data_ptr() + tc * _HEADS * _NOPE * 2
+    assert seen["gen_q"].data_ptr() == q.data_ptr() + tc * _HEADS * _LAT_DIM * 2
+    assert v_a.data_ptr() == lat.data_ptr() and v_a.shape == (_HEADS, rows, _NOPE)
 
 
 # ---- one GPU: the groups' numerics ----
@@ -425,7 +518,7 @@ def _selections(pos: torch.Tensor, g: torch.Generator) -> torch.Tensor:
 
 @pytest.fixture(scope="module")
 def env():
-    """The pool and the target over an 8192-row held workspace."""
+    """The pool and the target over an 8192-row workspace."""
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     from tensorrt_llm._utils import get_sm_version
@@ -516,13 +609,15 @@ def _fp32_error(env, s, layer: int, out: torch.Tensor, rows: torch.Tensor) -> fl
     return float((out[rows].float() - exact).norm() / exact.norm())
 
 
-def _check_step(env, contexts, expected_groups, seed: int) -> tuple[SimpleNamespace, list]:
-    """Run `_RUN` on one step's groups and check each layer's output (the module docstring's
-    three checks); return the step's groups and which workspace groups kept rows."""
+def _check_step(env, contexts, expected_groups, seed: int) -> SimpleNamespace:
+    """Run `_RUN` on one step's groups, the workspace refilled with NaN before every layer, and
+    check each layer's output (the module docstring's three checks); return the step's
+    groups."""
     s = _step(env, contexts, seed)
     target = env.target
     ctx = target._ctx_workspace(s.step, s.tc, env.dev)
-    kinds = ["decode" if g.ws_buf is None else "workspace" for g in ctx.groups]
+    ws = torch.empty(_HELD, _LAT_DIM, dtype=torch.bfloat16, device=env.dev)
+    kinds = ["decode" if g.n_kv is None else "workspace" for g in ctx.groups]
     assert list(zip([g.rows for g in ctx.groups], kinds)) == expected_groups
     new_starts = _cumsum([n for _, n in contexts]).tolist()
     edges = sorted({r for g in ctx.groups for r in (g.rows[0], g.rows[1] - 1)})
@@ -534,13 +629,15 @@ def _check_step(env, contexts, expected_groups, seed: int) -> tuple[SimpleNamesp
         scratch = torch.full(
             (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
         )
+        ws.fill_(float("nan"))
         L = SimpleNamespace(kv_source=src, indexer=None if layer == 39 else object())
-        out = target._attn_ctx(s.step, L, s.q, scratch, s.req_idx, s.topk, ctx)
+        lat = None if ctx.own_out else scratch
+        out = target._attn_ctx(s.step, L, s.q, lat, s.req_idx, s.topk, ctx, ws)
         assert out is scratch or ctx.own_out
         assert bool(torch.isfinite(out).all()), f"layer {layer}: a row read an unwritten byte"
         for g in ctx.groups:
             q0, q1 = g.rows
-            if g.ws_buf is None:
+            if g.n_kv is None:
                 ref = _decode(env, s, src, q0, q1, g.sub_batches)
                 assert torch.equal(out[q0:q1].view(torch.int16), ref.view(torch.int16)), (
                     layer,
@@ -566,22 +663,19 @@ def _check_step(env, contexts, expected_groups, seed: int) -> tuple[SimpleNamesp
         )
         assert rel <= _AGREE, (layer, rel)
         assert err < _FP32_BAND, (layer, err)
-    kept = [g.kept is not None for g in ctx.groups if g.ws_buf is not None]
-    return ctx, kept
+    return ctx
 
 
-def test_one_group_fitting_twice_keeps_layer_35(env):
-    """1000 + 500 and 500 + 500 KV rows (2500, twice within 8192): one workspace group, layer
-    35's rows kept beside the step's and read there by 39 after 36 rewrote the step's rows."""
-    ctx, kept = _check_step(env, [(1000, 500), (500, 500)], [((0, 1000), "workspace")], seed=1)
-    assert kept == [True] and _SHARED in ctx.groups[0].ws
+def test_one_small_group(env):
+    """1000 + 500 and 500 + 500 KV rows (2500 within 8192): one workspace group, layer 35
+    gathered again for 39 after 36 rewrote the workspace's rows."""
+    _check_step(env, [(1000, 500), (500, 500)], [((0, 1000), "workspace")], seed=1)
 
 
-def test_one_group_fitting_once(env):
-    """3000 + 1000 and 1000 + 500 KV rows (5500, once within 8192): one workspace group, layer
-    35 gathered again for 39."""
-    ctx, kept = _check_step(env, [(3000, 1000), (1000, 500)], [((0, 1500), "workspace")], seed=2)
-    assert kept == [False] and ctx.groups[0].ws == {}
+def test_one_group_near_the_workspace_rows(env):
+    """3000 + 1000 and 1000 + 500 KV rows (5500 within 8192): one workspace group, layer 35
+    gathered again for 39."""
+    _check_step(env, [(3000, 1000), (1000, 500)], [((0, 1500), "workspace")], seed=2)
 
 
 def test_three_requests_in_two_workspace_groups(env):
@@ -597,7 +691,7 @@ def test_three_requests_in_two_workspace_groups(env):
 
 def test_alternating_workspace_and_decode_groups(env):
     """KV rows 2000, 9700, 2300, 12600 and 900: the second and fourth requests are each past
-    the held rows, decode groups between three workspace groups."""
+    the workspace's rows, decode groups between three workspace groups."""
     _check_step(
         env,
         [(1500, 500), (9000, 700), (2000, 300), (12000, 600), (500, 400)],
@@ -615,7 +709,7 @@ def test_alternating_workspace_and_decode_groups(env):
 def test_decode_group_of_two_sub_batches(env):
     """A 9000-row request over 18000 KV rows behind a 1000-row one: its decode group's rows
     1000..10000 in sub-batches of 8192 and 808 from its first row."""
-    ctx, _ = _check_step(
+    ctx = _check_step(
         env,
         [(2000, 1000), (9000, 9000)],
         [((0, 1000), "workspace"), ((1000, 10000), "decode")],
@@ -624,11 +718,13 @@ def test_decode_group_of_two_sub_batches(env):
     assert ctx.groups[1].sub_batches == [(0, _SUB), (_SUB, 9000)]
 
 
-def test_kernel_output_feeds_the_v_projection_bitwise(env):
+def test_kernel_output_feeds_the_v_projection_bitwise(env, monkeypatch):
     """One workspace group (1000 + 500 and 500 + 500 KV rows), with its context rows alone and
     with a generation row behind them: the prefill kernel's own output the first returns and
-    the latent scratch the second writes are bitwise the same on every layer run, and so are
-    the V up-projections `bmm_out` makes of them with the target's transposed weight view."""
+    the latent output the second writes in calls of 384 rows (`_CTX_PREFILL_OUT_ROWS`) are
+    bitwise the same on every layer run, and so are the V up-projections `bmm_out` makes of
+    them with the target's transposed weight view."""
+    monkeypatch.setattr(M, "_CTX_PREFILL_OUT_ROWS", 384)
     s = _step(env, [(1000, 500), (500, 500)], seed=6)
     g = torch.Generator(device=env.dev).manual_seed(_SEED + 6)
     v_b_t = torch.transpose(
@@ -645,12 +741,14 @@ def test_kernel_output_feeds_the_v_projection_bitwise(env):
         scratch = torch.full(
             (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
         )
+        ws = torch.empty(_HELD, _LAT_DIM, dtype=torch.bfloat16, device=env.dev)
         per_layer = []
         for layer in _RUN:
             L = SimpleNamespace(
                 kv_source=_SOURCES[layer], indexer=None if layer == 39 else object()
             )
-            lat = target._attn_ctx(step, L, s.q, scratch, s.req_idx, s.topk, ctx)
+            lat_in = scratch if gen_rows else None
+            lat = target._attn_ctx(step, L, s.q, lat_in, s.req_idx, s.topk, ctx, ws)
             assert (lat is scratch) is (gen_rows == 1)
             attn = torch.empty(s.tc, _HEADS * 128, dtype=torch.bfloat16, device=env.dev)
             bmm_out(
