@@ -15,6 +15,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
+    cute_dsl_fp8_mqa_logits as sm107_scorer,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_gvr_topk_prefill import (  # noqa: E501
     cute_dsl_gvr_topk_prefill as op,
 )
@@ -46,6 +49,20 @@ POISON = 1.0e30
 HEADS, HEAD_DIM = 32, 128
 #: Rows argsorted per call while drawing the permutations.
 _SORT_ROWS = 1024
+#: The sm_107 scorer's handle, built on first use.
+_SM107_SCORER = []
+
+
+def _score(q, kv, w, row_starts, row_ends) -> torch.Tensor:
+    """The scorer the targets of this GPU run: cute_dsl_fp8_mqa_logits on sm_107 (whose rows are
+    padded to 16 bytes), fp8_mqa_logits elsewhere."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        return fp8_mqa_logits(q, kv, w, row_starts, row_ends)
+    if not _SM107_SCORER:
+        _SM107_SCORER.append(sm107_scorer.build(torch.cuda.current_device()))
+    return sm107_scorer.cute_dsl_fp8_mqa_logits(
+        q, kv, w, row_starts, row_ends, compiled=_SM107_SCORER[0]
+    )
 
 
 def _windows(requests):
@@ -87,9 +104,9 @@ def _build(requests, values: str, top_k: int, seed: int):
     """`(input_values, row_starts, row_ends, output_indices)` for one K block.
 
     `input_values` is a `[rows, W]` view of rows padded as fp8_mqa_logits pads them,
-    align(W + 256, 256) wide. "logits" scores the block with fp8_mqa_logits itself over
-    random e4m3 queries and keys (-inf outside the windows, as the target hands it over);
-    every other pattern writes `POISON` outside the windows. `output_indices` starts at -7
+    align(W + 256, 256) wide. "logits" scores the block with the GPU's target scorer itself
+    (`_score`) over random e4m3 queries and keys (-inf outside the windows, as the target hands
+    it over); every other pattern writes `POISON` outside the windows. `output_indices` starts at -7
     so an unwritten slot shows.
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -100,7 +117,7 @@ def _build(requests, values: str, top_k: int, seed: int):
         k = torch.randn(width, HEAD_DIM, generator=g, device="cuda").to(torch.float8_e4m3fn)
         k_scale = torch.rand(width, generator=g, device="cuda") + 0.5
         w = torch.randn(rows, HEADS, generator=g, device="cuda") * (HEAD_DIM * HEADS) ** -0.5
-        input_values = fp8_mqa_logits(q, (k, k_scale), w, row_starts, row_ends)
+        input_values = _score(q, (k, k_scale), w, row_starts, row_ends)
     else:
         cols = torch.arange(width, device="cuda")
         outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
@@ -162,7 +179,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
         seed = zlib.crc32(f"{cell.why}/{b}".encode()) % 2**31
         values, starts, ends, out = _build(requests, cell.spec["values"], top_k, seed)
         ws = gvr_workspace(values.device)
-        got = op(values, starts, ends, out, top_k, ws)
+        plan = dict(tier0_rows=cell.spec["tier0_rows"]) if "tier0_rows" in cell.spec else {}
+        got = op(values, starts, ends, out, top_k, ws, **plan)
         assert got is out
         ref = op.reference(values, starts, ends, out, top_k)
         want = _deterministic(values, starts, ends, top_k)
@@ -173,8 +191,13 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
         assert torch.equal(got.long().sort(dim=1).values[~short], want[~short]), (
             "a long row is not the deterministic set"
         )
-        again = op(values, starts, ends, torch.full_like(out, -7), top_k, ws)
+        again = op(values, starts, ends, torch.full_like(out, -7), top_k, ws, **plan)
         assert torch.equal(again, got), "a second call gives another order"
+        if plan:
+            default = op(values, starts, ends, torch.full_like(out, -7), top_k, ws)
+            assert torch.equal(default.sort(dim=1).values, got.sort(dim=1).values), (
+                "the raised tier-0 bound selects another set than the default plan"
+            )
         other = radix(values, starts, ends, torch.full_like(out, -7), top_k)
         _compare_to_radix(got, other, values, starts, ends)
         print(
@@ -242,7 +265,8 @@ _ENGINES = {"dep4-1m": (1048576, 2**26), "tep4-1m": (1048576, 2**28), "32k": (32
 def test_warmup_leaves_nothing_to_compile(engine, monkeypatch) -> None:
     """After `gvr_warmup`, the target's tile shapes compile nothing: every tier, each tier-0
     width bucket and both sides of each tier's stride bound (65536 / 131072 / 262144 columns),
-    full tiles of floor(budget / W) rows and short remainder tiles, up to max_seq_len keys.
+    full tiles of floor(budget / W) rows and short remainder tiles, up to max_seq_len keys, on
+    the default plans and with sm_107's tier-0 bound (`tier0_rows` 212, its 212-row tiles).
     Each engine starts from empty engine caches, as a server process does: what another
     engine's warmup or an earlier test compiled must not hide a launch this one misses."""
     monkeypatch.setattr(gvr_host, "_PREFILL_CACHE", {})
@@ -258,7 +282,7 @@ def test_warmup_leaves_nothing_to_compile(engine, monkeypatch) -> None:
     shapes = []
     for width in (w for w in widths if w <= max_cols):
         full = max(1, budget // width)
-        for rows in {full, 1, 75, 148, 149, 296, 297}:
+        for rows in {full, 1, 75, 148, 149, 212, 213, 296, 297}:
             if rows <= full:
                 shapes.append((rows, width))
     for rows, width in shapes:
@@ -267,7 +291,8 @@ def test_warmup_leaves_nothing_to_compile(engine, monkeypatch) -> None:
         starts = torch.zeros(rows, dtype=torch.int32, device=dev)
         ends = (width - rows + 1 + torch.arange(rows, device=dev)).clamp(min=1).to(torch.int32)
         out = torch.empty(rows, 2048, dtype=torch.int32, device=dev)
-        op(scores[:, :width], starts, ends, out, 2048, ws)
+        for plan in ({}, {"tier0_rows": 212}):
+            op(scores[:, :width], starts, ends, out, 2048, ws, **plan)
         del scores
     torch.cuda.synchronize()
     after = _engine_caches()
