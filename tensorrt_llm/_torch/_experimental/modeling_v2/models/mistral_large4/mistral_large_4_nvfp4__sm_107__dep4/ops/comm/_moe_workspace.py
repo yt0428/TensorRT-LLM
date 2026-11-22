@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The slots the attention-DP expert path's one-shot gather and reduce-scatter are handed.
+"""The slots the attention-DP expert path's one-shot gather and reduce-scatter are handed, and
+the alltoall its larger steps take.
 
 Not an entry: it holds what `lamport_moe_dispatch` and `lamport_moe_combine` are handed, built
-once at load by `build_moe_comm_workspace`. The kernels (`_moe_lamport_kernel`) fix the slot
-count and the not-ready sentinel; this module allocates to them.
+once at load by `build_moe_comm_workspace`, and builds the alltoall `a2a_moe_dispatch` and
+`a2a_moe_combine` are handed (`build_moe_alltoall`). The kernels (`_moe_lamport_kernel`) fix the
+slot count and the not-ready sentinel; this module allocates to them.
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm._lamport import ensure_process_group
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm.mapping import Mapping
 
 from . import _moe_lamport_kernel as _k
 
@@ -98,4 +102,32 @@ def build_moe_comm_workspace(hidden: int, max_rows: int, rank: int, world: int) 
         handle=handle,
         peers=peers,
         state=state,
+    )
+
+
+def build_moe_alltoall(
+    mapping: Mapping, num_experts: int, top_k: int, max_rows: int, hidden: int
+) -> NVLinkOneSided:
+    """The expert path's alltoall over `mapping`'s expert-parallel ranks, for steps of up to
+    `max_rows` rows per rank: `NVLinkOneSided`, whose dispatch sends each row only to the ranks
+    holding one of its experts (`num_experts` split evenly, `top_k` per row) and whose combine
+    sums each row's returned bf16 `hidden`-wide partials on its own rank. The combine reads its
+    payload in place in the workspace (`payload_in_workspace`): the expert runner writes there.
+
+    Collective over the expert-parallel ranks, outside any graph capture. The workspace is MNNVL
+    memory exchanged over the MPI session, so no torch.distributed group stays up; at 4 ranks
+    and 16384 rows it is 2.4 GB per rank (the layout that leaves room for counted writes, which
+    this device supports; they run only up to 128 rows per rank, below the one-shot workspace).
+    """
+    assert mapping.moe_ep_size == mapping.tp_size and mapping.moe_tp_size == 1, (
+        f"the alltoall spans the attention-DP ranks as experts: {mapping}"
+    )
+    return NVLinkOneSided(
+        mapping=mapping,
+        num_slots=num_experts,
+        top_k=top_k,
+        max_num_tokens_per_rank=max_rows,
+        hidden_size=hidden,
+        dtype=torch.bfloat16,
+        payload_in_workspace=True,
     )

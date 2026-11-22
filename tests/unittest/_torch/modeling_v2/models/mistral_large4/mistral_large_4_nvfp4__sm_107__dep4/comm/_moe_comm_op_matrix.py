@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU certification matrix for the attention-DP expert path's collectives on sm_107:
-`lamport_moe_dispatch`, `lamport_moe_combine` and `allgather_list`. The ragged cells of the
-shared `reducescatter` are driven by its own matrix (`_reducescatter_op_matrix.py`).
+`lamport_moe_dispatch`, `lamport_moe_combine`, `allgather_list`, `a2a_moe_dispatch` and
+`a2a_moe_combine`. The ragged cells of the shared `reducescatter` are driven by its own matrix
+(`_reducescatter_op_matrix.py`).
 
 Every rank runs under MPI, as a dep4 or dep8 engine's ranks do: the NCCL entries on the
 MPI-session communicator, the one-shot entries on a `MoeCommWorkspace` whose process group
-comes up from rank 0's address broadcast over the MPI communicator (`MPI.COMM_WORLD` here).
+comes up from rank 0's address broadcast over the MPI communicator (`MPI.COMM_WORLD` here), the
+alltoall entries at world 4 on `build_moe_alltoall`'s alltoall of 16384 rows per rank.
 Every rank regenerates every rank's inputs from a shared seed, so each reference is arithmetic
 rather than a second collective.
 
@@ -16,7 +18,11 @@ rather than a second collective.
   one combine per MoE layer at every graph batch, replayed on new rows between eager calls;
 - a long call sequence whose counts change call to call (eager and replayed), so every slot of
   the rotation is reused many times over;
-- `allgather_list` bitwise against the concatenations, uniform and ragged.
+- `allgather_list` bitwise against the concatenations, uniform and ragged;
+- `a2a_moe_dispatch`: every rank's rows routed to this rank arrive bit for bit (the token index
+  rides in each row's first three code bytes, since a block's row order is the alltoall's), and
+  every other row of each block carries ids -1; then `a2a_moe_combine` of partials of small
+  integers, whose every sum is exact, bitwise against the sum over the ranks each row went to.
 
 Two jobs, both this file:
 
@@ -59,6 +65,10 @@ TOPK = 4
 REPLAYS = 2
 #: Calls of the rotation check, each at its own counts.
 SEQUENCE_CALLS = 600
+#: The routed experts, split evenly over the ranks; and the alltoall's rows per rank, the
+#: cells' `max_rows`.
+EXPERTS = 128
+A2A_ROWS = 16384
 
 # Bound in the rank body.
 RANK = 0
@@ -70,6 +80,10 @@ WS: Any = None
 dispatch: Any = None
 combine: Any = None
 gather_list: Any = None
+A2A: Any = None
+a2a_dispatch: Any = None
+a2a_combine: Any = None
+a2a_payload: Any = None
 DRIVEN: Dict[str, int] = {}
 
 
@@ -313,6 +327,93 @@ def check_allgather_list_cells() -> None:
         DRIVEN[cell.why] = 1
 
 
+# ---------------------------------------------------------------------------- alltoall entries
+
+
+def _route(n: int, seed: int, rank: int, routing: str) -> torch.Tensor:
+    """Rank `rank`'s rows' expert ids: 4 distinct of the 128 uniformly ("uniform"), one on every
+    rank ("spread"), 4 distinct on the row's own rank ("local") or on rank 0 ("hotspot")."""
+    g = _gen(seed + 11, rank)
+    per = EXPERTS // WORLD
+    if routing == "uniform":
+        return torch.rand((n, EXPERTS), device="cuda", generator=g).topk(TOPK, dim=1).indices.int()
+    if routing == "spread":
+        owners = torch.rand((n, WORLD), device="cuda", generator=g).argsort(dim=1)[:, :TOPK]
+        offsets = torch.randint(0, per, (n, TOPK), device="cuda", generator=g)
+    else:
+        owners = torch.full((n, TOPK), rank if routing == "local" else 0, device="cuda")
+        offsets = torch.rand((n, per), device="cuda", generator=g).topk(TOPK, dim=1).indices
+    return (owners * per + offsets).int()
+
+
+def _a2a_inputs(n: int, seed: int, rank: int, routing: str):
+    """Rank `rank`'s rows of an alltoall dispatch: random codes whose first three bytes are the
+    row's index, random scales, `_route`'s ids and random bf16 weights."""
+    g = _gen(seed, rank)
+    codes = torch.randint(0, 256, (n, HIDDEN // 2), dtype=torch.uint8, device="cuda", generator=g)
+    row = torch.arange(n, device="cuda")
+    for b in range(3):
+        codes[:, b] = ((row >> (8 * b)) & 255).to(torch.uint8)
+    scales = torch.randint(
+        0, 0x7F, (n, HIDDEN // 16), dtype=torch.uint8, device="cuda", generator=g
+    )
+    weights = torch.rand((n, TOPK), device="cuda", generator=g).to(torch.bfloat16)
+    return codes, scales, _route(n, seed, rank, routing), weights
+
+
+def _row_of(codes: torch.Tensor) -> torch.Tensor:
+    return codes[:, 0].long() | (codes[:, 1].long() << 8) | (codes[:, 2].long() << 16)
+
+
+def _int_partial(rows: torch.Tensor, source: int, p: int) -> torch.Tensor:
+    """What rank `p`'s window gives row `rows` of rank `source`: small integers, exact in any
+    sum of four."""
+    cols = torch.arange(HIDDEN, device="cuda")
+    v = (rows[:, None] * 7 + cols[None, :] * 3 + source * 11 + p * 5) % 17 - 8
+    return v.to(torch.bfloat16)
+
+
+def check_a2a_cells() -> None:
+    d_cells = {(c.spec["counts"], c.spec["routing"]): c for c in _cells(a2a_dispatch)}
+    c_cells = {(c.spec["counts"], c.spec["routing"]): c for c in _cells(a2a_combine)}
+    assert d_cells.keys() == c_cells.keys(), (sorted(d_cells), sorted(c_cells))
+    per = EXPERTS // WORLD
+    for (counts, routing), cell in d_cells.items():
+        spec = cell.spec
+        assert (spec["max_rows"], spec["num_experts"]) == (A2A_ROWS, EXPERTS), spec
+        seed, rmax = cell.seed_base(), max(counts)
+        mine = _a2a_inputs(counts[RANK], seed, RANK, routing)
+        before = [t.clone() for t in mine]
+        got = a2a_dispatch(*mine, counts, A2A)
+        for t, b in zip(mine, before):
+            _bitwise(t, b, f"a2a_moe_dispatch {counts} {routing} input")
+        every = [_a2a_inputs(counts[r], seed, r, routing) for r in range(WORLD)]
+        want = a2a_dispatch.reference(every, RANK, EXPERTS)
+        blocks = [t.view(WORLD, rmax, -1) for t in got]
+        payload = a2a_payload(counts, HIDDEN, A2A)
+        rows_of_block = payload.view(WORLD, rmax, HIDDEN)
+        rows_of_block.zero_()
+        for r in range(WORLD):
+            where = f"a2a_moe_dispatch {counts} {routing} from rank {r}"
+            valid = (blocks[2][r] >= 0).any(dim=1)
+            slot = valid.nonzero().squeeze(1)
+            rows = _row_of(blocks[0][r, slot])
+            order = rows.argsort()
+            assert torch.equal(rows[order], _row_of(want[r][0])), f"{where}: other rows arrived"
+            for name, b, w in zip(("codes", "scales", "ids", "weights"), blocks, want[r]):
+                _bitwise(b[r, slot][order], w, f"{where} {name}")
+            assert bool((blocks[2][r][~valid] == -1).all()), f"{where}: a spare row's ids not -1"
+            rows_of_block[r, slot] = _int_partial(rows, r, RANK)
+        out = a2a_combine(payload, A2A)
+        n = counts[RANK]
+        own = torch.arange(n, device="cuda")
+        partials = [_int_partial(own, RANK, p) for p in range(WORLD)]
+        hits = [((mine[2] >= p * per) & (mine[2] < (p + 1) * per)).any(dim=1) for p in range(WORLD)]
+        _bitwise(out, a2a_combine.reference(partials, hits), f"a2a_moe_combine {counts} {routing}")
+        DRIVEN[cell.why] = 1
+        DRIVEN[c_cells[(counts, routing)].why] = 1
+
+
 # ---------------------------------------------------------------------------- the job
 
 MPI_CHECKS: List[Callable[[], None]] = [
@@ -320,6 +421,7 @@ MPI_CHECKS: List[Callable[[], None]] = [
     check_one_shot_eager_cells,
     check_one_shot_graph_cells,
     check_slot_rotation_sequence,
+    check_a2a_cells,
 ]
 
 
@@ -337,6 +439,7 @@ def _validating(entry_obj) -> None:
 
 def _run_one_mpi_rank() -> int:
     global RANK, WORLD, NODES, GROUP, MPI_COMM, WS, dispatch, combine, gather_list
+    global A2A, a2a_dispatch, a2a_combine, a2a_payload
     faulthandler.dump_traceback_later(MPI_DEADLINE_S, exit=True)
     RANK = int(os.environ["OMPI_COMM_WORLD_RANK"])
     WORLD = int(os.environ["OMPI_COMM_WORLD_SIZE"])
@@ -344,6 +447,14 @@ def _run_one_mpi_rank() -> int:
 
     from mpi4py import MPI
 
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.a2a_moe_combine import (  # noqa: E501
+        a2a_moe_combine,
+        a2a_moe_combine_payload,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.a2a_moe_dispatch import (  # noqa: E501
+        a2a_moe_dispatch,
+        build_moe_alltoall,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep4.ops.comm.allgather_list import (  # noqa: E501
         allgather_list,
     )
@@ -355,14 +466,24 @@ def _run_one_mpi_rank() -> int:
         lamport_moe_dispatch,
     )
     from tensorrt_llm._utils import mpi_comm
+    from tensorrt_llm.mapping import Mapping
 
     MPI_COMM = mpi_comm()
     NODES = len(set(MPI_COMM.allgather(socket.gethostname())))
     GROUP = list(range(WORLD))
     dispatch, combine, gather_list = lamport_moe_dispatch, lamport_moe_combine, allgather_list
-    for e in (dispatch, combine, gather_list):
+    a2a_dispatch, a2a_combine, a2a_payload = (
+        a2a_moe_dispatch,
+        a2a_moe_combine,
+        a2a_moe_combine_payload,
+    )
+    for e in (dispatch, combine, gather_list, a2a_dispatch, a2a_combine):
         _validating(e)
     WS = build_moe_comm_workspace(HIDDEN, 512, RANK, WORLD)
+    if WORLD == 4:
+        mapping = Mapping(world_size=WORLD, rank=RANK, tp_size=WORLD, moe_ep_size=WORLD,
+                          enable_attention_dp=True)  # fmt: skip
+        A2A = build_moe_alltoall(mapping, EXPERTS, TOPK, A2A_ROWS, HIDDEN)
 
     for check in MPI_CHECKS:
         started = time.monotonic()
@@ -380,7 +501,11 @@ def _run_one_mpi_rank() -> int:
         MPI_COMM.Barrier()
         if RANK == 0:
             print(f"[mpi] {check.__name__}: {time.monotonic() - started:.1f}s", flush=True)
-    every = [c.why for e in (dispatch, combine, gather_list) for c in _cells(e)]
+    every = [
+        c.why
+        for e in (dispatch, combine, gather_list, a2a_dispatch, a2a_combine)
+        for c in _cells(e)
+    ]
     missing = [w for w in every if w not in DRIVEN]
     assert not missing, f"cells not driven: {missing}"
     print(f"[mpi rank {RANK}] {len(DRIVEN)} cells passed at world {WORLD} on {NODES} node(s)")
