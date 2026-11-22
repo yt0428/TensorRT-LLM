@@ -293,7 +293,6 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
     assert len(offsets) == 1 and offsets[0][1] == [0] * 5 + [1] * 2
     calls = [c for c in calls if c[0] != "offset"]
     assert len(calls) == 12
-    first = None
     for i, layer in enumerate((_SHARED, 39)):
         gather0, prefill0, slots, decode, gather2, prefill2 = calls[6 * i : 6 * i + 6]
         assert gather0[:3] == ("gather", pool_row, [0] * 10 + [1] * 5)
@@ -301,11 +300,8 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
         assert prefill0[0] == "prefill" and prefill0[2] is gather0[3]
         assert _rows_of(prefill0[1], q) == (0, 7) and _rows_of(prefill0[4], out) == (0, 7)
         assert prefill0[3].tolist() == [[0, 1, -1, 2]] * 5 + [[10, 11, -1, 12]] * 2
-        if first is None:
-            first = prefill0[3]
-            assert first is offsets[0][2]
-        else:
-            assert prefill0[3] is first, f"layer {layer} read another buffer"
+        # The offset's buffer, the one 35 wrote, is what each layer reads.
+        assert _rows_of(prefill0[3], offsets[0][2]) == (0, 7), f"layer {layer} read another buffer"
         assert slots == ("slots", pool_row, [2] * 10)
         assert decode[0] == "decode" and decode[2] is ctx.sched[10]
         assert _rows_of(decode[1], q) == (7, 17) and _rows_of(decode[3], out) == (7, 17)
