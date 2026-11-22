@@ -94,6 +94,12 @@ class AllgatherList(OpWrapper):
     and 76.0 us there: below 64 rows per rank the four collectives' fixed cost outweighs the
     smaller payload. The world-8 cells were driven on two VR200 nodes of one NVL72 domain, bit
     for bit on all eight ranks.
+
+    `allgather_list_pg` with `sizes` returns before its rows land: c10d lowers a ragged
+    allgather to broadcasts inside a coalescing group of its own, which ends the op's group
+    around the list, so the op's wait covers nothing and the stream reads the outputs early.
+    Measured at dep4 on one VR200 node: every ragged count set gave other rows than the
+    concatenation, on most ranks; equal counts were exact. `is_valid` refuses that form.
     """
 
     def __call__(
@@ -132,6 +138,10 @@ class AllgatherList(OpWrapper):
                 "a 1-D tensor in the ragged form broadcasts sizes[i] elements rather than rows"
             )
         assert sizes is None or len(sizes) == len(group), (len(sizes), len(group))
+        assert process_group is None or sizes is None, (
+            "ragged sizes on a c10d group: allgather_list_pg returns before the broadcasts land, "
+            "and the stream reads rows that are not there yet"
+        )
         if process_group is None and sizes is not None and mpi_rank() in group:
             mine = sorted(set(group)).index(mpi_rank())
             assert sizes[mine] == next(iter(rows)), (

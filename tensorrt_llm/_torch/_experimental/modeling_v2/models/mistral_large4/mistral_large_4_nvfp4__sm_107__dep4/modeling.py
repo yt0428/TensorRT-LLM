@@ -34,10 +34,13 @@ gathered rows in calls of at most `expert_call_tokens` rows, and reduce-scatters
 sums back to each rank's own rows, adding the shared expert. While no rank holds more than
 `_ONE_SHOT_ROWS` rows both collectives are the one-shot Lamport kernels over symmetric memory
 (`lamport_moe_dispatch`, `lamport_moe_combine`, which on a decode step also adds the residual
-and applies the next layer's norm); past it, NCCL with every rank's own row count. Every rank
+and applies the next layer's norm). Past it, at four ranks the alltoall
+(`a2a_moe_dispatch`, `a2a_moe_combine`) sends each rank's rows only to the ranks holding one of
+their experts, the window runs over the rows it received, and each row's partials come back to
+its own rank, summed in fp32; at eight ranks, NCCL with every rank's own row count. Every rank
 issues the same collective sequence whatever its batch -- one gather and one reduce-scatter
-per MoE layer, chosen from `all_rank_num_tokens`, which every rank shares -- in the prefill and
-the decode target alike.
+(or one dispatch and one combine) per MoE layer, chosen from `all_rank_num_tokens`, which every
+rank shares -- in the prefill and the decode target alike.
 
 The absorbed form throughout: `fused_q = [q_nope @ W_UK | rope(q_pe)]` (576 wide) against the
 pooled `[c_kv | k_pe]` latent rows, then `@ W_UV`. Context rows attend over the selection (the
@@ -220,6 +223,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.a2a_moe_combine import a2a_moe_combine, a2a_moe_combine_payload
+from .ops.comm.a2a_moe_dispatch import a2a_moe_dispatch, build_moe_alltoall
 from .ops.comm.allgather_list import allgather_list
 from .ops.comm.lamport_moe_combine import lamport_moe_combine
 from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
@@ -377,8 +382,16 @@ _EXPERT_CALL_TOKENS_CHUNKED = {4: 32768, 8: 32768}
 # the one-shot workspace (`lamport_moe_dispatch`, `lamport_moe_combine`): every decode graph up
 # to 128 DSpark rows per rank, and the small eager steps beside them. Its slots are 3 x world x
 # 512 x 6144 bf16 of symmetric memory, 72 MiB per rank at four ranks and 144 MiB at eight. A step
-# whose largest rank holds more rows gathers and reduce-scatters through NCCL.
+# whose largest rank holds more rows goes through the alltoall at `_A2A_WORLD` ranks, through
+# NCCL at eight.
 _ONE_SHOT_ROWS = 512
+# The attention-DP world whose steps past the one-shot workspace move the expert path's rows
+# through the alltoall (`build_moe_alltoall`), on an engine whose max_num_tokens passes the
+# workspace. At four ranks on one VR200 node, with uniformly drawn experts, its dispatch and
+# combine took 28 to 54% of the time of the NCCL gather and reduce-scatter on the engine's
+# communicator, from 513 to 16384 rows per rank, equal or ragged (`a2a_moe_dispatch`). Its
+# workspace is 2.4 GB per rank at 16384 rows; eight ranks over two nodes keep NCCL.
+_A2A_WORLD = 4
 # The context workspace's ceiling (`_ctx_workspace_rows`), which bounds the context paths a
 # step chooses once on this rank's host ints. The context requests, in order, are grouped while
 # their KV (cached and new rows) together fits the workspace, and each group's KV is
@@ -512,30 +525,54 @@ def _one_shot(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]) -> b
     return max(counts) <= core.moe_comm.max_rows
 
 
+def _alltoall(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]) -> bool:
+    """Whether this step's expert path is the alltoall: the engine built one and some rank holds
+    more rows than the one-shot workspace. A function of `counts` alone, the same on every
+    rank."""
+    return core.moe_a2a is not None and not _one_shot(core, counts)
+
+
 def _dispatch(core: "MistralLarge4Dep4ModelingV2", inputs: tuple, counts: tuple[int, ...]):
-    """Every rank's routed-expert inputs, unpadded in rank order: the one-shot gather, or one
-    NCCL group over the four tensors (ragged when the counts differ)."""
+    """The routed-expert inputs this rank's window runs over: every rank's rows unpadded in rank
+    order through the one-shot gather or one NCCL group over the four tensors (ragged when the
+    counts differ), or through the alltoall the rows every rank sent here, in its receive
+    layout (`a2a_moe_dispatch`)."""
     if _one_shot(core, counts):
         return lamport_moe_dispatch(*inputs, counts, core.moe_comm)
     codes, scales, ids, weights = inputs
+    scales = scales.view(codes.shape[0], -1)
+    if _alltoall(core, counts):
+        codes, scales, ids, weights = a2a_moe_dispatch(
+            codes, scales, ids, weights, counts, core.moe_a2a
+        )
+        return codes, scales.view(-1), ids, weights
     sizes = None if len(set(counts)) == 1 else list(counts)
     codes, scales, ids, weights = allgather_list(
-        [codes, scales.view(codes.shape[0], -1), ids, weights], sizes, core.dp_group, core.dp_pg
+        [codes, scales, ids, weights], sizes, core.dp_group, core.dp_pg
     )
     return codes, scales.view(-1), ids, weights
 
 
-def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.Tensor:
-    """This rank's expert window over every gathered row, in calls of at most
-    `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial. A row
-    whose experts all lie outside the window comes back +0.0."""
+def _partial_out(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]):
+    """Where the expert runner writes this step's partial: the alltoall's combine payload, read
+    there in place, or None for a fresh tensor. Called after the step's dispatch."""
+    if _alltoall(core, counts):
+        return a2a_moe_combine_payload(counts, core.hidden, core.moe_a2a)
+    return None
+
+
+def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) -> torch.Tensor:
+    """This rank's expert window over every dispatched row, in calls of at most
+    `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial: `out`
+    when given (`_partial_out`), else a fresh one. A row whose experts all lie outside the
+    window, or whose ids are all -1, comes back +0.0."""
     codes, scales, ids, weights = gathered
     total = codes.shape[0]
     sf_row = scales.numel() // total
     call = core.expert_call_tokens
-    routed_all = (
-        None if total <= call else codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
-    )
+    routed_all = out
+    if out is None and total > call:
+        routed_all = codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
     for lo in range(0, total, call):
         hi = min(lo + call, total)
         part = fp4_block_scale_moe_runner(
@@ -545,7 +582,10 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.T
             core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
             topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
             tune_max_num_tokens=core.expert_tune_tokens,
+            output=None if out is None else out[lo:hi],
         )[0]  # fmt: skip
+        if out is not None:
+            continue
         if routed_all is None:
             routed_all = part
         else:
@@ -553,9 +593,12 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.T
     return routed_all
 
 
-def _nccl_combine(core: "MistralLarge4Dep4ModelingV2", routed_all, counts: tuple[int, ...]):
-    """This rank's rows of the windows' summed partials through NCCL, ragged when the counts
-    differ."""
+def _combine(core: "MistralLarge4Dep4ModelingV2", routed_all, counts: tuple[int, ...]):
+    """This rank's rows of the windows' summed partials past the one-shot workspace: the
+    alltoall's combine of the payload the runner wrote, or NCCL's reduce-scatter, ragged when
+    the counts differ."""
+    if _alltoall(core, counts):
+        return a2a_moe_combine(routed_all, core.moe_a2a)
     sizes = None if len(set(counts)) == 1 else list(counts)
     return reducescatter(routed_all, sizes, core.dp_group, core.dp_pg)
 
@@ -873,14 +916,16 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._ix_logits = None
         self._side_stream: torch.cuda.Stream | None = None
         self.dp_pg = None
-        # The expert path's one-shot slots (`build_moe_comm_workspace`), built at load.
+        # The expert path's one-shot slots (`build_moe_comm_workspace`) and alltoall
+        # (`build_moe_alltoall`, None where the engine has none), built at load.
         self.moe_comm = None
+        self.moe_a2a = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
         """Derive what the weights fix, build the kernels, the side stream (the shared expert's,
         and the decode attention's query half), the communicator handle and the expert path's
-        one-shot workspace, then the targets.
+        one-shot workspace and alltoall, then the targets.
 
         Named for the shell hook that drives it. Everything compiles here or on the first
         (eager) step: a first compile inside a CUDA-graph capture breaks the graph. The side
@@ -893,10 +938,17 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         # MPI session's, or the tensor-parallel process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.dp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-        # Collective: every rank builds it with the same arguments, outside any capture.
+        # Collective: every rank builds them with the same arguments, outside any capture. A
+        # four-rank engine whose steps can pass the one-shot workspace also gets the alltoall,
+        # sized to its max_num_tokens.
         self.moe_comm = build_moe_comm_workspace(
             self.hidden, _ONE_SHOT_ROWS, self.dp_rank, len(self.dp_group)
         )
+        tokens = self.model_config.max_num_tokens
+        if tokens > _ONE_SHOT_ROWS and len(self.dp_group) == _A2A_WORLD:
+            self.moe_a2a = build_moe_alltoall(
+                mapping, self.num_experts, self.topk, tokens, self.hidden
+            )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -1482,7 +1534,7 @@ class PrefillTarget:
         window (32 experts at 4 ranks, 16 at 8) runs over them in calls of at most
         `expert_call_tokens`, and the reduce-scatter sums the windows' partials back to this
         rank's rows and adds the shared expert's: one-shot while no rank holds more than the
-        workspace (`_one_shot`), NCCL past it."""
+        workspace (`_one_shot`), the alltoall or NCCL past it (`_alltoall`)."""
         core = self.core
         m = L.moe
         side = core._side_stream
@@ -1490,15 +1542,14 @@ class PrefillTarget:
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        routed_all = _routed_experts(
-            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        )
+        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
         if _one_shot(core, counts):
             main.wait_stream(side)
             return lamport_moe_combine(
                 routed_all, shared, None, None, core.eps, counts, core.moe_comm
             )
-        routed = _nccl_combine(core, routed_all, counts)
+        routed = _combine(core, routed_all, counts)
         main.wait_stream(side)
         return torch.add(routed, shared)
 
@@ -1902,8 +1953,8 @@ class DecodeTarget:
         `world_size * max_num_tokens` of them, so the expert calls' chunking is this target's
         too. While no rank holds more than the workspace (`_one_shot`, every captured decode
         graph) the reduce-scatter is the one-shot kernel that also adds the shared expert and
-        `residual` (in place) and applies the next layer's norm; past it, NCCL and the adds and
-        norm as separate ops."""
+        `residual` (in place) and applies the next layer's norm; past it, the alltoall or NCCL
+        (`_alltoall`) and the adds and norm as separate ops."""
         core = self.core
         m = L.moe
         side = core._side_stream
@@ -1911,16 +1962,15 @@ class DecodeTarget:
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        routed_all = _routed_experts(
-            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        )
+        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
         if _one_shot(core, counts):
             main.wait_stream(side)
             x = lamport_moe_combine(
                 routed_all, shared, residual, L.next_norm, core.eps, counts, core.moe_comm
             )
             return x, residual
-        routed = _nccl_combine(core, routed_all, counts)
+        routed = _combine(core, routed_all, counts)
         main.wait_stream(side)
         residual = torch.add(residual, torch.add(routed, shared))
         return flashinfer_rmsnorm(residual, L.next_norm, core.eps), residual
