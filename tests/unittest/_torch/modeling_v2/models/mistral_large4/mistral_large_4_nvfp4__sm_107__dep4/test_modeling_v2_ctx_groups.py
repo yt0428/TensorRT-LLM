@@ -9,19 +9,19 @@ requests each past the workspace's rows is a decode group. `PrefillTarget._attn_
 group's rows on its path: the workspace group's KV gathered, dequantized, into the first rows
 of the layer's workspace (`ds_mla_dequant_gather_tiled`) for FlashMLA's bf16 sparse prefill,
 layer 35's again for each sharer; the decode group's rows as one-row sequences of FlashMLA's
-sparse fp8 decode over the pool, in sub-batches of at most `_CTX_DECODE_ROWS`. A step of context
-rows alone that is one workspace group returns the prefill kernel's own output, which the V
-up-projection reads in place of a latent output (`own_out`); any other step's prefill output is
-copied into the latent output in calls of at most `_CTX_PREFILL_OUT_ROWS` rows.
+sparse fp8 decode over the pool, in sub-batches of at most `_CTX_DECODE_ROWS`, into a latent
+output of the group's own; and each group's latent output (the prefill kernel's own output, not
+a copy) projected into its rows of the attention output (`_v_up`) as soon as it is written.
 `PrefillTarget._attention` takes the layer's absorbed query and whole workspace as one
-allocation, the attention output over the query's first bytes.
+allocation, the attention output over the query's first bytes, and projects the generation
+rows' latent output the same way.
 
 Host only, with stand-ins for the kernels: the workspace's rows for an engine's
 max_num_tokens, max_num_requests, max_seq_len and runtime features (room for a request at
 max_seq_len, within 2**19..2**20 rows), the groups, their rows, request and position per
 workspace row, offsets and sub-batches over a 40-row workspace, which kernel each group's rows
-reach, with which slices, which steps return the kernel's own output, and the attention
-block's buffers.
+reach, with which slices, which latent output each group's projection reads and which rows it
+writes, and the attention block's buffers.
 
 On one sm_107 GPU, over a 63-owner fp8_ds_mla pool (every byte 0xFF, a NaN in every field, but
 the owner rows of layers 1, 35 and 36), queries at all 64 heads and selections shaped like the
@@ -39,9 +39,8 @@ workspace group. For layers 1, 35, 36 and 39 (35's sharer), in that order on one
 * sampled rows are within relative L2 1e-2 of an fp32 softmax over the selected keys read
   straight from the pool;
 
-and on a step that is one workspace group, the kernel's own output and the copy of it the step
-makes with a generation row behind it, in calls of 384 rows, are bitwise the same, as are their
-V up-projections.
+and the V up-projection group by group is bitwise the one over the step's whole latent output
+(five groups), as `bmm_out` over any split of 20480 rows is.
 """
 
 from __future__ import annotations
@@ -122,11 +121,15 @@ def _host_step(contexts) -> dict:
     )
 
 
-def _target(held: int) -> M.PrefillTarget:
+def _target(held: int, heads: int = _HEADS, kv_lora: int = _NOPE, v_dim: int = 128):
     """A prefill target over what its context workspace and attention read off the core: a
-    workspace of `held` rows and the 63-owner pool's addressing."""
+    workspace of `held` rows, the 63-owner pool's addressing, and the latent and attention
+    outputs' widths (the host tests' stand-ins take 1 each)."""
     target = M.PrefillTarget.__new__(M.PrefillTarget)
     target.core = SimpleNamespace(
+        heads=heads,
+        kv_lora=kv_lora,
+        v_dim=v_dim,
         lat_dim=_LAT_DIM,
         ctx_workspace_rows=held,
         softmax_scale=_SCALE,
@@ -186,7 +189,6 @@ def test_groups_by_request_kv(contexts, expected):
     starts = _cumsum(kv).tolist()
     new_starts = _cumsum([n for _, n in contexts]).tolist()
     assert [g.rows for g in ctx.groups] == [rows for rows, _, _ in expected]
-    assert ctx.own_out is (len(expected) == 1 and expected[0][1] != "decode")
     sizes = set()
     for g, (rows, kind, shape) in zip(ctx.groups, expected):
         if kind == "decode":
@@ -237,7 +239,9 @@ def test_workspace_rows_fit_a_request_at_max_seq_len(features, tokens, requests,
 
 def _recorded(monkeypatch) -> list:
     """Stand-ins for the context attention's kernels, recording each call's pool row, rows and
-    selections: the gather writes nothing, the slots are the selections, nothing is attended."""
+    selections: the gather writes nothing, the slots are the selections, the prefill returns an
+    output of its own, nothing is attended, and each projection records what it reads and
+    writes."""
     calls = []
 
     def gather(pool, row, kv_req, kv_pos, block_table, out):
@@ -245,7 +249,9 @@ def _recorded(monkeypatch) -> list:
         return out
 
     def prefill(q, ws, idx, scale, out):
-        calls.append(("prefill", q, ws, idx, out))
+        own = torch.empty(q.shape[0], 1, 1)
+        calls.append(("prefill", q, ws, idx, out, own))
+        return own
 
     def slots(req, table, sel, tpb, topk, stride, row):
         calls.append(("slots", row, req.tolist()))
@@ -258,11 +264,15 @@ def _recorded(monkeypatch) -> list:
         calls.append(("offset", req.tolist(), out))
         return out.copy_(torch.where(sel >= 0, sel + ws_off[req.long()][:, None], sel))
 
+    def v_up(self, L, lat, out):
+        calls.append(("v_up", lat, out))
+
     monkeypatch.setattr(M, "ds_mla_dequant_gather_tiled", gather)
     monkeypatch.setattr(M, "convert_req_index_to_workspace", offset)
     monkeypatch.setattr(M, "flash_mla_sparse_prefill", prefill)
     monkeypatch.setattr(M, "convert_req_index_to_global", slots)
     monkeypatch.setattr(M, "flash_mla_sparse_decode", decode)
+    monkeypatch.setattr(M.PrefillTarget, "_v_up", v_up)
     return calls
 
 
@@ -271,13 +281,14 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
     """A step of requests of 15 + 5, 41 and 10 KV rows over a 40-row workspace: a workspace group
     over the first two (rows 0..7), a decode group (7..17) and a workspace group (17..22). Layer
     35, then 39 (its sharer, selecting nothing): each workspace group gathers its own requests
-    into the workspace's first rows and attends its rows over them, the two-request group's
-    selections offset by 10 for its second request once, into a buffer 39 reads again; the
-    decode group's rows become slots and attend in one sub-batch; and 39 gathers layer 35
-    again."""
+    into the workspace's first rows, attends its rows over them, the two-request group's
+    selections offset by 10 for its second request once, into a buffer 39 reads again, and
+    projects the prefill's own output into its rows; the decode group's rows become slots,
+    attend in one sub-batch into a latent output of the group's own, which is projected into
+    its rows; and 39 gathers layer 35 again."""
     calls = _recorded(monkeypatch)
     pool_row = _OWNERS.index(_SHARED)
-    target = _target(40)
+    target = _target(40, 1, 1, 1)
     contexts = [(5, 5), (3, 2), (31, 10), (5, 5)]
     step = _host_step(contexts)
     ctx = target._ctx_workspace(step, 22, torch.device("cpu"))
@@ -292,31 +303,37 @@ def test_attn_ctx_runs_each_group_on_its_rows(monkeypatch):
     offsets = [c for c in calls if c[0] == "offset"]
     assert len(offsets) == 1 and offsets[0][1] == [0] * 5 + [1] * 2
     calls = [c for c in calls if c[0] != "offset"]
-    assert len(calls) == 12
+    assert len(calls) == 18
     for i, layer in enumerate((_SHARED, 39)):
-        gather0, prefill0, slots, decode, gather2, prefill2 = calls[6 * i : 6 * i + 6]
+        gather0, prefill0, v_up0, slots, decode, v_up1, gather2, prefill2, v_up2 = calls[
+            9 * i : 9 * i + 9
+        ]
         assert gather0[:3] == ("gather", pool_row, [0] * 10 + [1] * 5)
         assert _rows_of(gather0[3], buf) == (0, 15)
-        assert prefill0[0] == "prefill" and prefill0[2] is gather0[3]
-        assert _rows_of(prefill0[1], q) == (0, 7) and _rows_of(prefill0[4], out) == (0, 7)
+        assert prefill0[0] == "prefill" and prefill0[2] is gather0[3] and prefill0[4] is None
+        assert _rows_of(prefill0[1], q) == (0, 7)
         assert prefill0[3].tolist() == [[0, 1, -1, 2]] * 5 + [[10, 11, -1, 12]] * 2
         # The offset's buffer, the one 35 wrote, is what each layer reads.
-        assert _rows_of(prefill0[3], offsets[0][2]) == (0, 7), f"layer {layer} read another buffer"
+        assert prefill0[3] is offsets[0][2], f"layer {layer} read another buffer"
+        assert v_up0[1] is prefill0[5] and _rows_of(v_up0[2], out) == (0, 7)
         assert slots == ("slots", pool_row, [2] * 10)
         assert decode[0] == "decode" and decode[2] is ctx.sched[10]
-        assert _rows_of(decode[1], q) == (7, 17) and _rows_of(decode[3], out) == (7, 17)
+        assert _rows_of(decode[1], q) == (7, 17) and _rows_of(decode[3], v_up1[1]) == (0, 10)
+        assert v_up1[1].shape == (10, 1, 1) and _rows_of(v_up1[2], out) == (7, 17)
         assert gather2[:3] == ("gather", pool_row, [3] * 10)
         assert _rows_of(gather2[3], buf) == (0, 10)
         assert _rows_of(prefill2[1], q) == (17, 22) and prefill2[3].tolist() == sel[17:].tolist()
+        assert v_up2[1] is prefill2[5] and _rows_of(v_up2[2], out) == (17, 22)
 
 
 @pytest.mark.cpu_only
 def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
-    """A 20000-row request past the workspace's rows behind a 5-row one that fits: the decode group's
-    rows 5..20005 attend in sub-batches of 8192, 8192 and 3616 from its first row, on those
-    sizes' schedulers, and nothing of its KV is gathered."""
+    """A 20000-row request past the workspace's rows behind a 5-row one that fits: the decode
+    group's rows 5..20005 attend in sub-batches of 8192, 8192 and 3616 from its first row, on
+    those sizes' schedulers, into the group's own latent output, projected into rows 5..20005;
+    nothing of its KV is gathered."""
     calls = _recorded(monkeypatch)
-    target = _target(40)
+    target = _target(40, 1, 1, 1)
     step = _host_step([(5, 5), (100, 20000)])
     ctx = target._ctx_workspace(step, 20005, torch.device("cpu"))
     assert [g.rows for g in ctx.groups] == [(0, 5), (5, 20005)]
@@ -330,75 +347,11 @@ def test_decode_group_sub_batches_from_its_first_row(monkeypatch):
     gathers = [c for c in calls if c[0] == "gather"]
     assert [kv_req for _, _, kv_req, _ in gathers] == [[0] * 10]
     decodes = [c for c in calls if c[0] == "decode"]
+    lat = [c for c in calls if c[0] == "v_up"][1][1]
     assert [_rows_of(c[1], q) for c in decodes] == [(5, 8197), (8197, 16389), (16389, 20005)]
+    assert [_rows_of(c[3], lat) for c in decodes] == [(0, 8192), (8192, 16384), (16384, 20000)]
     assert [c[2] for c in decodes] == [ctx.sched[8192], ctx.sched[8192], ctx.sched[3616]]
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("gen_rows, own", [(0, True), (2, False)], ids=["ctx_alone", "gen_behind"])
-def test_one_group_alone_returns_the_kernel_output(monkeypatch, gen_rows, own):
-    """A step that is one workspace group (16 KV rows over 40): with its context rows alone the
-    prefill takes no latent output and its own output is returned for the V up-projection; with
-    generation rows behind them the prefill writes the latent output's context rows, which are
-    returned."""
-    prefills = []
-    kernel_out = torch.empty(9, 1)
-
-    def prefill(q, ws, idx, scale, out):
-        prefills.append(out)
-        return kernel_out if out is None else out
-
-    monkeypatch.setattr(M, "ds_mla_dequant_gather_tiled", lambda *args: args[-1])
-    monkeypatch.setattr(M, "convert_req_index_to_workspace", lambda req, sel, off, out: out)
-    monkeypatch.setattr(M, "flash_mla_sparse_prefill", prefill)
-    target = _target(40)
-    step = _host_step([(7, 3), (0, 6)])
-    step["num_tokens"] += gen_rows
-    ctx = target._ctx_workspace(step, 9, torch.device("cpu"))
-    assert ctx.own_out is own
-    lat_out = None if own else torch.empty(9, 1)
-    L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
-    req_idx = torch.tensor([0] * 3 + [1] * 6, dtype=torch.int32)
-    sel = torch.zeros(9, 4, dtype=torch.int32)
-    ws = torch.empty(40, _LAT_DIM)
-    got = target._attn_ctx(step, L, torch.empty(9, 1), lat_out, req_idx, sel, ctx, ws)
-    if own:
-        assert prefills == [None] and got is kernel_out
-    else:
-        assert _rows_of(prefills[0], lat_out) == (0, 9) and got is lat_out
-
-
-@pytest.mark.cpu_only
-def test_copied_prefill_runs_in_bounded_calls(monkeypatch):
-    """With generation rows behind a two-request group's 9 context rows, the prefill's output is
-    copied into the latent output in calls of at most `_CTX_PREFILL_OUT_ROWS` rows (4 here):
-    rows 0..4, 4..8 and 8..9, each with its rows' queries and offset selections over the one
-    gather of the group's 16 KV rows."""
-    calls = _recorded(monkeypatch)
-    monkeypatch.setattr(M, "_CTX_PREFILL_OUT_ROWS", 4)
-    target = _target(40)
-    step = _host_step([(7, 3), (0, 6)])
-    step["num_tokens"] += 2
-    ctx = target._ctx_workspace(step, 9, torch.device("cpu"))
-    assert not ctx.own_out
-    ws = torch.empty(40, _LAT_DIM, dtype=torch.bfloat16)
-    req_idx = torch.tensor([0] * 3 + [1] * 6, dtype=torch.int32)
-    sel = torch.tensor([[0, 1, -1, 2]] * 9, dtype=torch.int32)
-    q, out = torch.empty(9, 1), torch.empty(9, 1)
-    L = SimpleNamespace(kv_source=_SOURCES[1], indexer=object())
-    assert target._attn_ctx(step, L, q, out, req_idx, sel, ctx, ws) is out
-    (gather,) = [c for c in calls if c[0] == "gather"]
-    assert _rows_of(gather[3], ws) == (0, 16)
-    (offset,) = [c for c in calls if c[0] == "offset"]
-    prefills = [c for c in calls if c[0] == "prefill"]
-    bounds = [(0, 4), (4, 8), (8, 9)]
-    assert [_rows_of(c[1], q) for c in prefills] == bounds
-    assert [_rows_of(c[4], out) for c in prefills] == bounds
-    assert [_rows_of(c[3], offset[2]) for c in prefills] == bounds
-    assert all(c[2] is gather[3] for c in prefills)
-    assert torch.cat([c[3] for c in prefills]).tolist() == (
-        [[0, 1, -1, 2]] * 3 + [[10, 11, -1, 12]] * 6
-    )
+    assert [_rows_of(c[2], out) for c in calls if c[0] == "v_up"] == [(0, 5), (5, 20005)]
 
 
 @pytest.mark.cpu_only
@@ -406,35 +359,30 @@ def test_copied_prefill_runs_in_bounded_calls(monkeypatch):
 def test_attention_buffers_are_one_allocation(monkeypatch, gen_rows):
     """`_attention` on a step of one workspace group (9 context rows, 16 KV rows over a 40-row
     workspace): the absorbed query at all 64 heads and the whole workspace behind it are one
-    allocation, and the attention output the V up-projection writes is its first bytes. With
-    the context rows alone the context attention takes no latent output and the V
-    up-projection reads the prefill kernel's own; with generation rows behind them both phases
-    write one latent output of the layer's own, outside that allocation."""
+    allocation, and the attention output the context and generation rows are projected into
+    is its first bytes. Generation rows behind them attend into a latent output of their own,
+    outside that allocation, projected into their rows of the attention output."""
     target = _target(40)
-    core = target.core
-    core.heads, core.qk_dim, core.kv_lora, core.v_dim, core.unfused_glue = (
-        _HEADS, 128, _NOPE, 128, False,
-    )  # fmt: skip
+    target.core.qk_dim, target.core.unfused_glue = 128, False
     tc = 9
     rows = tc + gen_rows
     step = _host_step([(7, 3), (0, 6)])
     step["num_tokens"] += gen_rows
     ctx = target._ctx_workspace(step, tc, torch.device("cpu"))
-    seen = {"bmm": []}
-    kernel_out = torch.empty(tc, _HEADS, _NOPE, dtype=torch.bfloat16)
+    seen = {"bmm": [], "v_up": []}
 
-    def attn_ctx(step_, L_, fused_q, lat_out, req_idx, topk_buf, ctx_, ws_rows):
-        seen.update(ctx_q=fused_q, ctx_out=lat_out, ws=ws_rows)
-        return kernel_out if lat_out is None else lat_out
+    def attn_ctx(step_, L_, fused_q, attn_out, req_idx, topk_buf, ctx_, ws_rows):
+        seen.update(ctx_q=fused_q, ctx_attn=attn_out, ws=ws_rows)
 
-    def attn_gen(step_, L_, fused_q, lat_out, slots, sched):
-        seen.update(gen_q=fused_q, gen_out=lat_out)
+    def attn_gen(step_, L_, fused_q, lat, slots, sched):
+        seen.update(gen_q=fused_q, gen_lat=lat)
 
     monkeypatch.setattr(
         target, "_linear_fp8", lambda x, w, w_s: torch.zeros(x.shape[0], _HEADS * 128)
     )
     monkeypatch.setattr(target, "_attn_ctx", attn_ctx)
     monkeypatch.setattr(target, "_attn_gen", attn_gen)
+    monkeypatch.setattr(target, "_v_up", lambda L, lat, out: seen["v_up"].append((lat, out)))
     monkeypatch.setattr(M, "ssmax_scaling_fused_q", lambda *args: None)
     monkeypatch.setattr(M, "convert_req_index_to_global", lambda *args: None)
     monkeypatch.setattr(M, "bmm_out", lambda a, b, out: seen["bmm"].append((a, out)))
@@ -452,17 +400,18 @@ def test_attention_buffers_are_one_allocation(monkeypatch, gen_rows):
     assert q.untyped_storage().data_ptr() == ws.untyped_storage().data_ptr()
     assert ws.data_ptr() - q.data_ptr() == rows * _HEADS * _LAT_DIM * 2
     assert attn.shape == (rows, _HEADS * 128) and attn.data_ptr() == q.data_ptr()
-    (absorb_a, absorb_out), (v_a, v_out) = seen["bmm"]
-    assert absorb_out.data_ptr() == q.data_ptr() and v_out.data_ptr() == attn.data_ptr()
+    assert seen["ctx_attn"].data_ptr() == attn.data_ptr() and seen["ctx_attn"].shape[0] == tc
+    ((absorb_a, absorb_out),) = seen["bmm"]
+    assert absorb_out.data_ptr() == q.data_ptr()
     if gen_rows == 0:
-        assert seen["ctx_out"] is None and "gen_q" not in seen
-        assert v_a.data_ptr() == kernel_out.data_ptr()
+        assert "gen_q" not in seen and seen["v_up"] == []
         return
-    lat = seen["ctx_out"]
+    lat = seen["gen_lat"]
+    assert lat.shape == (gen_rows, _HEADS, _NOPE)
     assert lat.untyped_storage().data_ptr() != q.untyped_storage().data_ptr()
-    assert seen["gen_out"].data_ptr() == lat.data_ptr() + tc * _HEADS * _NOPE * 2
     assert seen["gen_q"].data_ptr() == q.data_ptr() + tc * _HEADS * _LAT_DIM * 2
-    assert v_a.data_ptr() == lat.data_ptr() and v_a.shape == (_HEADS, rows, _NOPE)
+    ((v_lat, v_out),) = seen["v_up"]
+    assert v_lat is lat and _rows_of(v_out, attn) == (tc, rows)
 
 
 # ---- one GPU: the groups' numerics ----
@@ -514,7 +463,7 @@ def _selections(pos: torch.Tensor, g: torch.Generator) -> torch.Tensor:
 
 @pytest.fixture(scope="module")
 def env():
-    """The pool and the target over an 8192-row workspace."""
+    """The 63-owner pool, its owner rows of layers 1, 35 and 36 written."""
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     from tensorrt_llm._utils import get_sm_version
@@ -531,9 +480,7 @@ def env():
         pool[:, row] = _dev_rows(_BLOCKS * _TPB, g, nope=layer == _SHARED).view(
             _BLOCKS, _TPB, _ROW_BYTES
         )
-    return SimpleNamespace(
-        dev=dev, pool=pool, kv=pool.view(-1, _TPB, 1, _ROW_BYTES), rows=rows, target=_target(_HELD)
-    )
+    return SimpleNamespace(dev=dev, pool=pool, kv=pool.view(-1, _TPB, 1, _ROW_BYTES), rows=rows)
 
 
 def _step(env, contexts, seed: int) -> SimpleNamespace:
@@ -610,9 +557,18 @@ def _check_step(env, contexts, expected_groups, seed: int) -> SimpleNamespace:
     check each layer's output (the module docstring's three checks); return the step's
     groups."""
     s = _step(env, contexts, seed)
-    target = env.target
+    target = _target(_HELD)
     ctx = target._ctx_workspace(s.step, s.tc, env.dev)
     ws = torch.empty(_HELD, _LAT_DIM, dtype=torch.bfloat16, device=env.dev)
+    # The projection's stand-in copies each group's latent output into its rows of `out`.
+    rows_of_attn = torch.empty(s.tc, 1, device=env.dev)
+    out = torch.empty(s.tc, _HEADS, _NOPE, dtype=torch.bfloat16, device=env.dev)
+
+    def capture(L, lat, attn_rows):
+        lo, hi = _rows_of(attn_rows, rows_of_attn)
+        out[lo:hi].copy_(lat)
+
+    target._v_up = capture
     kinds = ["decode" if g.n_kv is None else "workspace" for g in ctx.groups]
     assert list(zip([g.rows for g in ctx.groups], kinds)) == expected_groups
     new_starts = _cumsum([n for _, n in contexts]).tolist()
@@ -622,14 +578,10 @@ def _check_step(env, contexts, expected_groups, seed: int) -> SimpleNamespace:
     rows = torch.tensor(sorted(set(sampled) | set(edges)), device=env.dev)
     for layer in _RUN:
         src = _SOURCES[layer]
-        scratch = torch.full(
-            (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
-        )
+        out.fill_(float("nan"))
         ws.fill_(float("nan"))
         L = SimpleNamespace(kv_source=src, indexer=None if layer == 39 else object())
-        lat = None if ctx.own_out else scratch
-        out = target._attn_ctx(s.step, L, s.q, lat, s.req_idx, s.topk, ctx, ws)
-        assert out is scratch or ctx.own_out
+        target._attn_ctx(s.step, L, s.q, rows_of_attn, s.req_idx, s.topk, ctx, ws)
         assert bool(torch.isfinite(out).all()), f"layer {layer}: a row read an unwritten byte"
         for g in ctx.groups:
             q0, q1 = g.rows
@@ -714,46 +666,62 @@ def test_decode_group_of_two_sub_batches(env):
     assert ctx.groups[1].sub_batches == [(0, _SUB), (_SUB, 9000)]
 
 
-def test_kernel_output_feeds_the_v_projection_bitwise(env, monkeypatch):
-    """One workspace group (1000 + 500 and 500 + 500 KV rows), with its context rows alone and
-    with a generation row behind them: the prefill kernel's own output the first returns and
-    the latent output the second writes in calls of 384 rows (`_CTX_PREFILL_OUT_ROWS`) are
-    bitwise the same on every layer run, and so are the V up-projections `bmm_out` makes of
-    them with the target's transposed weight view."""
-    monkeypatch.setattr(M, "_CTX_PREFILL_OUT_ROWS", 384)
-    s = _step(env, [(1000, 500), (500, 500)], seed=6)
-    g = torch.Generator(device=env.dev).manual_seed(_SEED + 6)
-    v_b_t = torch.transpose(
-        (torch.randn(_HEADS, 128, _NOPE, generator=g, device=env.dev) * 0.05).to(torch.bfloat16),
-        1,
-        2,
-    )
-    runs = []
-    for gen_rows in (0, 1):
-        step = dict(s.step, num_tokens=s.tc + gen_rows)
-        target = _target(_HELD)
-        ctx = target._ctx_workspace(step, s.tc, env.dev)
-        assert ctx.own_out is (gen_rows == 0)
-        scratch = torch.full(
-            (s.tc, _HEADS, _NOPE), float("nan"), dtype=torch.bfloat16, device=env.dev
-        )
-        ws = torch.empty(_HELD, _LAT_DIM, dtype=torch.bfloat16, device=env.dev)
-        per_layer = []
-        for layer in _RUN:
-            L = SimpleNamespace(
-                kv_source=_SOURCES[layer], indexer=None if layer == 39 else object()
-            )
-            lat_in = scratch if gen_rows else None
-            lat = target._attn_ctx(step, L, s.q, lat_in, s.req_idx, s.topk, ctx, ws)
-            assert (lat is scratch) is (gen_rows == 1)
-            attn = torch.empty(s.tc, _HEADS * 128, dtype=torch.bfloat16, device=env.dev)
-            bmm_out(
-                torch.transpose(lat, 0, 1),
-                v_b_t,
-                torch.transpose(attn.view(s.tc, _HEADS, 128), 0, 1),
-            )
-            per_layer.append((lat.clone(), attn))
-        runs.append(per_layer)
-    for layer, (own, copied) in zip(_RUN, zip(*runs)):
-        assert torch.equal(own[0].view(torch.int16), copied[0].view(torch.int16)), layer
-        assert torch.equal(own[1].view(torch.int16), copied[1].view(torch.int16)), layer
+def _v_b_t(dev, seed: int) -> torch.Tensor:
+    """A V up-projection weight in the target's transposed view (`L.v_b_t`)."""
+    g = torch.Generator(device=dev).manual_seed(_SEED + seed)
+    w = (torch.randn(_HEADS, 128, _NOPE, generator=g, device=dev) * 0.05).to(torch.bfloat16)
+    return torch.transpose(w, 1, 2)
+
+
+def test_v_projection_by_group_is_the_whole_steps_bitwise(env):
+    """The alternating step's five groups (three workspace, two decode): every layer's attention
+    output, projected group by group by `_attn_ctx`, is bitwise `bmm_out` over the step's whole
+    latent output in one call, the projection before the step was split."""
+    s = _step(env, [(1500, 500), (9000, 700), (2000, 300), (12000, 600), (500, 400)], seed=6)
+    target = _target(_HELD)
+    ctx = target._ctx_workspace(s.step, s.tc, env.dev)
+    assert len(ctx.groups) == 5
+    ws = torch.empty(_HELD, _LAT_DIM, dtype=torch.bfloat16, device=env.dev)
+    attn = torch.empty(s.tc, _HEADS * 128, dtype=torch.bfloat16, device=env.dev)
+    lat = torch.empty(s.tc, _HEADS, _NOPE, dtype=torch.bfloat16, device=env.dev)
+    project = target._v_up
+
+    def capture(L, group_lat, rows):
+        lo, hi = _rows_of(rows, attn)
+        lat[lo:hi].copy_(group_lat)
+        project(L, group_lat, rows)
+
+    target._v_up = capture
+    whole = torch.empty_like(attn)
+    for layer in _RUN:
+        L = SimpleNamespace(
+            kv_source=_SOURCES[layer], indexer=None if layer == 39 else object(),
+            v_b_t=_v_b_t(env.dev, layer),
+        )  # fmt: skip
+        attn.fill_(float("nan"))
+        target._attn_ctx(s.step, L, s.q, attn, s.req_idx, s.topk, ctx, ws)
+        bmm_out(
+            torch.transpose(lat, 0, 1), L.v_b_t,
+            torch.transpose(whole.view(s.tc, _HEADS, 128), 0, 1),
+        )  # fmt: skip
+        assert torch.equal(attn.view(torch.int16), whole.view(torch.int16)), layer
+
+
+def test_v_projection_splits_bitwise(env):
+    """`bmm_out` with the target's transposed V weight over 20480 latent rows in one call, and
+    over the same rows split at 1, 15, 16, 17, 255, 1000, 2051, 8192, 16387 and 20479: every
+    piece's rows, at their offsets in one attention output, are bitwise the whole call's."""
+    g = torch.Generator(device=env.dev).manual_seed(_SEED + 7)
+    n = 20480
+    lat = (torch.randn(n, _HEADS, _NOPE, generator=g, device=env.dev) * 0.5).to(torch.bfloat16)
+    v_b_t = _v_b_t(env.dev, 7)
+    whole = torch.empty(n, _HEADS * 128, dtype=torch.bfloat16, device=env.dev)
+    bmm_out(torch.transpose(lat, 0, 1), v_b_t, torch.transpose(whole.view(n, _HEADS, 128), 0, 1))
+    cuts = [0, 1, 15, 16, 17, 255, 1000, 2051, 8192, 16387, 20479, n]
+    pieces = torch.full_like(whole, float("nan"))
+    for lo, hi in zip(cuts, cuts[1:]):
+        bmm_out(
+            torch.transpose(lat[lo:hi], 0, 1), v_b_t,
+            torch.transpose(pieces[lo:hi].view(hi - lo, _HEADS, 128), 0, 1),
+        )  # fmt: skip
+    assert torch.equal(pieces.view(torch.int16), whole.view(torch.int16))
