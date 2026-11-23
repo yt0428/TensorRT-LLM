@@ -46,7 +46,8 @@ The absorbed form throughout: `fused_q = [q_nope @ W_UK | rope(q_pe)]` (576 wide
 pooled `[c_kv | k_pe]` latent rows, then `@ W_UV`. Context rows attend over the selection (the
 engine's causal index on a step it skipped the indexer) with FlashMLA's bf16 sparse prefill
 over the requests' latent rows dequantized out of the pool, so they read the FP8-rounded latent
-as the reference does; generation rows run FlashMLA's sparse fp8 decode over the pool itself.
+as the reference does; generation rows run FlashMLA's sparse fp8 decode over the pool itself,
+the decode step's each over its own selection length.
 Both kernels take the rank's 64 heads in one call.
 
 No path is selected by the serving configuration: each step chooses from its own sizes, and
@@ -493,6 +494,18 @@ def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict
         radix_aux_indices=md.radix_aux_indices,
         radix_aux_logits=md.radix_aux_logits,
     )
+
+
+def _selection_lengths(kv_lens: torch.Tensor, next_n: int, topk: int) -> torch.Tensor:
+    """Each decode row's selection length, int32 `[len(kv_lens) * next_n]`.
+
+    Row `b * next_n + t` (sequence `b`'s `t`-th new token) attends to the
+    `end = kv_lens[b] - next_n + t + 1` keys before it, and both of its selections -- the
+    indexer's top-k and the engine's dense one for a step that skips it -- hold its
+    `min(end, topk)` selected slots first and -1 after, so that clamp is FlashMLA's
+    `topk_length` for the row."""
+    offsets = torch.arange(1 - next_n, 1, dtype=torch.int32, device=kv_lens.device)
+    return torch.clamp(kv_lens.unsqueeze(1) + offsets, 0, topk).view(-1)
 
 
 def _rank_counts(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> tuple[int, ...]:
@@ -2011,7 +2024,7 @@ class DecodeTarget:
             topk_buf = step["topk_indices_buffer"][:rows]
         else:
             topk_buf = torch.empty([rows, core.idx_topk], dtype=torch.int32, device=dev)
-        scratch = self._scratch(rows, h.dtype, dev)
+        scratch = self._scratch(step, rows, h.dtype, dev)
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         # The attention block adds into the residual in place, so the residual starts in a
@@ -2036,14 +2049,18 @@ class DecodeTarget:
                 spec_metadata.maybe_capture_hidden_states(layer_idx, residual)
         return x
 
-    def _scratch(self, rows: int, dtype, dev) -> SimpleNamespace:
+    def _scratch(self, step, rows: int, dtype, dev) -> SimpleNamespace:
         """Per-step scratch every layer rewrites in turn: the absorbed query at the kernel's 64
         heads (this rank's first, the rest zero for the step), a NoPE owner's 576-wide latent
         rows (the rope key zero for the step), the latent attention output the unfused glue
-        copies FlashMLA's live heads into, and the FlashMLA scheduler the step's first layer
-        fills and the rest share (captured with the step)."""
+        copies FlashMLA's live heads into, the FlashMLA scheduler the step's first layer
+        fills and the rest share (captured with the step), and each row's selection length
+        (`_selection_lengths`), FlashMLA's `topk_length`: a padding dummy's or short
+        sequence's row costs the decode its few keys' blocks instead of all of
+        `index_topk`'s."""
         core = self.core
         bf16 = dict(dtype=dtype, device=dev)
+        num_seqs = step["num_seqs"]
         return SimpleNamespace(
             fused_q=torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16),
             nope_lat=None if core.unfused_glue else torch.zeros([rows, core.lat_dim], **bf16),
@@ -2051,6 +2068,9 @@ class DecodeTarget:
                 torch.empty([rows, core.heads, core.kv_lora], **bf16) if core.unfused_glue else None
             ),
             sched=get_mla_metadata()[0],
+            topk_len=_selection_lengths(
+                step["kv_lens_cuda"][:num_seqs], rows // num_seqs, core.idx_topk
+            ),
         )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
@@ -2145,12 +2165,14 @@ class DecodeTarget:
         )
         if core.unfused_glue:
             lat = flash_mla_sparse_decode(
-                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out
-            )
+                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out,
+                topk_length=s.topk_len,
+            )  # fmt: skip
         else:
             lat = flash_mla_sparse_decode(
-                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None
-            )[:, : core.heads]
+                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None,
+                topk_length=s.topk_len,
+            )[:, : core.heads]  # fmt: skip
         return mla_v_up_fp8_block_scale_linear(lat, L.v_b_t, L.wo, L.wo_s)
 
     def dspark_forward(
