@@ -172,6 +172,8 @@ public:
 
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
+    // Release a page's slot once `ticket`, the unfenced disk transfer that last used it, completes.
+    void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot, DiskIoTicket ticket);
 
     // ---- Eviction ----------------------------------------------------------
 
@@ -218,7 +220,8 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
-    // Disk reads complete asynchronously; each moved page records its read in diskReadTicket.
+    // Disk reads into host memory complete in the background, unfenced; each moved page records its read
+    // in diskIoTicket.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
@@ -244,6 +247,16 @@ public:
 
     // Caller holds the manager's exclusive lock.
     DiskIoIterationStats getAndResetDiskIoStats();
+
+    // Blocks until the disk transfers that produced these pages' data complete. Needed before work that
+    // reads a page's data or reuses its slot whenever that transfer was unfenced (see Page::diskIoTicket).
+    // Caller holds the manager's exclusive lock.
+    void waitForPageIo(std::vector<SharedPtr<Page>> const& pages);
+    void waitForPageIo(Page& page);
+
+    // Completes every queued disk transfer and settles it, so no slot is in use by I/O. For operations
+    // that move or drop slots wholesale, such as resizing a level. Caller holds the exclusive lock.
+    void flushDiskIo();
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -440,9 +453,10 @@ private:
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     // When the batch touches disk and pageTickets is non-null, appends each page's disk ticket.
+    // Without fenceDisk, a host/disk batch does not hold back later work on `stream`.
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream,
-        std::vector<DiskIoTicket>* pageTickets = nullptr);
+        std::vector<DiskIoTicket>* pageTickets = nullptr, bool fenceDisk = true);
 
     // Tracks the pages of a disk batch until reapDiskIo() settles it.
     void recordDiskBatch(
@@ -507,6 +521,22 @@ private:
 
     // Disk batches not yet settled by reapDiskIo().
     std::vector<DiskBatchRecord> mInflightDiskBatches;
+
+    // A slot that an unfenced disk transfer still uses; reapDiskIo() returns it to its pool once the
+    // transfer completes.
+    struct DeferredRelease
+    {
+        CacheLevel level;
+        PoolGroupIndex poolGroup;
+        Slot slot;
+        DiskIoTicket ticket;
+    };
+
+    std::vector<DeferredRelease> mDeferredReleases;
+    // Set while migrations between host and disk may run unfenced: reads during prefetch to host,
+    // writes during host-reserve eviction. Nothing on the GPU consumes those transfers directly.
+    bool mUnfencedDiskReads = false;
+    bool mUnfencedDiskWrites = false;
     double mHostReserveFraction = 0.0;
     size_t mMaxPendingWriteBytes = 0;
     uint64_t mReserveEvictedPages = 0;

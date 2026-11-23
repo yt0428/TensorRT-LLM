@@ -34,6 +34,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! until the batch completes. The host function only pushes the batch onto a queue; the I/O runs on
 //! the engine's workers, so the driver's callback thread is never held by disk latency.
 //!
+//! A stream parked on a disk wait also stalls unrelated streams that share its hardware connection
+//! (measured on VR200 with the default 8 connections), so the fence is for the rare transfers that
+//! GPU work consumes directly; transfers between host and disk go unfenced.
+//!
 //! The completion wait is cuStreamWaitValue32 on host-mapped words that the engine updates. Where
 //! stream memory operations are unavailable, a host function blocks until the batch completes
 //! instead; that is still correct, but it holds the callback thread for the duration of the I/O.
@@ -50,8 +54,10 @@ public:
     DiskIoChannel(DiskIoChannel const&) = delete;
     DiskIoChannel& operator=(DiskIoChannel const&) = delete;
 
-    //! Queues `ops` behind the work already on `stream`, and the work queued after it behind them.
-    DiskIoTicket enqueue(CUstream stream, DiskIoKind kind, std::vector<DiskIoOp> ops);
+    //! Queues `ops` behind the work already on `stream`. With `fence`, the work queued on `stream`
+    //! afterwards also waits for them; without it, nothing on the GPU waits, and the caller orders
+    //! every later use of the buffers and slots through the ticket instead.
+    DiskIoTicket enqueue(CUstream stream, DiskIoKind kind, std::vector<DiskIoOp> ops, bool fence = true);
 
     [[nodiscard]] DiskIoEngine& engine() const
     {

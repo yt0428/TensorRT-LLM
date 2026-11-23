@@ -85,7 +85,7 @@ StagingBufferManager& CopyEngine::pageStagingManager() const
 }
 
 DiskIoTicket CopyEngine::submitDisk(CacheTier dstTier, CacheTier srcTier, size_t numBytes,
-    std::vector<CopyTask> const& tasks, size_t begin, size_t end, CUstream stream)
+    std::vector<CopyTask> const& tasks, size_t begin, size_t end, CUstream stream, bool fence)
 {
     TLLM_CHECK_WITH_INFO(mDiskIo != nullptr, "CopyEngine requires the disk I/O channel for this transfer");
     constexpr auto H = CacheTier::HOST_MEM;
@@ -138,7 +138,7 @@ DiskIoTicket CopyEngine::submitDisk(CacheTier dstTier, CacheTier srcTier, size_t
         }
         ops.push_back(op);
     }
-    return mDiskIo->enqueue(stream, kind, std::move(ops));
+    return mDiskIo->enqueue(stream, kind, std::move(ops), fence);
 }
 
 // Two-hop transfer via host staging buffer (e.g., GPU→Disk or Disk→GPU).
@@ -199,7 +199,7 @@ void CopyEngine::twoHopTransfer(
 }
 
 void CopyEngine::transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
-    CUstream stream, std::vector<DiskIoTicket>* taskTickets)
+    CUstream stream, std::vector<DiskIoTicket>* taskTickets, bool fenceDisk)
 {
     // Nothing to copy. Also guards the two-hop path against a div-by-zero on
     // `buf.size() / numBytes` when numBytes == 0.
@@ -215,7 +215,7 @@ void CopyEngine::transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes,
     bool const hostDiskPair = (dstTier == D || srcTier == D) && dstTier != G && srcTier != G;
     if (hostDiskPair && mDiskIo != nullptr)
     {
-        DiskIoTicket const ticket = submitDisk(dstTier, srcTier, numBytes, tasks, 0, tasks.size(), stream);
+        DiskIoTicket const ticket = submitDisk(dstTier, srcTier, numBytes, tasks, 0, tasks.size(), stream, fenceDisk);
         if (taskTickets != nullptr)
         {
             taskTickets->insert(taskTickets->end(), tasks.size(), ticket);

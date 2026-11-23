@@ -100,7 +100,7 @@ DiskIoChannel::~DiskIoChannel()
     destroy();
 }
 
-DiskIoTicket DiskIoChannel::enqueue(CUstream stream, DiskIoKind kind, std::vector<DiskIoOp> ops)
+DiskIoTicket DiskIoChannel::enqueue(CUstream stream, DiskIoKind kind, std::vector<DiskIoOp> ops, bool fence)
 {
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "DiskIoChannel used after destroy()");
     DiskIoTicket const ticket = mEngine->submit(kind, std::move(ops), /*activate=*/false);
@@ -116,6 +116,10 @@ DiskIoTicket DiskIoChannel::enqueue(CUstream stream, DiskIoKind kind, std::vecto
     }
     activateArgs.release();
 
+    if (!fence)
+    {
+        return ticket;
+    }
     if (mStreamMemOps)
     {
         CUdeviceptr const word = mWordsDevice + sizeof(uint32_t) * (ticket & (mEngine->ringSize() - 1));

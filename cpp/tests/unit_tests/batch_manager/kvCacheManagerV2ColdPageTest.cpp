@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -445,6 +446,60 @@ TEST_F(KvCacheManagerV2DiskIoTest, PrefetchedDiskPagesArriveAndRestoreData)
     EXPECT_EQ(stats.failedPages, 0u);
 }
 
+// Onboarding reads into host memory are unfenced: no stream waits for them, so a stream parked on disk
+// I/O cannot stall the streams that share its hardware connection. The CPU learns about them through
+// the tickets instead.
+TEST_F(KvCacheManagerV2DiskIoTest, OnboardingReadsHoldNoStream)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    auto const pages = commitPrefix(tokenSpan, 8);
+    ASSERT_EQ(pages.size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+
+    engine().setPausedForTest(true);
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (auto* page : pages)
+    {
+        EXPECT_NE(page->diskIoTicket, kNoDiskIoTicket);
+        bool complete = false;
+        while (!(complete = page->readyEvent.queryComplete()) && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        EXPECT_TRUE(complete) << "a stream waits for the held read";
+    }
+    EXPECT_EQ(reader->pollDiskReads(), DiskIoStatus::kPending);
+    engine().setPausedForTest(false);
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+
+    // The disk slots the reads came from return to the pool once the reads landed.
+    auto const diskGroup = storage().getPoolGroupIndex(kDiskLevel, mLifeCycle);
+    auto const diskStats = storage().getStatistics(kDiskLevel, diskGroup);
+    EXPECT_EQ(diskStats.free, diskStats.total);
+
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto const group = storage().getPoolGroupIndex(kHotLevel, mLifeCycle);
+    auto const pageBytes = storage().slotSize(group)[PoolIndex{0}];
+    auto const pageIndices = reader->getBasePageIndices(mLifeCycle);
+    for (int i = 0; i < 2; ++i)
+    {
+        auto const address
+            = std::get<MemAddress>(storage().slotAddress(kHotLevel, group, SlotId{pageIndices[i]}, PoolIndex{0}));
+        std::vector<uint8_t> bytes(pageBytes);
+        ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), pageBytes, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == kPattern; }));
+    }
+    reader->close();
+}
+
 TEST_F(KvCacheManagerV2DiskIoTest, FailedReadDropsPagesAndReportsFailed)
 {
     makeManager();
@@ -512,10 +567,12 @@ TEST_F(KvCacheManagerV2DiskIoTest, HostReserveWritesColdPagesAheadOrDropsThem)
     pressure(kHotLevel);
     ASSERT_LT(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
 
-    // No writes are queued, so the reserve is refilled by writing the coldest pages to disk.
+    // No writes are queued, so the reserve is refilled by writing the coldest pages to disk. The
+    // writes are unfenced: their host slots come back to the pool only once the writes land.
     storage().maintainHostReserve();
-    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
     engine().drain();
+    storage().reapDiskIo();
+    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
     auto stats = storage().getAndResetDiskIoStats();
     EXPECT_GT(stats.reserveEvictedPages, 0u);
     EXPECT_EQ(stats.reserveDroppedPages, 0u);

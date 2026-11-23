@@ -56,15 +56,17 @@ public:
     // Transfer numBytes per task. Tasks must all share the same source and destination tiers.
     // When the transfer touches disk and taskTickets is non-null, appends the disk ticket of each task, in
     // task order; a batch that fails still completes on the stream, and only its ticket reports the failure.
+    // Without fenceDisk, a host/disk transfer leaves `stream` free to run ahead of the I/O (see
+    // DiskIoChannel::enqueue); two-hop transfers always fence, since GPU work consumes or produces them.
     void transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
-        CUstream stream, std::vector<DiskIoTicket>* taskTickets = nullptr);
+        CUstream stream, std::vector<DiskIoTicket>* taskTickets = nullptr, bool fenceDisk = true);
 
 private:
     [[nodiscard]] StagingBufferManager& pageStagingManager() const;
 
     // Queues tasks[begin, end) of a host/disk pair on the disk channel and returns its ticket.
     DiskIoTicket submitDisk(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
-        size_t begin, size_t end, CUstream stream);
+        size_t begin, size_t end, CUstream stream, bool fence = true);
 
     template <CacheTier DstTier, CacheTier MidTier, CacheTier SrcTier>
     void twoHopTransfer(

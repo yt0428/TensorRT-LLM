@@ -797,6 +797,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
 
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
+            storageMgr.waitForPageIo(*lock->page());
             storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
@@ -978,7 +979,7 @@ DiskIoStatus KvCache::pollDiskReads(bool wait)
         {
             return DiskIoStatus::kFailed;
         }
-        DiskIoTicket const ticket = page->diskReadTicket;
+        DiskIoTicket const ticket = page->diskIoTicket;
         if (ticket == kNoDiskIoTicket)
         {
             continue;
@@ -990,7 +991,7 @@ DiskIoStatus KvCache::pollDiskReads(bool wait)
         }
         else if (status == DiskIoStatus::kOk)
         {
-            page->diskReadTicket = kNoDiskIoTicket;
+            page->diskIoTicket = kNoDiskIoTicket;
         }
         else
         {
@@ -1369,6 +1370,7 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+        storageMgr.waitForPageIo(*srcPage);
         storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
 
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
