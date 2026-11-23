@@ -157,9 +157,10 @@ void CopyEngine::twoHopTransfer(
         size_t const maxSize = remaining > std::numeric_limits<size_t>::max() / numBytes
             ? std::numeric_limits<size_t>::max()
             : numBytes * remaining;
-        // O_DIRECT needs the staging pages aligned; numBytes is a multiple of the alignment whenever the
-        // disk file is opened that way.
-        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, kDiskIoAlignment, stream);
+        // O_DIRECT needs the staging pages aligned, and the disk file is opened that way only when numBytes
+        // is a multiple of kDiskIoAlignment. The size granularity must be a multiple of the alignment.
+        size_t const alignment = numBytes % kDiskIoAlignment == 0 ? kDiskIoAlignment : 1;
+        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, alignment, stream);
         MemAddress addr = buf.address();
         size_t n = buf.size() / numBytes;
         TLLM_CHECK_DEBUG(n > 0 && n <= remaining);

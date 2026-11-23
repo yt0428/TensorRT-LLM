@@ -718,11 +718,13 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
             : coldPageBytes * remaining;
-        // The cold-page codec's copy path needs a 16-byte-aligned base, and O_DIRECT needs
-        // kDiskIoAlignment; with coldPageBytes a multiple of it, every staged page is aligned too.
+        // The cold-page codec's copy path needs a 16-byte-aligned base. A disk file opened with O_DIRECT
+        // also needs kDiskIoAlignment, which it is only when coldPageBytes is a multiple of it; the size
+        // granularity must be a multiple of the alignment, so smaller pages stay at the 16-byte floor.
         static_assert(kDiskIoAlignment % 16 == 0);
+        size_t const stagingAlignment = coldPageBytes % kDiskIoAlignment == 0 ? kDiskIoAlignment : 16;
         auto const staging
-            = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, kDiskIoAlignment, stream);
+            = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, stagingAlignment, stream);
         size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 

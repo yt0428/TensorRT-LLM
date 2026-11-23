@@ -1268,6 +1268,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # The lender sharing.attach_lender installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
     _sharing = None
+    # Whether a disk tier is configured. Resume, preparation and request release read it, so it is on
+    # the class for instances built without running __init__; context onboarding exists only with it.
+    _disk_tier_enabled: bool = False
 
     def __init__(
         self,
@@ -5743,7 +5746,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its saves drain, and a dead entry here would block every later
         # preemption through has_pending_preemption.
         self._pending_preemption.pop(request.py_request_id, None)
-        self.cancel_context_onboard(request.py_request_id)
+        if self._disk_tier_enabled:
+            self.cancel_context_onboard(request.py_request_id)
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
             if self.kv_connector_manager.has_pending_load(request):
@@ -6045,9 +6049,10 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
-        for onboard in self._context_onboards.values():
-            onboard.kv_cache.close()
-        self._context_onboards.clear()
+        if self._disk_tier_enabled:
+            for onboard in self._context_onboards.values():
+                onboard.kv_cache.close()
+            self._context_onboards.clear()
         self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
