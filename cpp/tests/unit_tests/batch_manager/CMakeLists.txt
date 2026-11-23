@@ -93,6 +93,21 @@ target_include_directories(
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
+add_tllm_gtest(
+  kvCacheManagerV2DiskIoEngineTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2DiskIoEngineTest.cpp
+  ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/diskIoEngine.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;batch-manager;host")
+target_include_directories(
+  kvCacheManagerV2DiskIoEngineTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+
 add_gtest(kvCacheManagerV2DigestPoolTest
           "kvCacheManagerV2DigestPoolTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(

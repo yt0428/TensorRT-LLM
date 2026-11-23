@@ -20,11 +20,13 @@
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/diskIoEngine.h"
 #include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 #include "tensorrt_llm/common/assert.h"
 
 #include <deque>
@@ -42,7 +44,22 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class Page;
 class KvCache;
 class CopyEngine;
+class DiskIoChannel;
 class StagingBufferManager;
+
+// Disk tier counters since the last StorageManager::getAndResetDiskIoStats().
+struct DiskIoIterationStats
+{
+    DiskIoStats io;
+    // Host pages that maintainHostReserve() wrote to disk ahead of demand, and those it dropped instead
+    // because queued writes exceeded the cap.
+    uint64_t reserveEvictedPages = 0;
+    uint64_t reserveDroppedPages = 0;
+    // Pages whose disk transfer failed and that left the radix tree.
+    uint64_t failedPages = 0;
+    // Whether streams wait for disk I/O with stream memory operations rather than host functions.
+    bool streamMemOps = false;
+};
 
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
@@ -201,8 +218,32 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
+    // Disk reads complete asynchronously; each moved page records its read in diskReadTicket.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+
+    // ---- Disk tier ---------------------------------------------------------
+
+    // Null without a disk tier.
+    [[nodiscard]] DiskIoChannel* diskIo() const noexcept
+    {
+        return mDiskIo.get();
+    }
+
+    // Settles completed disk batches: every page of a failed batch is marked ioFailed and leaves the
+    // radix tree, at once if it is droppable and otherwise when its last owner lets go. Caller holds
+    // the manager's exclusive lock.
+    void reapDiskIo();
+
+    // Keeps each host level that spills to disk at hostReserveFraction free slots by writing its
+    // coldest pages to disk. The call only queues the writes; the freed host slots carry the writes'
+    // completion events, and allocation prefers slots whose events have completed, so GPU eviction
+    // into host no longer waits for a write. Above maxPendingWriteBytes of queued writes, droppable
+    // pages are dropped instead. Caller holds the manager's exclusive lock.
+    void maintainHostReserve();
+
+    // Caller holds the manager's exclusive lock.
+    DiskIoIterationStats getAndResetDiskIoStats();
 
     // ---- Query helpers -----------------------------------------------------
 
@@ -398,8 +439,19 @@ private:
         KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
+    // When the batch touches disk and pageTickets is non-null, appends each page's disk ticket.
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream,
+        std::vector<DiskIoTicket>* pageTickets = nullptr);
+
+    // Tracks the pages of a disk batch until reapDiskIo() settles it.
+    void recordDiskBatch(
+        std::vector<SharedPtr<Page>> const& pages, std::vector<DiskIoTicket> const& pageTickets, bool isRead);
+    // Marks a page whose disk data is garbage and takes it out of the radix tree.
+    void detachFailedPage(SharedPtr<Page> const& page);
+    // Moves the `numPages` coldest pages of a host level to the next level, or drops the droppable ones
+    // among them when `drop` is set.
+    void evictForHostReserve(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages, bool drop);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
@@ -441,7 +493,25 @@ private:
 
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.
     std::unique_ptr<StagingBufferManager> mPageStagingManager;
+    // Present iff a cold tier is disk. Borrowed by CopyEngine, so declared before it.
+    std::unique_ptr<DiskIoChannel> mDiskIo;
     std::unique_ptr<CopyEngine> mCopyEngine;
+
+    struct DiskBatchRecord
+    {
+        bool isRead = false;
+        std::vector<DiskIoTicket> uniqueTickets;
+        std::vector<DiskIoTicket> pageTickets;
+        std::vector<WeakPtr<Page>> pages;
+    };
+
+    // Disk batches not yet settled by reapDiskIo().
+    std::vector<DiskBatchRecord> mInflightDiskBatches;
+    double mHostReserveFraction = 0.0;
+    size_t mMaxPendingWriteBytes = 0;
+    uint64_t mReserveEvictedPages = 0;
+    uint64_t mReserveDroppedPages = 0;
+    uint64_t mFailedPages = 0;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

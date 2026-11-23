@@ -55,6 +55,12 @@ public:
     Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    // Disk read that last brought this page's data in, until a check finds it complete. Readiness on
+    // the GPU is still readyEvent; this is how the CPU learns whether that read succeeded.
+    DiskIoTicket diskReadTicket = kNoDiskIoTicket;
+    // A disk transfer of this page's data failed, so the data is garbage. The page has left the radix
+    // tree and no owner may use it.
+    bool ioFailed = false;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

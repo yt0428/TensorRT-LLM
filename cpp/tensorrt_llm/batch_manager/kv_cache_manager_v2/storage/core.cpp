@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/storage/core.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -431,11 +432,19 @@ Address HostSlotPool::slotAddress(SlotId slot) const
 // DiskSlotPool
 // ---------------------------------------------------------------------------
 
-DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots)
+DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots, bool directIo)
     : SlotPoolBase(slotSize)
 {
+    bool const wantDirect = directIo && slotSize % kDiskIoAlignment == 0;
     // Try O_TMPFILE first, fall back to mkstemp.
-    mFd = ::open(directory.c_str(), O_TMPFILE | O_RDWR | O_EXCL, 0664);
+    int const baseFlags = O_TMPFILE | O_RDWR | O_EXCL;
+    mFd = ::open(directory.c_str(), baseFlags | (wantDirect ? O_DIRECT : 0), 0664);
+    mDirectIo = wantDirect && mFd >= 0;
+    if (mFd < 0 && wantDirect && errno == EINVAL)
+    {
+        // The filesystem refuses O_DIRECT (tmpfs, for one); buffered I/O still works.
+        mFd = ::open(directory.c_str(), baseFlags, 0664);
+    }
     if (mFd < 0)
     {
         if (errno == EOPNOTSUPP)
@@ -448,11 +457,21 @@ DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCo
                 throw DiskOOMError("DiskSlotPool: mkstemp failed: " + std::string(std::strerror(errno)));
             }
             ::unlink(tmpl);
+            if (wantDirect)
+            {
+                int const flags = ::fcntl(mFd, F_GETFL);
+                mDirectIo = flags >= 0 && ::fcntl(mFd, F_SETFL, flags | O_DIRECT) == 0;
+            }
         }
         else
         {
             throw DiskOOMError("DiskSlotPool: open O_TMPFILE failed: " + std::string(std::strerror(errno)));
         }
+    }
+    if (wantDirect && !mDirectIo)
+    {
+        TLLM_LOG_INFO(
+            "KV cache manager v2: %s does not accept O_DIRECT; the disk tier uses buffered I/O.", directory.c_str());
     }
     resize(numSlots);
 }
@@ -699,12 +718,12 @@ std::vector<Slot> HostPoolGroup::allocateMultiple(SlotCount numSlots)
 // ---------------------------------------------------------------------------
 
 DiskPoolGroup::DiskPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory)
+    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory, bool directIo)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
     {
-        mPools.push_back(std::make_unique<DiskSlotPool>(directory, sz, numSlots));
+        mPools.push_back(std::make_unique<DiskSlotPool>(directory, sz, numSlots, directIo));
     }
 }
 
@@ -778,15 +797,15 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 // ---------------------------------------------------------------------------
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory, bool directIo)
     : mDirectory(std::move(directory))
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(
-            std::make_unique<DiskPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory));
+        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory, directIo));
     }
 }
 
@@ -813,7 +832,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else
             {
-                return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path);
+                return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path, cfg.directIo);
             }
         },
         tierCfg);

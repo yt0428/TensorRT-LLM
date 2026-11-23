@@ -99,6 +99,23 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
+    //! Open the cache file with O_DIRECT, so disk traffic bypasses the page cache. Applies only when the
+    //! cold page is a multiple of the O_DIRECT alignment, which the default codec arranges when a disk
+    //! tier is configured; otherwise, or where the filesystem refuses O_DIRECT, I/O is buffered.
+    bool directIo = true;
+
+    //! Worker threads of the disk I/O engine.
+    int numIoThreads = 8;
+
+    //! Fraction of the host tier's slots that maintainHostReserve() keeps free by writing the coldest
+    //! host pages to disk ahead of demand, so that GPU eviction finds host slots whose writes already
+    //! finished. Zero disables the reserve.
+    double hostReserveFraction = 0.02;
+
+    //! Queued disk-write bytes above which maintainHostReserve() drops the coldest droppable host pages
+    //! instead of writing them: losing a reuse hit is cheaper than making the forward pass wait.
+    size_t maxPendingWriteBytes = size_t{8} << 30;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

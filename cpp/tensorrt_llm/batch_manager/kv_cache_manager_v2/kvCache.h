@@ -285,8 +285,14 @@ public:
     KVCacheStatsDelta commitPendingStats();
     void discardPendingStats();
 
-    // Best-effort prefetch active pages to the target cache level.
+    // Best-effort prefetch active pages to the target cache level. Disk reads it starts complete in the
+    // background; pollDiskReads() reports them.
     bool prefetch(CacheLevel target);
+
+    // Status of the disk reads that brought this cache's pages in: kFailed when any page's data is
+    // known to be garbage, kPending while a read is in flight (wait=true blocks until none is), kOk
+    // otherwise. A cache that sees kFailed must not be used for the forward pass.
+    DiskIoStatus pollDiskReads(bool wait = false);
 
     // ---- Capacity / history ------------------------------------------------
 

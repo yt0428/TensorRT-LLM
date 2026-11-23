@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/diskIoChannel.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
 // Reuse existing copy implementations (no Python round-trip).
@@ -27,6 +28,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -70,8 +72,9 @@ static void dispatchCopy(std::vector<CopyTask> const& tasks, size_t numBytes, CU
 // CopyEngine
 // ---------------------------------------------------------------------------
 
-CopyEngine::CopyEngine(StagingBufferManager* pageStagingManager)
+CopyEngine::CopyEngine(StagingBufferManager* pageStagingManager, DiskIoChannel* diskIo)
     : mPageStagingManager(pageStagingManager)
+    , mDiskIo(diskIo)
 {
 }
 
@@ -81,12 +84,71 @@ StagingBufferManager& CopyEngine::pageStagingManager() const
     return *mPageStagingManager;
 }
 
+DiskIoTicket CopyEngine::submitDisk(CacheTier dstTier, CacheTier srcTier, size_t numBytes,
+    std::vector<CopyTask> const& tasks, size_t begin, size_t end, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(mDiskIo != nullptr, "CopyEngine requires the disk I/O channel for this transfer");
+    constexpr auto H = CacheTier::HOST_MEM;
+    constexpr auto D = CacheTier::DISK;
+    DiskIoKind kind{};
+    if (dstTier == D && srcTier == H)
+        kind = DiskIoKind::kWrite;
+    else if (dstTier == H && srcTier == D)
+        kind = DiskIoKind::kRead;
+    else if (dstTier == D && srcTier == D)
+        kind = DiskIoKind::kCopy;
+    else
+        throw std::invalid_argument("CopyEngine::submitDisk: not a host/disk tier pair");
+
+    std::vector<DiskIoOp> ops;
+    ops.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i)
+    {
+        auto const& task = tasks[i];
+        DiskIoOp op;
+        op.size = numBytes;
+        switch (kind)
+        {
+        case DiskIoKind::kWrite:
+        {
+            auto const dst = std::get<DiskAddress>(task.dst);
+            op.fd = dst.fd;
+            op.offset = dst.pos;
+            op.buffer = reinterpret_cast<std::byte*>(std::get<MemAddress>(task.src));
+            break;
+        }
+        case DiskIoKind::kRead:
+        {
+            auto const src = std::get<DiskAddress>(task.src);
+            op.fd = src.fd;
+            op.offset = src.pos;
+            op.buffer = reinterpret_cast<std::byte*>(std::get<MemAddress>(task.dst));
+            break;
+        }
+        case DiskIoKind::kCopy:
+        {
+            auto const dst = std::get<DiskAddress>(task.dst);
+            auto const src = std::get<DiskAddress>(task.src);
+            op.fd = dst.fd;
+            op.offset = dst.pos;
+            op.srcFd = src.fd;
+            op.srcOffset = src.pos;
+            break;
+        }
+        }
+        ops.push_back(op);
+    }
+    return mDiskIo->enqueue(stream, kind, std::move(ops));
+}
+
 // Two-hop transfer via host staging buffer (e.g., GPU→Disk or Disk→GPU).
 // SrcTier → MidTier (staging) → DstTier.  MidTier is the staging tier (HOST_MEM).
 template <CacheTier DstTier, CacheTier MidTier, CacheTier SrcTier>
-static void twoHopTransfer(
-    StagingBufferManager& manager, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
+void CopyEngine::twoHopTransfer(
+    size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream, std::vector<DiskIoTicket>* taskTickets)
 {
+    constexpr auto D = CacheTier::DISK;
+    auto& manager = pageStagingManager();
     size_t remaining = tasks.size();
     size_t offset = 0;
 
@@ -95,10 +157,13 @@ static void twoHopTransfer(
         size_t const maxSize = remaining > std::numeric_limits<size_t>::max() / numBytes
             ? std::numeric_limits<size_t>::max()
             : numBytes * remaining;
-        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, 1, stream);
+        // O_DIRECT needs the staging pages aligned; numBytes is a multiple of the alignment whenever the
+        // disk file is opened that way.
+        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, kDiskIoAlignment, stream);
         MemAddress addr = buf.address();
         size_t n = buf.size() / numBytes;
         TLLM_CHECK_DEBUG(n > 0 && n <= remaining);
+        DiskIoTicket ticket = kNoDiskIoTicket;
 
         // First hop: src → staging
         {
@@ -106,7 +171,10 @@ static void twoHopTransfer(
             hop1.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop1.push_back({Address{addr + numBytes * i}, tasks[offset + i].src});
-            dispatchCopy<MidTier, SrcTier>(hop1, numBytes, *buf.stream());
+            if (SrcTier == D && mDiskIo != nullptr)
+                ticket = submitDisk(MidTier, SrcTier, numBytes, hop1, 0, n, *buf.stream());
+            else
+                dispatchCopy<MidTier, SrcTier>(hop1, numBytes, *buf.stream());
         }
 
         // Second hop: staging → dst
@@ -115,16 +183,23 @@ static void twoHopTransfer(
             hop2.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop2.push_back({tasks[offset + i].dst, Address{addr + numBytes * i}});
-            dispatchCopy<DstTier, MidTier>(hop2, numBytes, *buf.stream());
+            if (DstTier == D && mDiskIo != nullptr)
+                ticket = submitDisk(DstTier, MidTier, numBytes, hop2, 0, n, *buf.stream());
+            else
+                dispatchCopy<DstTier, MidTier>(hop2, numBytes, *buf.stream());
         }
 
+        if (taskTickets != nullptr && ticket != kNoDiskIoTicket)
+        {
+            taskTickets->insert(taskTickets->end(), n, ticket);
+        }
         offset += n;
         remaining -= n;
     }
 }
 
-void CopyEngine::transfer(
-    CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
+void CopyEngine::transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
+    CUstream stream, std::vector<DiskIoTicket>* taskTickets)
 {
     // Nothing to copy. Also guards the two-hop path against a div-by-zero on
     // `buf.size() / numBytes` when numBytes == 0.
@@ -137,12 +212,23 @@ void CopyEngine::transfer(
     constexpr auto H = CacheTier::HOST_MEM;
     constexpr auto D = CacheTier::DISK;
 
+    bool const hostDiskPair = (dstTier == D || srcTier == D) && dstTier != G && srcTier != G;
+    if (hostDiskPair && mDiskIo != nullptr)
+    {
+        DiskIoTicket const ticket = submitDisk(dstTier, srcTier, numBytes, tasks, 0, tasks.size(), stream);
+        if (taskTickets != nullptr)
+        {
+            taskTickets->insert(taskTickets->end(), tasks.size(), ticket);
+        }
+        return;
+    }
+
     if (dstTier == G && srcTier == G)
         dispatchCopy<G, G>(tasks, numBytes, stream);
     else if (dstTier == G && srcTier == H)
         dispatchCopy<G, H>(tasks, numBytes, stream);
     else if (dstTier == G && srcTier == D)
-        twoHopTransfer<G, H, D>(pageStagingManager(), numBytes, tasks, stream);
+        twoHopTransfer<G, H, D>(numBytes, tasks, stream, taskTickets);
     else if (dstTier == H && srcTier == G)
         dispatchCopy<H, G>(tasks, numBytes, stream);
     else if (dstTier == H && srcTier == H)
@@ -150,7 +236,7 @@ void CopyEngine::transfer(
     else if (dstTier == H && srcTier == D)
         dispatchCopy<H, D>(tasks, numBytes, stream);
     else if (dstTier == D && srcTier == G)
-        twoHopTransfer<D, H, G>(pageStagingManager(), numBytes, tasks, stream);
+        twoHopTransfer<D, H, G>(numBytes, tasks, stream, taskTickets);
     else if (dstTier == D && srcTier == H)
         dispatchCopy<D, H>(tasks, numBytes, stream);
     else if (dstTier == D && srcTier == D)
