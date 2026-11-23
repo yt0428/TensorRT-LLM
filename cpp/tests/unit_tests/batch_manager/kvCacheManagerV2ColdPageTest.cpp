@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/batch.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/diskIoChannel.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/eventManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
@@ -33,6 +34,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -293,6 +296,250 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
 
 INSTANTIATE_TEST_SUITE_P(
     DefaultAndCustomCodec, OptionalDiskCheckpointTest, ::testing::Combine(::testing::Bool(), ::testing::Bool()));
+
+// GPU -> host -> disk tiers with a single global attention layer of 4 KiB pages.
+KVCacheManagerConfig makeHostDiskConfig(DiskCacheTierConfig disk = DiskCacheTierConfig{4 << 20, "/tmp"})
+{
+    auto config = makeConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    config.cacheTiers.emplace_back(std::move(disk));
+    return config;
+}
+
+//! Disk tier behavior through the I/O engine: asynchronous reads, failures and the host reserve.
+class KvCacheManagerV2DiskIoTest : public ::testing::Test
+{
+protected:
+    static constexpr uint8_t kPattern = 0x5A;
+    static constexpr CacheLevel kHostLevel{1};
+    static constexpr CacheLevel kDiskLevel{2};
+
+    void SetUp() override
+    {
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(cudaStreamCreate(&mStream), cudaSuccess);
+    }
+
+    void TearDown() override
+    {
+        if (mManager)
+        {
+            mManager->shutdown();
+        }
+        cudaStreamDestroy(mStream);
+    }
+
+    void makeManager(DiskCacheTierConfig disk = DiskCacheTierConfig{4 << 20, "/tmp"})
+    {
+        mManager = std::make_shared<KvCacheManager>(makeHostDiskConfig(std::move(disk)));
+        mLifeCycle = mManager->getLayerGroupId(LayerId{0});
+    }
+
+    StorageManager& storage()
+    {
+        return mManager->storage();
+    }
+
+    DiskIoEngine& engine()
+    {
+        return storage().diskIo()->engine();
+    }
+
+    TokenSpan span(std::vector<TokenIdExt>& tokens, int numTokens, int firstToken = 0)
+    {
+        tokens.clear();
+        for (int i = 0; i < numTokens; ++i)
+        {
+            tokens.emplace_back(TokenId{firstToken + i});
+        }
+        return TokenSpan{tokens.data(), numTokens};
+    }
+
+    //! Commits `numTokens` tokens whose pages hold kPattern and returns the committed blocks' pages.
+    std::vector<CommittedPage*> commitPrefix(TokenSpan tokens, int numTokens)
+    {
+        auto source = mManager->createKvCache({}, {}, mNextCacheId++);
+        EXPECT_TRUE(source->resume(mStream));
+        EXPECT_TRUE(source->resize(numTokens));
+        auto const group = storage().getPoolGroupIndex(kHotLevel, mLifeCycle);
+        auto const pageBytes = storage().slotSize(group)[PoolIndex{0}];
+        auto const pageIndices = source->getBasePageIndices(mLifeCycle);
+        for (int i = 0; i < numTokens / 4; ++i)
+        {
+            auto const address
+                = std::get<MemAddress>(storage().slotAddress(kHotLevel, group, SlotId{pageIndices[i]}, PoolIndex{0}));
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), kPattern, pageBytes, mStream), cudaSuccess);
+        }
+        source->commit(tokens);
+        std::vector<CommittedPage*> pages;
+        for (auto const& block : source->blocks())
+        {
+            if (block.treeBlock && block.treeBlock->getPage(mLifeCycle) != nullptr)
+            {
+                pages.push_back(block.treeBlock->getPage(mLifeCycle));
+            }
+        }
+        source->close();
+        return pages;
+    }
+
+    //! Evicts every page of `level` to the level below.
+    void pressure(CacheLevel level)
+    {
+        auto const group = storage().getPoolGroupIndex(level, mLifeCycle);
+        TypedVec<PoolGroupIndex, SlotCount> goals(storage().numPoolGroups(level), SlotCount{0});
+        goals[group] = storage().getStatistics(level, group).total;
+        storage().prepareFreeSlots(level, goals);
+    }
+
+    cudaStream_t mStream{};
+    std::shared_ptr<KvCacheManager> mManager;
+    LifeCycleId mLifeCycle{0};
+    int mNextCacheId = 1;
+};
+
+TEST_F(KvCacheManagerV2DiskIoTest, PrefetchedDiskPagesArriveAndRestoreData)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    auto const pages = commitPrefix(tokenSpan, 8);
+    ASSERT_EQ(pages.size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    for (auto const* page : pages)
+    {
+        ASSERT_EQ(page->cacheLevel, kDiskLevel);
+    }
+
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    for (auto const* page : pages)
+    {
+        EXPECT_EQ(page->cacheLevel, kHostLevel);
+    }
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    EXPECT_EQ(reader->pollDiskReads(), DiskIoStatus::kOk);
+
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto const group = storage().getPoolGroupIndex(kHotLevel, mLifeCycle);
+    auto const pageBytes = storage().slotSize(group)[PoolIndex{0}];
+    auto const pageIndices = reader->getBasePageIndices(mLifeCycle);
+    for (int i = 0; i < 2; ++i)
+    {
+        auto const address
+            = std::get<MemAddress>(storage().slotAddress(kHotLevel, group, SlotId{pageIndices[i]}, PoolIndex{0}));
+        std::vector<uint8_t> bytes(pageBytes);
+        ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), pageBytes, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == kPattern; }));
+    }
+    reader->close();
+
+    auto const stats = storage().getAndResetDiskIoStats();
+    EXPECT_GE(stats.io.writeBytes, 2 * pageBytes);
+    EXPECT_GE(stats.io.readBytes, 2 * pageBytes);
+    EXPECT_EQ(stats.io.readErrors + stats.io.writeErrors, 0u);
+    EXPECT_EQ(stats.failedPages, 0u);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, FailedReadDropsPagesAndReportsFailed)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    ASSERT_EQ(commitPrefix(tokenSpan, 8).size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+
+    engine().injectFaults(DiskIoKind::kRead, 1 << 20, EIO);
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    EXPECT_EQ(reader->numCommittedTokens(), 8);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kFailed);
+    reader->close();
+    engine().injectFaults(DiskIoKind::kRead, 0, 0);
+
+    // The unreadable blocks no longer match, so a new request recomputes them.
+    auto fresh = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    EXPECT_EQ(fresh->numCommittedTokens(), 0);
+    fresh->close();
+    auto const stats = storage().getAndResetDiskIoStats();
+    EXPECT_EQ(stats.failedPages, 2u);
+    EXPECT_GE(stats.io.readErrors, 1u);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, FailedWriteDropsPages)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    ASSERT_EQ(commitPrefix(tokenSpan, 8).size(), 2u);
+    pressure(kHotLevel);
+
+    engine().injectFaults(DiskIoKind::kWrite, 1 << 20, ENOSPC);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+    engine().injectFaults(DiskIoKind::kWrite, 0, 0);
+
+    auto fresh = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    EXPECT_EQ(fresh->numCommittedTokens(), 0);
+    fresh->close();
+    EXPECT_EQ(storage().getAndResetDiskIoStats().failedPages, 2u);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, HostReserveWritesColdPagesAheadOrDropsThem)
+{
+    DiskCacheTierConfig disk{4 << 20, "/tmp"};
+    disk.hostReserveFraction = 0.5;
+    disk.maxPendingWriteBytes = 0;
+    makeManager(disk);
+    auto const apiLock = mManager->lockExclusive();
+    auto const hostGroup = storage().getPoolGroupIndex(kHostLevel, mLifeCycle);
+    auto const hostSlots = storage().getStatistics(kHostLevel, hostGroup).total;
+    auto const reserve = static_cast<SlotCount>(std::ceil(hostSlots * 0.5));
+
+    // Fill three quarters of the host tier with committed pages.
+    int const numBlocks = static_cast<int>(hostSlots * 3 / 4);
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, numBlocks * 4);
+    ASSERT_EQ(commitPrefix(tokenSpan, numBlocks * 4).size(), static_cast<size_t>(numBlocks));
+    pressure(kHotLevel);
+    ASSERT_LT(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+
+    // No writes are queued, so the reserve is refilled by writing the coldest pages to disk.
+    storage().maintainHostReserve();
+    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    engine().drain();
+    auto stats = storage().getAndResetDiskIoStats();
+    EXPECT_GT(stats.reserveEvictedPages, 0u);
+    EXPECT_EQ(stats.reserveDroppedPages, 0u);
+    EXPECT_EQ(mManager->radixTree().match({}, tokenSpan).numTokens, numBlocks * 4);
+
+    // Take host slots back, then hold the workers so a queued write stays pending: above the
+    // zero-byte cap the reserve now drops the coldest droppable pages instead of writing them.
+    std::vector<TokenIdExt> moreTokens;
+    auto const moreSpan = span(moreTokens, numBlocks * 4, 1 << 20);
+    ASSERT_EQ(commitPrefix(moreSpan, numBlocks * 4).size(), static_cast<size_t>(numBlocks));
+    pressure(kHotLevel);
+    engine().setPausedForTest(true);
+    TypedVec<PoolGroupIndex, SlotCount> one(storage().numPoolGroups(kHostLevel), SlotCount{0});
+    one[hostGroup] = 1;
+    storage().forceEvict(kHostLevel, one);
+    ASSERT_GT(engine().pendingWriteBytes(), 0u);
+    storage().maintainHostReserve();
+    stats = storage().getAndResetDiskIoStats();
+    EXPECT_GT(stats.reserveDroppedPages, 0u);
+    EXPECT_EQ(stats.reserveEvictedPages, 0u);
+    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    engine().setPausedForTest(false);
+    engine().drain();
+}
 
 KVCacheManagerConfig makeDiskTieredConfig()
 {

@@ -2393,6 +2393,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("end"), nb::arg("groups") = nb::none());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("inject_disk_io_faults", &kv::KvCacheIntrospection::injectDiskIoFaults, nb::arg("manager"),
+        nb::arg("reads"), nb::arg("count"), nb::arg("errno_value"), nb::call_guard<nb::gil_scoped_release>());
     nb::class_<kv::HostMemPlacement>(mIntrospection, "HostMemPlacement")
         .def_ro("gpu_numa_node", &kv::HostMemPlacement::gpuNumaNode)
         .def_ro("strict_binding", &kv::HostMemPlacement::strictBinding)
