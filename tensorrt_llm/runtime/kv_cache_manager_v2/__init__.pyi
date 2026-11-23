@@ -286,7 +286,7 @@ class DiskCacheTierConfig:
     path: str
     direct_io: bool = True
     num_io_threads: int = 8
-    host_reserve_fraction: float = 0.02
+    host_reserve_fraction: float = 0.1
     max_pending_write_bytes: int = 8 << 30
     @property
     def tier(self) -> CacheTier: ...

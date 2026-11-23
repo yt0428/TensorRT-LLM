@@ -109,8 +109,9 @@ struct DiskCacheTierConfig
 
     //! Fraction of the host tier's slots that maintainHostReserve() keeps free by writing the coldest
     //! host pages to disk ahead of demand, so that GPU eviction finds host slots whose writes already
-    //! finished. Zero disables the reserve.
-    double hostReserveFraction = 0.02;
+    //! finished. A resume that pushes more than this out of the GPU writes the rest to disk inside its
+    //! own step. Zero disables the reserve.
+    double hostReserveFraction = 0.1;
 
     //! Queued disk-write bytes above which maintainHostReserve() drops the coldest droppable host pages
     //! instead of writing them: losing a reuse hit is cheaper than making the forward pass wait.

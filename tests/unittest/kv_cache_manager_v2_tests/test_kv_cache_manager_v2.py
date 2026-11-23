@@ -2457,7 +2457,7 @@ class TestDiskTier(TestKVCacheManagerV2):
         config = DiskCacheTierConfig(quota=1 << 20, path="/tmp")
         self.assertTrue(config.direct_io)
         self.assertEqual(config.num_io_threads, 8)
-        self.assertAlmostEqual(config.host_reserve_fraction, 0.02)
+        self.assertAlmostEqual(config.host_reserve_fraction, 0.1)
         self.assertEqual(config.max_pending_write_bytes, 8 << 30)
 
     def test_prefetch_is_polled_until_the_reads_land(self) -> None:
