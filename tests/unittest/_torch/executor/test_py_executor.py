@@ -2683,6 +2683,20 @@ def test_encoder_decoder_disagg_wait_and_transfer_states_are_not_schedulable(sta
     assert len(stub.active_requests) == 2
 
 
+def test_context_request_onboarding_from_disk_is_not_schedulable():
+    """A request waiting for its disk reads leaves the rank without forward work, like a disagg wait."""
+    stub = _StubADPExecutor()
+    request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
+    request.py_kv_onboard_pending = True
+    stub.active_requests = [request]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
 def test_decoder_context_waiting_for_encoder_output_is_not_counted():
     stub = _StubADPExecutor()
     request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
