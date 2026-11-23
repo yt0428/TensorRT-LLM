@@ -813,6 +813,16 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
             )
         cute.arch.barrier()
 
+    @cute.jit
+    def _row_end(self, logits, seq_lens, row):
+        """The causal end of `row`, 0 when it falls outside the score row."""
+        cols = cute.size(logits, mode=[1])
+        end = seq_lens[row // cutlass.Int32(self.next_n)] - cutlass.Int32(self.next_n)
+        end = end + row % cutlass.Int32(self.next_n) + cutlass.Int32(1)
+        if (end < cutlass.Int32(0)) | (end > cols):
+            end = cutlass.Int32(0)
+        return end
+
     @cute.kernel
     def split_kernel(
         self,
@@ -832,11 +842,31 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
         s_lcol = smem.allocate_tensor(cutlass.Int32, cute.make_layout((LIST_CAPACITY,)), 128)
         s_warp = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.W,)), 128)
         s_scal = smem.allocate_tensor(cutlass.Int32, cute.make_layout((_NUM_SCALARS,)), 128)
-        cols = cute.size(logits, mode=[1])
-        end = seq_lens[row // cutlass.Int32(self.next_n)] - cutlass.Int32(self.next_n)
-        end = end + row % cutlass.Int32(self.next_n) + cutlass.Int32(1)
-        if (end < cutlass.Int32(0)) | (end > cols):
-            end = cutlass.Int32(0)
+        self._partition(
+            logits, seq_lens, aux_indices, aux_logits, row, part,
+            s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid,
+        )  # fmt: skip
+
+    @cute.jit
+    def _partition(
+        self,
+        logits,
+        seq_lens,
+        aux_indices,
+        aux_logits,
+        row,
+        part,
+        s_hist,
+        s_out,
+        s_lkey,
+        s_lcol,
+        s_warp,
+        s_scal,
+        tid,
+    ):
+        """Partition `part` of `row`: its top_k candidates, or its columns and their pads, into
+        the row's slots of the aux buffers."""
+        end = self._row_end(logits, seq_lens, row)
         span = end // cutlass.Int32(self.partitions)
         start = part * span
         stop = start + span
@@ -878,6 +908,15 @@ class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
         s_lcol = smem.allocate_tensor(cutlass.Int32, cute.make_layout((LIST_CAPACITY,)), 128)
         s_warp = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.W,)), 128)
         s_scal = smem.allocate_tensor(cutlass.Int32, cute.make_layout((_NUM_SCALARS,)), 128)
+        self._merge(
+            aux_indices, aux_logits, out, row, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid
+        )
+
+    @cute.jit
+    def _merge(
+        self, aux_indices, aux_logits, out, row, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid
+    ):
+        """The top_k of `row`'s partition candidates into `out[row]`, valid columns first."""
         length = cutlass.Int32(self.partitions * TOP_K)
         base = row * length
         score = cute.make_tensor(aux_logits.iterator + base, cute.make_layout((length,)))

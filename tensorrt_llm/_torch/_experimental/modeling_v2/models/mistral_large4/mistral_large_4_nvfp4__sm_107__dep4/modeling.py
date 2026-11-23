@@ -130,11 +130,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    build_split as build_ix_topk_verify,
+    build_cluster as build_ix_topk_verify,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    cluster_radix_topk_decode,
     cute_dsl_radix_topk_decode,
-    split_radix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
     ds_mla_dequant_gather_tiled,
@@ -340,14 +340,14 @@ _TOPK_WAVE_TILE_KEYS = 1 << 17
 # whose width it serves (`_derive_first_step`). next_n 1: cute_dsl_radix_topk_decode, one CTA
 # per row selecting the op's set (up to exact ties), at 4096 columns (where the op splits each
 # row) to 65536 (one CTA scans a whole row). DSpark verification (next_n 4):
-# split_radix_topk_decode, ten partitions plus a radix merge, at 20480 columns (the narrowest
-# row the op splits into ten blocks) to 1048584 (the 1M envelope with DSpark's headroom, the
-# split kernel's widest row), on the rows of a rank's padded graph batches 1, 2, 4, 8 and 16.
-# The split kernel takes at most 64 rows, so the graph batches padding adds above 16 when
-# max_batch_size allows them (24 and 32: 96 and 128 rows) keep the op, as do a mixed
-# step's generation rows at other counts. split_radix_topk_decode itself keeps the op for a
-# call the op would not split into ten blocks, or whose rows are not 32-byte aligned with a
-# width that is a multiple of 8.
+# cluster_radix_topk_decode, the set of the op's ten-block split selected by one cluster of CTAs
+# per row in one launch, at 20480 columns (the narrowest row the op splits into ten blocks) to
+# 1048584 (the 1M envelope with DSpark's headroom, the selector's widest row), on the rows of a
+# rank's padded graph batches 1, 2, 4, 8 and 16. The selector takes at most 64 rows, so the
+# graph batches padding adds above 16 when max_batch_size allows them (24 and 32: 96 and 128
+# rows) keep the op, as do a mixed step's generation rows at other counts.
+# cluster_radix_topk_decode itself keeps the op for a call the op would not split into ten
+# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
@@ -1068,7 +1068,7 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
             and lo <= logits.shape[1] <= hi
             and logits.dtype == torch.float32
         ):
-            return split_radix_topk_decode(
+            return cluster_radix_topk_decode(
                 logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
             )
         if next_n != 1 or self._ix_topk is None:
