@@ -34,10 +34,13 @@ gathered rows in calls of at most `expert_call_tokens` rows, and reduce-scatters
 sums back to each rank's own rows, adding the shared expert. While no rank holds more than
 `_ONE_SHOT_ROWS` rows both collectives are the one-shot Lamport kernels over symmetric memory
 (`lamport_moe_dispatch`, `lamport_moe_combine`, which on a decode step also adds the residual
-and applies the next layer's norm); past it, NCCL with every rank's own row count. Every rank
+and applies the next layer's norm). Past it, at four ranks the alltoall
+(`a2a_moe_dispatch`, `a2a_moe_combine`) sends each rank's rows only to the ranks holding one of
+their experts, the window runs over the rows it received, and each row's partials come back to
+its own rank, summed in fp32; at eight ranks, NCCL with every rank's own row count. Every rank
 issues the same collective sequence whatever its batch -- one gather and one reduce-scatter
-per MoE layer, chosen from `all_rank_num_tokens`, which every rank shares -- in the prefill and
-the decode target alike.
+(or one dispatch and one combine) per MoE layer, chosen from `all_rank_num_tokens`, which every
+rank shares -- in the prefill and the decode target alike.
 
 The absorbed form throughout: `fused_q = [q_nope @ W_UK | rope(q_pe)]` (576 wide) against the
 pooled `[c_kv | k_pe]` latent rows, then `@ W_UV`. Context rows attend over the selection (the
@@ -50,14 +53,16 @@ No path is selected by the serving configuration: each step chooses from its own
 every buffer is sized from the engine's quantities (the attention metadata's max_num_tokens,
 max_num_requests, max_seq_len and runtime_features). The context rows take one of two paths,
 chosen per step from the rank's own context requests' KV (each one's cached and new rows): the
-requests, in order, are grouped while their KV together fits the held workspace, and each
+requests, in order, are grouped while their KV together fits the context workspace, and each
 group's rows run the sparse prefill over that KV dequantized into it; the rows of a request
 whose own KV is past it run as one-row sequences of the sparse fp8 decode over the pool
-itself, as generation rows always do. The held workspace, allocated on the first context step,
-has room for the most context KV one step can attend, twice over, up to 2**19 rows
-(`_ctx_workspace_rows`): a step whose context KV fits twice keeps layer 35's rows beside its
-own for the NoPE layers attending over that latent, any other gathers them again for each of
-those layers. An indexer chunk the engine packs past `max_seq_len` keys is scored request
+itself, as generation rows always do. The workspace has room for the most context KV one step
+can attend, up to the engine's max_seq_len within 2**19..2**20 rows (`_ctx_workspace_rows`), so
+up to max_seq_len 1048576 every request fits it whole; each layer gathers its own source's
+rows, layer 35's again for each NoPE layer attending over that latent. A layer's absorbed
+query and workspace are one allocation that lives from its query to its output projection
+(`PrefillTarget._attention`), so the MLP's buffers reuse that memory. An indexer chunk the
+engine packs past `max_seq_len` keys is scored request
 by request, the indexer's logits are tiled under a budget from the engine's max_num_tokens and
 max_seq_len (`_prefill_logits_budget`), each tile scored with the CuTe DSL FP8 MQA scorer
 and selected with the self-sampling GVR
@@ -218,6 +223,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.a2a_moe_combine import a2a_moe_combine, a2a_moe_combine_payload
+from .ops.comm.a2a_moe_dispatch import a2a_moe_dispatch, build_moe_alltoall
 from .ops.comm.allgather_list import allgather_list
 from .ops.comm.lamport_moe_combine import lamport_moe_combine
 from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
@@ -321,6 +328,13 @@ _NVFP4_SF_LINEAR = False
 # 1 GiB tile (1 << 28) left a dep4 rank under the 2%-of-device free-memory margin at 0.9 of free
 # memory to KV at max_seq_len 1048576.
 _PREFILL_LOGITS_CEILING = 1 << 26
+# From this many keys on, a prefill block's query tiles hold at most one row per SM: the GVR
+# top-k then runs every tile as one wave of its 1024-thread tier-0 plan (`_select_ctx` passes
+# the SM count as its `tier0_rows`), one CTA of 32 warps per row, instead of the latency-bound
+# 512- and 256-thread plans the budget's 219- to 403-row tiles take. Below it the per-row work is
+# too short for that plan to pay: at 93384 keys the 718-row budget tile on the 256-thread plan
+# is the fastest per row.
+_TOPK_WAVE_TILE_KEYS = 1 << 17
 # The decode indexer's CuTe DSL selectors, False for the trtllm indexer_topk_decode op alone; the
 # scorer's column count is the engine's max_seq_len, so each selector is built for an engine
 # whose width it serves (`_derive_first_step`). next_n 1: cute_dsl_radix_topk_decode, one CTA
@@ -357,7 +371,7 @@ _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
 # is refused.
 _EXPERT_CALL_TOKENS = {4: 131072, 8: 32768}
 # capacity: fixed: by attention-DP world size, the calls of an engine under chunked prefill,
-# whose steps attend a cached prefix up to max_seq_len and hold the large context workspace:
+# whose steps attend a cached prefix up to max_seq_len over the large context workspace:
 # 32768 at both, a token column the expert path's entries are certified to at that world's
 # expert window. A call's workspace grows with its rows: at 4 ranks one call over all 131072
 # gathered rows leaves the engine about 5.6 GiB less free memory once up, more than max_seq_len
@@ -368,16 +382,30 @@ _EXPERT_CALL_TOKENS_CHUNKED = {4: 32768, 8: 32768}
 # the one-shot workspace (`lamport_moe_dispatch`, `lamport_moe_combine`): every decode graph up
 # to 128 DSpark rows per rank, and the small eager steps beside them. Its slots are 3 x world x
 # 512 x 6144 bf16 of symmetric memory, 72 MiB per rank at four ranks and 144 MiB at eight. A step
-# whose largest rank holds more rows gathers and reduce-scatters through NCCL.
+# whose largest rank holds more rows goes through the alltoall at `_A2A_WORLD` ranks, through
+# NCCL at eight.
 _ONE_SHOT_ROWS = 512
-# The held context workspace's ceiling (`_ctx_workspace_rows`), which bounds the context paths a
+# The attention-DP world whose steps past the one-shot workspace move the expert path's rows
+# through the alltoall (`build_moe_alltoall`), on an engine whose max_num_tokens passes the
+# workspace. At four ranks on one VR200 node, with uniformly drawn experts, its dispatch and
+# combine took 28 to 54% of the time of the NCCL gather and reduce-scatter on the engine's
+# communicator, from 513 to 16384 rows per rank, equal or ragged (`a2a_moe_dispatch`). Its
+# workspace is 2.4 GB per rank at 16384 rows; eight ranks over two nodes keep NCCL.
+_A2A_WORLD = 4
+# The context workspace's ceiling (`_ctx_workspace_rows`), which bounds the context paths a
 # step chooses once on this rank's host ints. The context requests, in order, are grouped while
-# their KV (cached and new rows) together fits the held workspace, and each group's KV is
+# their KV (cached and new rows) together fits the workspace, and each group's KV is
 # gathered, dequantized, into it (bf16 [rows, 576]) for FlashMLA's sparse prefill; a request
 # whose own KV is past it attends straight off the pool with the sparse decode kernel, which
-# takes about twice the prefill's time per context row on sm_107.
-# capacity: fixed: 2**19 rows, 576 MiB, the most KV one request attends through the workspace.
+# takes about twice the prefill's time per context row on sm_107. The ceiling follows the
+# engine's max_seq_len between these two, so that a request at max_seq_len fits whole.
+# capacity: fixed: 2**19 rows (576 MiB), the ceiling of an engine whose max_seq_len is shorter:
+# sixteen requests of max_seq_len 32768 hold it.
 _CTX_WORKSPACE_ROWS = 1 << 19
+# capacity: fixed: 2**20 rows (1.125 GiB), one request at max_seq_len 1048576; the rows the
+# gather and the sparse prefill are certified to (`ds_mla_dequant_gather_tiled`,
+# `flash_mla_sparse_prefill` and `convert_req_index_to_workspace`, their 2**20-row cells).
+_CTX_WORKSPACE_MAX_ROWS = 1 << 20
 # The most context rows one sparse-decode call takes on that path: FlashMLA's decode scheduler
 # exits the process, raising nothing, past 11622 one-row sequences of 64 heads on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
@@ -417,12 +445,14 @@ def _most_ctx_kv(md) -> int:
 
 
 def _ctx_workspace_rows(md) -> int:
-    """The held context workspace's rows: the most context KV one step can attend
-    (`_most_ctx_kv`) twice over, a step's rows and a shared owner's (layer 35's) kept beside
-    them, up to `_CTX_WORKSPACE_ROWS`. At max_num_tokens 32768 with neither chunked prefill nor
-    block reuse that is 65536 rows, the two `[32768, 576]` gathers a step there makes; with either,
-    at 16 requests of max_seq_len 32768 or more, 2**19."""
-    return min(2 * _most_ctx_kv(md), _CTX_WORKSPACE_ROWS)
+    """The context workspace's rows: the most context KV one step can attend (`_most_ctx_kv`),
+    up to the engine's max_seq_len within `_CTX_WORKSPACE_ROWS` and `_CTX_WORKSPACE_MAX_ROWS`, so
+    that a request at max_seq_len up to 1048576 fits whole. At max_num_tokens 32768 with neither
+    chunked prefill nor block reuse that is 32768 rows, the one `[32768, 576]` gather a step
+    there makes; with either, 2**19 at 16 requests of max_seq_len 32768, and 2**20 at max_seq_len
+    1048576."""
+    ceiling = min(max(md.max_seq_len, _CTX_WORKSPACE_ROWS), _CTX_WORKSPACE_MAX_ROWS)
+    return min(_most_ctx_kv(md), ceiling)
 
 
 def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict:
@@ -495,30 +525,54 @@ def _one_shot(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]) -> b
     return max(counts) <= core.moe_comm.max_rows
 
 
+def _alltoall(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]) -> bool:
+    """Whether this step's expert path is the alltoall: the engine built one and some rank holds
+    more rows than the one-shot workspace. A function of `counts` alone, the same on every
+    rank."""
+    return core.moe_a2a is not None and not _one_shot(core, counts)
+
+
 def _dispatch(core: "MistralLarge4Dep4ModelingV2", inputs: tuple, counts: tuple[int, ...]):
-    """Every rank's routed-expert inputs, unpadded in rank order: the one-shot gather, or one
-    NCCL group over the four tensors (ragged when the counts differ)."""
+    """The routed-expert inputs this rank's window runs over: every rank's rows unpadded in rank
+    order through the one-shot gather or one NCCL group over the four tensors (ragged when the
+    counts differ), or through the alltoall the rows every rank sent here, in its receive
+    layout (`a2a_moe_dispatch`)."""
     if _one_shot(core, counts):
         return lamport_moe_dispatch(*inputs, counts, core.moe_comm)
     codes, scales, ids, weights = inputs
+    scales = scales.view(codes.shape[0], -1)
+    if _alltoall(core, counts):
+        codes, scales, ids, weights = a2a_moe_dispatch(
+            codes, scales, ids, weights, counts, core.moe_a2a
+        )
+        return codes, scales.view(-1), ids, weights
     sizes = None if len(set(counts)) == 1 else list(counts)
     codes, scales, ids, weights = allgather_list(
-        [codes, scales.view(codes.shape[0], -1), ids, weights], sizes, core.dp_group, core.dp_pg
+        [codes, scales, ids, weights], sizes, core.dp_group, core.dp_pg
     )
     return codes, scales.view(-1), ids, weights
 
 
-def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.Tensor:
-    """This rank's expert window over every gathered row, in calls of at most
-    `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial. A row
-    whose experts all lie outside the window comes back +0.0."""
+def _partial_out(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]):
+    """Where the expert runner writes this step's partial: the alltoall's combine payload, read
+    there in place, or None for a fresh tensor. Called after the step's dispatch."""
+    if _alltoall(core, counts):
+        return a2a_moe_combine_payload(counts, core.hidden, core.moe_a2a)
+    return None
+
+
+def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) -> torch.Tensor:
+    """This rank's expert window over every dispatched row, in calls of at most
+    `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial: `out`
+    when given (`_partial_out`), else a fresh one. A row whose experts all lie outside the
+    window, or whose ids are all -1, comes back +0.0."""
     codes, scales, ids, weights = gathered
     total = codes.shape[0]
     sf_row = scales.numel() // total
     call = core.expert_call_tokens
-    routed_all = (
-        None if total <= call else codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
-    )
+    routed_all = out
+    if out is None and total > call:
+        routed_all = codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
     for lo in range(0, total, call):
         hi = min(lo + call, total)
         part = fp4_block_scale_moe_runner(
@@ -528,7 +582,10 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.T
             core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
             topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
             tune_max_num_tokens=core.expert_tune_tokens,
+            output=None if out is None else out[lo:hi],
         )[0]  # fmt: skip
+        if out is not None:
+            continue
         if routed_all is None:
             routed_all = part
         else:
@@ -536,9 +593,12 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered) -> torch.T
     return routed_all
 
 
-def _nccl_combine(core: "MistralLarge4Dep4ModelingV2", routed_all, counts: tuple[int, ...]):
-    """This rank's rows of the windows' summed partials through NCCL, ragged when the counts
-    differ."""
+def _combine(core: "MistralLarge4Dep4ModelingV2", routed_all, counts: tuple[int, ...]):
+    """This rank's rows of the windows' summed partials past the one-shot workspace: the
+    alltoall's combine of the payload the runner wrote, or NCCL's reduce-scatter, ragged when
+    the counts differ."""
+    if _alltoall(core, counts):
+        return a2a_moe_combine(routed_all, core.moe_a2a)
     sizes = None if len(set(counts)) == 1 else list(counts)
     return reducescatter(routed_all, sizes, core.dp_group, core.dp_pg)
 
@@ -809,13 +869,6 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self.nope_layer = [bool(f) for f in cfg.nope_layer_flags]
         self.indexer_nope = [bool(f) for f in cfg.indexer_nope_layer_flags]
         self.kv_source = [int(s) for s in cfg.kv_source_layers]
-        # An owner some later layer attends over (layer 35): a step whose context KV fits the
-        # held workspace twice keeps its gather there for the sharers; a longer one has each
-        # sharer gather its source's rows again (`_ctx_workspace`).
-        self.shared_source = [
-            any(s == i and j != i for j, s in enumerate(self.kv_source))
-            for i in range(self.num_layers)
-        ]
         self.full_indexer = [role == "full" for role in cfg.index_sharing]
         # A 'shared' layer attends with the most recent full layer's selection: each target
         # keeps one selection buffer per step, which every full layer overwrites in order.
@@ -848,9 +901,10 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._stride_factor = 0
         self._max_ctx_len = 0
         # The engine's sizes, fixed on the first step (`_derive_first_step`): the indexer's
-        # prefill logits budget, the held context workspace's rows, the most gathered rows one
+        # prefill logits budget, the context workspace's rows, the most gathered rows one
         # expert-path call takes and the MoE autotuner's largest bucket.
         self.prefill_logits_budget = 0
+        self.topk_wave_rows = 0
         self.ctx_workspace_rows = 0
         self.expert_call_tokens = 0
         self.expert_tune_tokens = 0
@@ -862,14 +916,16 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._ix_logits = None
         self._side_stream: torch.cuda.Stream | None = None
         self.dp_pg = None
-        # The expert path's one-shot slots (`build_moe_comm_workspace`), built at load.
+        # The expert path's one-shot slots (`build_moe_comm_workspace`) and alltoall
+        # (`build_moe_alltoall`, None where the engine has none), built at load.
         self.moe_comm = None
+        self.moe_a2a = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
         """Derive what the weights fix, build the kernels, the side stream (the shared expert's,
         and the decode attention's query half), the communicator handle and the expert path's
-        one-shot workspace, then the targets.
+        one-shot workspace and alltoall, then the targets.
 
         Named for the shell hook that drives it. Everything compiles here or on the first
         (eager) step: a first compile inside a CUDA-graph capture breaks the graph. The side
@@ -882,10 +938,17 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         # MPI session's, or the tensor-parallel process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.dp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-        # Collective: every rank builds it with the same arguments, outside any capture.
+        # Collective: every rank builds them with the same arguments, outside any capture. A
+        # four-rank engine whose steps can pass the one-shot workspace also gets the alltoall,
+        # sized to its max_num_tokens.
         self.moe_comm = build_moe_comm_workspace(
             self.hidden, _ONE_SHOT_ROWS, self.dp_rank, len(self.dp_group)
         )
+        tokens = self.model_config.max_num_tokens
+        if tokens > _ONE_SHOT_ROWS and len(self.dp_group) == _A2A_WORLD:
+            self.moe_a2a = build_moe_alltoall(
+                mapping, self.num_experts, self.topk, tokens, self.hidden
+            )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -937,12 +1000,14 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
         self._stride_factor = len(mgr.kv_owner_layers) * md.tokens_per_block
         # The decode scorer's column count: frozen into a capture, so an engine constant.
         self._max_ctx_len = md.max_seq_len
-        # The indexer's prefill logits budget and the held context workspace's rows, from the
+        # The indexer's prefill logits budget and the context workspace's rows, from the
         # engine's max_num_tokens, max_num_requests, max_seq_len and runtime features.
         self.prefill_logits_budget = _prefill_logits_budget(md.max_num_tokens, md.max_seq_len)
+        # One wave of the prefill top-k's tier-0 plan: a CTA per SM (`_TOPK_WAVE_TILE_KEYS`).
+        self.topk_wave_rows = torch.cuda.get_device_properties(dev).multi_processor_count
         self.ctx_workspace_rows = _ctx_workspace_rows(md)
         # The expert path's calls at this world size: the smaller ones under chunked prefill,
-        # the engines whose steps attend a cached prefix up to max_seq_len and hold the large
+        # the engines whose steps attend a cached prefix up to max_seq_len over the large
         # context workspace.
         calls = (
             _EXPERT_CALL_TOKENS_CHUNKED
@@ -1138,9 +1203,6 @@ def _dspark_block(
 class PrefillTarget:
     """The general case: context rows, and possibly generation rows behind them."""
 
-    # The held context workspace, bf16 [core.ctx_workspace_rows, 576]: allocated on the first
-    # context step and held from then on (`_ctx_workspace`).
-    _ws_buf: torch.Tensor | None = None
     # The indexer's prefill top-k scratch (`gvr_workspace`, 20 MiB): allocated on the first
     # context step that selects and held, used on the main stream only (`_select_ctx`).
     _gvr_ws: torch.Tensor | None = None
@@ -1285,7 +1347,8 @@ class PrefillTarget:
         """Plan the context rows and key windows scored by each query tile.
 
         The engine's chunk and query-split mappings determine each block's rows,
-        keys and window offsets. Tiles stay within the prefill logits budget.
+        keys and window offsets. Tiles stay within the prefill logits budget, and
+        from `_TOPK_WAVE_TILE_KEYS` keys on within one top-k wave of rows.
         The plan is reused across indexer layers within this step."""
         core = self.core
         chunks = step["indexer_prefill_chunks"]
@@ -1314,6 +1377,8 @@ class PrefillTarget:
                 if n_k > 0:
                     shift = k_token_start - chunk.k_token_start
                     tile = max(1, core.prefill_logits_budget // n_k)
+                    if n_k >= _TOPK_WAVE_TILE_KEYS:
+                        tile = min(tile, core.topk_wave_rows)
                     for lo in range(token_start, token_end, tile):
                         hi = min(lo + tile, token_end)
                         # The windows are the chunk's own, indexed from its first row and key.
@@ -1373,68 +1438,78 @@ class PrefillTarget:
                     q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke, compiled=core._ix_logits
                 )
                 cute_dsl_gvr_topk_prefill(
-                    logits, ks, ke, topk_buf[lo:hi], core.idx_topk, self._gvr_ws
-                )
+                    logits, ks, ke, topk_buf[lo:hi], core.idx_topk, self._gvr_ws,
+                    tier0_rows=core.topk_wave_rows,
+                )  # fmt: skip
                 # Freed before the next tile's is allocated: one tile is live at a time.
                 del logits
 
-    def _attn_ctx(self, step, L, fused_q, lat_out, req_idx, topk_buf, ctx):
-        """Sparse MLA over the context rows into `lat_out`, group by group (`ctx.groups`), each
-        group's rows on its own path (`_ctx_workspace`). Returns the context rows' latent
-        output: `lat_out`, or on a step of context rows alone that is one workspace group
-        (`ctx.own_out`) the prefill kernel's own output, which the V up-projection reads in
-        its place instead of a copy into `lat_out`.
+    def _attn_ctx(self, step, L, fused_q, attn_out, req_idx, topk_buf, ctx, ws_rows):
+        """Sparse MLA over the context rows and its V up-projection into `attn_out`, group by
+        group (`ctx.groups`), each group's rows on its own path (`_ctx_workspace`) and projected
+        (`_v_up`) as soon as its latent output is written, so no group's latent output outlives
+        it and none is copied.
 
         Workspace group: FlashMLA's bf16 sparse prefill over its requests' latent rows of the
         source layer, dequantized out of the pool (this step's rows included, so every row is
-        read FP8-rounded) into the held workspace's first rows. A shared source (layer 35) is
-        gathered once into the rows the step keeps beside them, when it has them, and read there
-        by every layer that shares it; otherwise each of those layers gathers it again into the
-        first rows. The group's selections as workspace rows (`idx`) change only with the
-        selection: a lone request's run starts at row 0, so its selections are already
-        workspace rows; with more, they are offset on a layer that selects and on the step's
-        first layer. Decode group: the selections as pool slots, then FlashMLA's sparse fp8
-        decode over the pool with every row a one-row sequence, in the group's sub-batches."""
+        read FP8-rounded) into the first rows of the layer's workspace (`ws_rows`, bf16
+        `[core.ctx_workspace_rows, 576]`), the kernel's own output projected; a shared source
+        (layer 35) is gathered again for each layer that shares it. The group's selections as
+        workspace rows (`idx`) change only with the selection: a lone request's run starts at
+        row 0, so its selections are already workspace rows; with more, they are offset on a
+        layer that selects and on the step's first layer. Decode group: the selections as pool
+        slots, then FlashMLA's sparse fp8 decode over the pool with every row a one-row
+        sequence, in the group's sub-batches, into a latent output of the group's own."""
         core = self.core
         src = L.kv_source
         selects = L.indexer is not None and not step["skip_ctx"]
         for g in ctx.groups:
             q0, q1 = g.rows
             sel = topk_buf[q0:q1]
-            if g.ws_buf is None:
+            if g.n_kv is None:
                 slots = convert_req_index_to_global(
                     req_idx[q0:q1], step["block_table"], sel, step["tokens_per_block"],
                     core.idx_topk, core._stride_factor, core._pool_row[src],
                 )  # fmt: skip
+                lat = torch.empty(
+                    [q1 - q0, core.heads, core.kv_lora], dtype=torch.bfloat16, device=fused_q.device
+                )
                 for lo, hi in g.sub_batches:
                     # Past 11622 rows FlashMLA's scheduler exits the process instead of raising.
                     assert hi - lo <= _CTX_DECODE_ROWS, (lo, hi)
                     flash_mla_sparse_decode(
                         fused_q[q0 + lo : q0 + hi], step["latent_kv"], slots[lo:hi],
-                        ctx.sched[hi - lo], core.softmax_scale, lat_out[q0 + lo : q0 + hi],
+                        ctx.sched[hi - lo], core.softmax_scale, lat[lo:hi],
                     )  # fmt: skip
-                continue
-            ws = g.ws.get(src)
-            if ws is None:
-                keep = core.shared_source[src] and g.kept is not None
+            else:
                 ws = ds_mla_dequant_gather_tiled(
                     step["latent_pool"], core._pool_row[src], g.kv_req, g.kv_pos,
-                    step["block_table"], g.kept if keep else g.ws_buf,
+                    step["block_table"], ws_rows[: g.n_kv],
                 )  # fmt: skip
-                if keep:
-                    g.ws[src] = ws
-            if g.ws_off is None:
-                g.idx = sel
-            elif g.idx is None or selects:
-                # Request-local selections to workspace rows: each request's run starts at its
-                # KV offset in the group. One buffer per group, rewritten by each selection.
-                g.idx = convert_req_index_to_workspace(
-                    req_idx[q0:q1], sel, g.ws_off, torch.empty_like(sel) if g.idx is None else g.idx
-                )
-            if ctx.own_out:
-                return flash_mla_sparse_prefill(fused_q, ws, g.idx, core.softmax_scale, None)
-            flash_mla_sparse_prefill(fused_q[q0:q1], ws, g.idx, core.softmax_scale, lat_out[q0:q1])
-        return lat_out
+                if g.ws_off is None:
+                    g.idx = sel
+                elif g.idx is None or selects:
+                    # Request-local selections to workspace rows: each request's run starts at
+                    # its KV offset in the group. One buffer per group, rewritten by each
+                    # selection.
+                    g.idx = convert_req_index_to_workspace(
+                        req_idx[q0:q1], sel, g.ws_off,
+                        torch.empty_like(sel) if g.idx is None else g.idx,
+                    )  # fmt: skip
+                lat = flash_mla_sparse_prefill(fused_q[q0:q1], ws, g.idx, core.softmax_scale, None)
+            self._v_up(L, lat, attn_out[q0:q1])
+
+    def _v_up(self, L, lat, out):
+        """The V up-projection of latent rows `lat` (bf16 `[n, 64, 512]`) into attention output
+        rows `out` (`[n, 64 * 128]`). A row's projection is bitwise the same in any call that
+        holds it, at any row of it (`bmm_out`'s dep4 V-B cells; test_modeling_v2_ctx_groups.py
+        splits a step's rows), so projecting group by group gives the whole step's bits."""
+        core = self.core
+        bmm_out(
+            torch.transpose(lat, 0, 1),
+            L.v_b_t,
+            torch.transpose(torch.reshape(out, [out.shape[0], core.heads, core.v_dim]), 0, 1),
+        )
 
     def _attn_gen(self, step, L, fused_q, lat_out, slots, sched):
         """Sparse MLA over the generation rows behind the context rows into `lat_out`: FlashMLA's
@@ -1459,7 +1534,7 @@ class PrefillTarget:
         window (32 experts at 4 ranks, 16 at 8) runs over them in calls of at most
         `expert_call_tokens`, and the reduce-scatter sums the windows' partials back to this
         rank's rows and adds the shared expert's: one-shot while no rank holds more than the
-        workspace (`_one_shot`), NCCL past it."""
+        workspace (`_one_shot`), the alltoall or NCCL past it (`_alltoall`)."""
         core = self.core
         m = L.moe
         side = core._side_stream
@@ -1467,15 +1542,14 @@ class PrefillTarget:
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        routed_all = _routed_experts(
-            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        )
+        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
         if _one_shot(core, counts):
             main.wait_stream(side)
             return lamport_moe_combine(
                 routed_all, shared, None, None, core.eps, counts, core.moe_comm
             )
-        routed = _nccl_combine(core, routed_all, counts)
+        routed = _combine(core, routed_all, counts)
         main.wait_stream(side)
         return torch.add(routed, shared)
 
@@ -1534,6 +1608,8 @@ class PrefillTarget:
                 step, L, x, pos, req_idx, topk_buf, scratch, ctx, tc, skip_ctx, skip_gen
             )
             residual = torch.add(residual, self._linear_fp8(attn_out, L.wo, L.wo_s))
+            # The layer's attention buffers go back to the allocator before the MLP's.
+            del attn_out
             o = flashinfer_rmsnorm(residual, L.ffn_norm, core.eps)
             mlp = self._dense(o, L) if L.moe is None else self._moe(o, L, counts)
             residual = torch.add(residual, mlp)
@@ -1543,18 +1619,15 @@ class PrefillTarget:
         return x
 
     def _scratch(self, rows: int, dtype, dev) -> SimpleNamespace:
-        """Per-step scratch every layer rewrites in turn: the attention output, the absorbed
-        query at the kernels' 64 heads (this rank's first, the rest zero for the step), the
-        latent attention output, a NoPE owner's 576-wide latent rows (the rope key zero for
-        the step), and the generation rows' FlashMLA scheduler, filled by the step's first
-        decode call and shared by the rest."""
+        """Per-step scratch every layer rewrites in turn: a NoPE owner's 576-wide latent rows
+        (the rope key zero for the step) and the generation rows' FlashMLA scheduler, filled by
+        the step's first decode call and shared by the rest. The attention's larger buffers
+        are each layer's own (`_attention`)."""
         core = self.core
-        bf16 = dict(dtype=dtype, device=dev)
         return SimpleNamespace(
-            attn_out=torch.empty([rows, core.heads * core.v_dim], **bf16),
-            fused_q=torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16),
-            lat_out=torch.empty([rows, core.heads, core.kv_lora], **bf16),
-            nope_lat=None if core.unfused_glue else torch.zeros([rows, core.lat_dim], **bf16),
+            nope_lat=None
+            if core.unfused_glue
+            else torch.zeros([rows, core.lat_dim], dtype=dtype, device=dev),
             sched=get_mla_metadata()[0],
         )
 
@@ -1565,39 +1638,19 @@ class PrefillTarget:
         rank's own requests only and the attention has no collective, so each rank takes its
         own paths; ranks on different paths meet again only at the expert path's collectives.
 
-        The held workspace, bf16 `[core.ctx_workspace_rows, 576]` (`_ctx_workspace_rows`), is
-        allocated on the first context step, whichever paths that step takes, and held. The
-        engine's KV-capacity estimate runs context steps as its profiling forward and sizes the
-        pool after their peak memory (`KvCacheCreator.configure_kv_cache_capacity`), so the pool
-        is sized with the workspace held. A generation-only engine runs no context step and
-        holds none.
-
         The context requests, in order, form groups (`groups`), each over its requests' rows
-        of the step (`rows`). A request whose own KV fits the held rows joins a workspace
-        group, which takes the following requests while their KV together still fits: the
-        whole step is one group when its context KV fits. A workspace group holds its request
-        and position per workspace row as the dequantizing gather and the prefill kernel
-        address them, the held workspace's first rows for its KV, which every layer's gather
-        rewrites, and, when the step is that one group and its KV fits twice, the next as many
-        rows (`kept`), where a shared owner's gather stays for the step (`ws`). Over more than
-        one request it holds each request's int32 offset into the workspace (`ws_off`) and the
-        selections offset by it (`idx`, `_attn_ctx`). A run of requests each past the held
-        rows is a decode group, with no workspace: its rows' sub-batches of at most
-        `_CTX_DECODE_ROWS`, on one FlashMLA scheduler per sub-batch size (`sched`), filled by
-        its first call and shared by the step's layers. A step of context rows alone that is
-        one workspace group takes the prefill kernel's own output as its latent output
-        (`own_out`, `_attn_ctx`)."""
-        if self._ws_buf is None:
-            # On the first context step: the KV-capacity estimate's profiling forward is one,
-            # so the peak it measures, which sizes the pool, holds this buffer.
-            self._ws_buf = torch.empty(
-                [self.core.ctx_workspace_rows, self.core.lat_dim], dtype=torch.bfloat16, device=dev
-            )
-            logger.info(
-                f"modeling_v2 Mistral Large 4 NVFP4: context workspace held, {self._ws_buf.shape[0]} "
-                f"rows x {self.core.lat_dim} bf16 ({self._ws_buf.nbytes / 2**20:.0f} MiB)"
-            )
-        held = self._ws_buf.shape[0]
+        of the step (`rows`). A request whose own KV fits the workspace's rows
+        (`core.ctx_workspace_rows`, `_ctx_workspace_rows`) joins a workspace group, which takes
+        the following requests while their KV together still fits: the whole step is one group
+        when its context KV fits. A workspace group holds its request and position per
+        workspace row as the dequantizing gather and the prefill kernel address them, and its
+        KV's row count (`n_kv`), the first rows of each layer's workspace (`_attention`). Over
+        more than one request it holds each request's int32 offset into the workspace
+        (`ws_off`) and the selections offset by it (`idx`, `_attn_ctx`). A run of requests
+        each past the workspace's rows is a decode group (`n_kv` None): its rows' sub-batches
+        of at most `_CTX_DECODE_ROWS`, on one FlashMLA scheduler per sub-batch size (`sched`),
+        filled by its first call and shared by the step's layers."""
+        room = self.core.ctx_workspace_rows
         n = step["num_contexts"]
         # Under KV reuse a context request attends over its cached prefix and its new tokens.
         kv, new = step["host_cu_ctx_kv"], step["host_cu_ctx_new"]
@@ -1607,8 +1660,8 @@ class PrefillTarget:
         r0 = 0
         while r0 < n:
             r1 = r0 + 1
-            if kv[r1] - kv[r0] > held:
-                while r1 < n and kv[r1 + 1] - kv[r1] > held:
+            if kv[r1] - kv[r0] > room:
+                while r1 < n and kv[r1 + 1] - kv[r1] > room:
                     r1 += 1
                 rows = new[r1] - new[r0]
                 bounds = [
@@ -1617,11 +1670,11 @@ class PrefillTarget:
                 ]
                 sizes.update(hi - lo for lo, hi in bounds)
                 groups.append(
-                    SimpleNamespace(rows=(new[r0], new[r1]), ws_buf=None, sub_batches=bounds)
+                    SimpleNamespace(rows=(new[r0], new[r1]), n_kv=None, sub_batches=bounds)
                 )
                 r0 = r1
                 continue
-            while r1 < n and kv[r1 + 1] - kv[r0] <= held:
+            while r1 < n and kv[r1 + 1] - kv[r0] <= room:
                 r1 += 1
             n_kv = kv[r1] - kv[r0]
             kv_req = torch.repeat_interleave(
@@ -1630,7 +1683,6 @@ class PrefillTarget:
                 output_size=n_kv,
             )
             kv_pos = (torch.arange(kv[r0], kv[r1], device=dev) - cu[:-1][kv_req]).to(torch.int32)
-            keep = r0 == 0 and r1 == n and 2 * n_kv <= held
             groups.append(
                 SimpleNamespace(
                     rows=(new[r0], new[r1]),
@@ -1638,41 +1690,51 @@ class PrefillTarget:
                     kv_pos=kv_pos,
                     ws_off=(cu[:-1] - kv[r0]).to(torch.int32) if r1 - r0 > 1 else None,
                     idx=None,
-                    ws_buf=self._ws_buf[:n_kv],
-                    kept=self._ws_buf[n_kv : 2 * n_kv] if keep else None,
-                    ws={},
+                    n_kv=n_kv,
                 )
             )
             r0 = r1
         logger.debug(
-            f"modeling_v2 Mistral Large 4 NVFP4: context KV {kv[n]} over the held {held} rows: "
+            f"modeling_v2 Mistral Large 4 NVFP4: context KV {kv[n]} over the workspace's {room} "
+            "rows: "
             + ", ".join(
                 f"rows {g.rows[0]}..{g.rows[1]} "
                 + (
                     f"decode ({len(g.sub_batches)} sub-batches)"
-                    if g.ws_buf is None
-                    else f"workspace ({g.ws_buf.shape[0]} KV rows"
-                    + (", the shared source kept)" if g.kept is not None else ")")
+                    if g.n_kv is None
+                    else f"workspace ({g.n_kv} KV rows)"
                 )
                 for g in groups
             )
         )
-        return SimpleNamespace(
-            groups=groups,
-            sched={rows: get_mla_metadata()[0] for rows in sizes},
-            own_out=len(groups) == 1 and groups[0].ws_buf is not None and step["num_tokens"] == tc,
-        )
+        return SimpleNamespace(groups=groups, sched={rows: get_mla_metadata()[0] for rows in sizes})
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, ctx, tc, skip_ctx, skip_gen):
-        """One layer's attention block, both phases, into `s.attn_out` (returned): the query
-        with SSMax, the indexer's selection, the absorbed query, the owner's rope and
+        """One layer's attention block, both phases, into the attention output (returned): the
+        query with SSMax, the indexer's selection, the absorbed query, the owner's rope and
         fp8_ds_mla append, sparse MLA over the context and the generation rows, and the V
-        up-projection."""
+        up-projection.
+
+        The layer's absorbed query (bf16 `[rows, 64, 576]`, every head written) and, on a step
+        with context rows, its context workspace (bf16 `[core.ctx_workspace_rows, 576]`) are one
+        allocation, and the attention output reuses the query's first bytes as the sparse MLA
+        reads them; it lives until `forward` has projected the output, so the MLP's buffers
+        reuse the memory. Every context step allocates the whole workspace, whatever its groups
+        need: the engine's KV-capacity estimate runs context steps as its profiling forward and
+        sizes the pool after their peak memory (`KvCacheCreator.configure_kv_cache_capacity`),
+        so the peak it measures is the largest a step allocates. Each context group's latent
+        output (`_attn_ctx`) and the generation rows' are projected as soon as they are written,
+        none larger than the profiled step's one group."""
         core = self.core
         rows = x.shape[0]
+        # Every head of the absorbed query is written below: no head is left for a zero.
+        assert core.heads == _FLASH_MLA_HEADS, core.heads
+        q_size = rows * _FLASH_MLA_HEADS * core.lat_dim
+        ws_size = core.ctx_workspace_rows * core.lat_dim if tc else 0
+        buf = torch.empty([q_size + ws_size], dtype=torch.bfloat16, device=x.device)
+        fq = buf[:q_size].view(rows, _FLASH_MLA_HEADS, core.lat_dim)
         q = self._linear_fp8(x, L.wq, L.wq_s)
         q3 = torch.reshape(q, [rows, core.heads, core.qk_dim])
-        fq = s.fused_q[:, : core.heads]
         if core.unfused_glue:
             q3 = ssmax_scaling(q3, pos, L.ssmax_s, L.ssmax_b)
             if L.rope:
@@ -1690,6 +1752,8 @@ class PrefillTarget:
             torch.transpose(q3[..., : L.nope], 0, 1), L.k_b,
             torch.transpose(fq[..., : core.kv_lora], 0, 1),
         )  # fmt: skip
+        # Read for the last time: freed before the workspace is gathered.
+        del q, q3
         if L.owner:
             # Every row's latent, context and generation, before either phase reads the pool;
             # the query tail is roped in the same call.
@@ -1697,25 +1761,23 @@ class PrefillTarget:
                 self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
                 step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
             )  # fmt: skip
-        lat_out = s.lat_out
+        # A row of the attention output (64 x 128) lies in the absorbed query's bytes of that
+        # row and the ones before it (64 x 576 a row), all read before the row is projected.
+        attn_out = buf[: rows * core.heads * core.v_dim].view(rows, core.heads * core.v_dim)
         if tc:
-            lat_ctx = self._attn_ctx(
-                step, L, s.fused_q[:tc], s.lat_out[:tc], req_idx, topk_buf, ctx
-            )
-            if ctx.own_out:
-                lat_out = lat_ctx
+            ws_rows = buf[q_size:].view(core.ctx_workspace_rows, core.lat_dim)
+            self._attn_ctx(step, L, fq[:tc], attn_out[:tc], req_idx, topk_buf, ctx, ws_rows)
         if rows > tc:
             slots = convert_req_index_to_global(
                 req_idx[tc:], step["block_table"], topk_buf[tc:], step["tokens_per_block"],
                 core.idx_topk, core._stride_factor, core._pool_row[L.kv_source],
             )  # fmt: skip
-            self._attn_gen(step, L, s.fused_q[tc:], s.lat_out[tc:], slots, s.sched)
-        bmm_out(
-            torch.transpose(lat_out, 0, 1),
-            L.v_b_t,
-            torch.transpose(torch.reshape(s.attn_out, [rows, core.heads, core.v_dim]), 0, 1),
-        )
-        return s.attn_out
+            lat = torch.empty(
+                [rows - tc, core.heads, core.kv_lora], dtype=torch.bfloat16, device=x.device
+            )
+            self._attn_gen(step, L, fq[tc:], lat, slots, s.sched)
+            self._v_up(L, lat, attn_out[tc:])
+        return attn_out
 
     def dspark_forward(
         self,
@@ -1891,8 +1953,8 @@ class DecodeTarget:
         `world_size * max_num_tokens` of them, so the expert calls' chunking is this target's
         too. While no rank holds more than the workspace (`_one_shot`, every captured decode
         graph) the reduce-scatter is the one-shot kernel that also adds the shared expert and
-        `residual` (in place) and applies the next layer's norm; past it, NCCL and the adds and
-        norm as separate ops."""
+        `residual` (in place) and applies the next layer's norm; past it, the alltoall or NCCL
+        (`_alltoall`) and the adds and norm as separate ops."""
         core = self.core
         m = L.moe
         side = core._side_stream
@@ -1900,16 +1962,15 @@ class DecodeTarget:
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        routed_all = _routed_experts(
-            core, m, _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        )
+        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
         if _one_shot(core, counts):
             main.wait_stream(side)
             x = lamport_moe_combine(
                 routed_all, shared, residual, L.next_norm, core.eps, counts, core.moe_comm
             )
             return x, residual
-        routed = _nccl_combine(core, routed_all, counts)
+        routed = _combine(core, routed_all, counts)
         main.wait_stream(side)
         residual = torch.add(residual, torch.add(routed, shared))
         return flashinfer_rmsnorm(residual, L.next_norm, core.eps), residual

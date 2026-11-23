@@ -8,9 +8,12 @@ and weights unpadded, runs its expert window (32 experts at four ranks, 16 at ei
 gathered rows in calls of at most `_EXPERT_CALL_TOKENS[world]` rows (or
 `_EXPERT_CALL_TOKENS_CHUNKED[world]` under chunked prefill), and reduce-scatters the partials
 back, adding the shared expert -- through the one-shot kernels while no rank holds more than
-`_ONE_SHOT_ROWS` rows, through NCCL past it; the decode target's one-shot combine also adds the
-residual and applies the next layer's norm. A gather or combine defect raises nothing: the
-collectives move rows, and every rank simply gets other rows.
+`_ONE_SHOT_ROWS` rows; past it, at four ranks through the alltoall (each rank's rows only to the
+ranks holding their experts, the window over the `world * max(counts)` rows of the receive
+layout, the partials summed back on each row's own rank), at eight through NCCL. The decode
+target's one-shot combine also adds the residual and applies the next layer's norm. A gather or
+combine defect raises nothing: the collectives move rows, and every rank simply gets other
+rows.
 
 On layer 1 of Mistral-Large-4-1T-A52B-NVFP4 itself (its router, its shared expert, each rank's
 own window of its routed experts, laid out by the dep4 weight table's own manifest rows), every
@@ -21,8 +24,8 @@ with a zero residual, so its new residual is the layer's output itself, and its 
 compared with the fp64 norm of the reference.
 
 Cases, per world: unequal counts on the one-shot path (ranks prefilling beside ranks decoding
-and the one-row dummy), the one-shot path at its workspace, unequal counts on the NCCL path,
-equal counts on the NCCL path, and the gathered maximum (one rank at max_num_tokens); and
+and the one-row dummy), the one-shot path at its workspace, unequal counts past it, equal counts
+past it (at world 4 at two sizes), and the gathered maximum (one rank at max_num_tokens); and
 captured decode graphs (every rank decoding the same batch, 1, 16, 64 and 128 rows: one row per
 request or DSpark's four, at batches up to 32), captured once and replayed on new tokens.
 
@@ -31,11 +34,15 @@ before routing moved ahead of the gather (the router, the routing and the NVFP4 
 the gathered bf16 rows): the codes and scales bit for bit (the one-shot gather stores the 16-bit
 word 0x8000, an e2m1 -0 code beside three +0 codes, as +0), the expert ids equal except in rows
 whose 4th and 5th router logits are within `TIE` of each other, and the count of rows whose bf16
-weights differ in any bit is reported. The router GEMM's tactic depends on its row count.
+weights differ in any bit is reported. The router GEMM's tactic depends on its row count. On the
+alltoall, whose receive layout holds only the rows routed to each rank, each rank's own rows are
+checked so as they enter the dispatch; the alltoall moves them as bytes, which the comm matrix
+certifies.
 
 The gate is the runner entry's, against the row's scale: 16 bf16 ulp per element, 2 ulp relative
 RMS; near-tie rows are not compared. One defect is shown to land far outside it: the combine
-handed the partial rolled by one rank's block.
+handed the partial rolled by one rank's block (on the alltoall, one source block of its
+payload).
 
 The ranks are MPI ranks, as the engine's are: the four-rank test starts `mpirun -n 4` over the
 first four visible devices; the eight-rank test runs in each of eight ranks a launcher started
@@ -72,8 +79,9 @@ CASES = {
     4: (
         ("one-shot unequal", (300, 1, 16, 257), ("prefill", "decode", "decode", "prefill")),
         ("one-shot workspace", (512, 1, 64, 3), ("prefill", "decode", "decode", "decode")),
-        ("nccl unequal", (1003, 1, 16, 257), ("prefill", "decode", "decode", "prefill")),
-        ("nccl equal", (600, 600, 600, 600), ("prefill", "prefill", "decode", "prefill")),
+        ("alltoall unequal", (1003, 1, 16, 257), ("prefill", "decode", "decode", "prefill")),
+        ("alltoall equal", (600, 600, 600, 600), ("prefill", "prefill", "decode", "prefill")),
+        ("alltoall equal 2560", (2560,) * 4, ("prefill", "decode", "prefill", "prefill")),
         ("gathered maximum", (32768, 1, 16, 9001), ("prefill", "decode", "decode", "prefill")),
     ),
     8: (
@@ -217,15 +225,16 @@ def _layer(M, p: dict, window: dict, next_norm: torch.Tensor) -> SimpleNamespace
     )
 
 
-def _target(M, kind: str, d, rank: int, world: int, side, call: int, ws) -> object:
+def _target(M, kind: str, d, rank: int, world: int, side, call: int, ws, a2a) -> object:
     """The target class `kind` over the surface `_moe` reads off the core, on the MPI-session
-    communicator (`dp_pg` None, as the core holds it under MPI), in expert calls of `call`."""
+    communicator (`dp_pg` None, as the core holds it under MPI), in expert calls of `call`, with
+    the alltoall `a2a` (None at eight ranks)."""
     target = object.__new__(M.PrefillTarget if kind == "prefill" else M.DecodeTarget)
     target.core = SimpleNamespace(
         hidden=6144, eps=EPS, topk=4, num_experts=d.num_experts, moe_inter=d.moe_inter,
         expert_offset=d.expert_offset, local_experts=d.local_experts, expert_call_tokens=call,
         expert_tune_tokens=call, dp_group=list(range(world)), dp_rank=rank, dp_pg=None,
-        _side_stream=side, moe_comm=ws,
+        _side_stream=side, moe_comm=ws, moe_a2a=a2a,
     )  # fmt: skip
     return target
 
@@ -283,6 +292,7 @@ def _deviation(out: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
 def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
     """One rank's body under MPI. Returns the rank's gate failures; raises on anything else."""
     from tensorrt_llm._utils import mpi_comm, mpi_rank
+    from tensorrt_llm.mapping import Mapping
 
     M, W = _modules()
     call = getattr(M, EXPERT_CALLS[engine])[world]
@@ -304,7 +314,14 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
     ref_windows = {w: _layer(M, p, windows[w], next_norm).moe for w in sorted(windows)}
     side = torch.cuda.Stream()
     ws = M.build_moe_comm_workspace(6144, M._ONE_SHOT_ROWS, rank, world)
-    shared_of = _target(M, "prefill", d, rank, world, side, call, ws)._dense
+    a2a = None
+    if world == M._A2A_WORLD:
+        mapping = Mapping(world_size=world, rank=rank, tp_size=world, moe_ep_size=world,
+                          enable_attention_dp=True)  # fmt: skip
+        rows = max(max(counts) for _, counts, _ in CASES[world])
+        a2a = M.build_moe_alltoall(mapping, d.num_experts, 4, rows, 6144)
+    paths = SimpleNamespace(moe_comm=ws, moe_a2a=a2a)
+    shared_of = _target(M, "prefill", d, rank, world, side, call, ws, a2a)._dense
     # Activations at the amax the layer's static input scale was calibrated for.
     scale = E4M3_MAX * E2M1_MAX * float(p["isc1"]) / 5
     failures = []
@@ -323,7 +340,7 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
         """The gathered inputs against the computation over the gathered bf16 rows."""
         codes, scales, ids, weights = got
         r_codes, r_scales, r_ids, r_weights = want
-        if M._one_shot(SimpleNamespace(moe_comm=ws), counts):
+        if M._one_shot(paths, counts):
             r_codes = r_codes.clone()
             words = r_codes.view(torch.int16)
             words.masked_fill_(words == -32768, 0)
@@ -341,17 +358,18 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
     def round_trip(name, counts, kinds, x, roll=False):
         lo = sum(counts[:rank])
         own = x[lo : lo + counts[rank]].contiguous()
-        target = _target(M, kinds[rank], d, rank, world, side, call, ws)
+        target = _target(M, kinds[rank], d, rank, world, side, call, ws, a2a)
         runner, dispatch = M.fp4_block_scale_moe_runner, M._dispatch
-        combine, rs = M.lamport_moe_combine, M.reducescatter
-        calls, gathered = [], []
+        combine, rs, a2a_combine = M.lamport_moe_combine, M.reducescatter, M.a2a_moe_combine
+        calls, gathered, sent = [], [], []
 
         def counted(*args, **kwargs):
             calls.append(args[2].shape[0])
             return runner(*args, **kwargs)
 
-        def seen(*args, **kwargs):
-            gathered.append(dispatch(*args, **kwargs))
+        def seen(core, inputs, counts_):
+            sent.append(tuple(t.clone() for t in inputs))
+            gathered.append(dispatch(core, inputs, counts_))
             return gathered[-1]
 
         def rolled_combine(partial, *args, **kwargs):
@@ -360,9 +378,15 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
         def rolled_rs(partial, *args, **kwargs):
             return rs(torch.roll(partial, -counts[0], 0), *args, **kwargs)
 
+        def rolled_a2a(partial, *args, **kwargs):
+            # The payload is read in place in the workspace: roll it there by one source block.
+            partial.copy_(torch.roll(partial, -(partial.shape[0] // world), 0))
+            return a2a_combine(partial, *args, **kwargs)
+
         M.fp4_block_scale_moe_runner, M._dispatch = counted, seen
         if roll:
             M.lamport_moe_combine, M.reducescatter = rolled_combine, rolled_rs
+            M.a2a_moe_combine = rolled_a2a
         try:
             if kinds[rank] == "prefill":
                 out = target._moe(own, L, counts)
@@ -373,30 +397,36 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
         finally:
             M.fp4_block_scale_moe_runner, M._dispatch = runner, dispatch
             M.lamport_moe_combine, M.reducescatter = combine, rs
+            M.a2a_moe_combine = a2a_combine
         torch.cuda.synchronize()
-        total = sum(counts)
+        total = world * max(counts) if M._alltoall(paths, counts) else sum(counts)
         expected = [min(call, total - lo) for lo in range(0, total, call)]
         if calls != expected:
             failures.append(f"{name}: expert calls {calls}, expected {expected}")
-        return out, norm, gathered[0]
+        return out, norm, gathered[0], sent[0]
 
     for seed, (name, counts, kinds) in enumerate(CASES[world]):
         x = _tokens(sum(counts), seed, scale)
-        out, norm, got = round_trip(name, counts, kinds, x)
+        out, norm, got, own_inputs = round_trip(name, counts, kinds, x)
         ref, tie, want = _reference(M, x, L, ref_windows, offsets, lambda t: shared_of(t, L), call)
-        check_gathered(name, counts, got, want, tie)
         lo = sum(counts[:rank])
         mine = slice(lo, lo + counts[rank])
+        if M._alltoall(paths, counts):
+            total = sum(counts)
+            own_want = tuple(t.view(total, -1)[mine] for t in want)
+            check_gathered(name, counts, own_inputs, own_want, tie[mine])
+        else:
+            check_gathered(name, counts, got, want, tie)
         gate(name, out, ref[mine], ~tie[mine])
         if norm is not None:
             gate(f"{name} norm", norm, _rmsnorm64(ref[mine], next_norm), ~tie[mine])
         del x, out, ref
 
     # The defect the comparison must see: every rank's combine handed the partial rolled by one
-    # rank's block, on the one-shot path and on the NCCL path.
+    # rank's block, on the one-shot path and past it (the alltoall at four ranks, NCCL at eight).
     for name, counts, kinds in (CASES[world][0], CASES[world][-2]):
         x = _tokens(sum(counts), 5, scale)
-        out, _, _ = round_trip(name, counts, kinds, x, roll=True)
+        out, _, _, _ = round_trip(name, counts, kinds, x, roll=True)
         ref, tie, _ = _reference(M, x, L, ref_windows, offsets, lambda t: shared_of(t, L), call)
         lo = sum(counts[:rank])
         keep = ~tie[lo : lo + counts[rank]]
@@ -408,7 +438,7 @@ def _run_rank(ck: Path, world: int, engine: str) -> list[str]:
     # CUDA graphs: every rank decoding the same batch, captured once, replayed on new tokens.
     for b in GRAPH_BATCHES:
         counts = (b,) * world
-        target = _target(M, "decode", d, rank, world, side, call, ws)
+        target = _target(M, "decode", d, rank, world, side, call, ws, a2a)
         static = torch.zeros(b, 6144, dtype=torch.bfloat16, device="cuda")
         residual = torch.zeros_like(static)
         warm = torch.cuda.Stream()

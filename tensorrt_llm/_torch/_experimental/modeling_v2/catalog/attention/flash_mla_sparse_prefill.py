@@ -16,6 +16,8 @@ KERNEL_HEADS = (64, 128)
 #: The tep4, dep4 and tep8 targets' bounded context workspace at max_seq_len 1048576:
 #: B = 2**19 bf16 rows.
 _WS_ROWS = 2**19
+#: The sm_107 dep4 target's at max_seq_len 1048576: one request at max_seq_len, 2**20 rows.
+_WS_ROWS_MAX = 2**20
 #: The row sweep's pre-merge share of the 32768 query row counts: 1..65, 2**k - 1, 2**k and
 #: 2**k + 1 up to 32768, every 4093rd count, and 32736 (a chunk with generation rows behind).
 _ROW_SAMPLE = tuple(
@@ -503,6 +505,36 @@ class FlashMlaSparsePrefill(OpWrapper):
                 dense=True,
             ),
         ),
+        # The sm_107 dep4 target's workspace at max_seq_len 1048576 holds 2**20 rows, so a
+        # request at max_seq_len takes it whole.
+        Cell(
+            why="dep4 sm_107 2**20 workspace, 64 live heads: a 16384-row chunk at cached 1032192 "
+            "selects over all 2**20 rows",
+            spec=dict(
+                rows=16384,
+                kv_len=[1048576],
+                new=[16384],
+                h_q=64,
+                h_out=64,
+                topk=2048,
+                kv_rows=_WS_ROWS_MAX,
+                selection="topk",
+            ),
+        ),
+        Cell(
+            why="dep4 sm_107 2**20 workspace, 64 live heads: two requests of 524288 KV rows, the "
+            "second's run at offsets 524288..1048575",
+            spec=dict(
+                rows=16384,
+                kv_len=[524288, 524288],
+                new=[8192, 8192],
+                h_q=64,
+                h_out=64,
+                topk=2048,
+                kv_rows=_WS_ROWS_MAX,
+                selection="topk",
+            ),
+        ),
         # The 1M landing's workspace steps outside the cells above: chunk k of a 1M prompt is
         # 32768 rows behind 32768 * (k - 1) cached keys over N = 32768 * k rows, k = 2..15
         # (chunk 1 and chunk 16 at N = 2**19 are cells above; past 2**19 the decode path).
@@ -830,6 +862,12 @@ class FlashMlaSparsePrefill(OpWrapper):
     tokens only, say) therefore drops selections with no error and no NaN; the call cannot
     refuse it without a device sync, so `is_valid` does not.
 
+    sm_107 dep4 at max_seq_len 1048576 (the `kv_rows` 2**20 cells): as dep4 above, over a
+    workspace of 2**20 rows instead, so a request at max_seq_len (its chunks behind up to
+    1032192 cached keys) and a group of requests whose KV together fits it take this path;
+    the sparse decode over the pool takes only a request past 2**20 rows. kv's index stays
+    below 2**20, half the kernel's 1152-byte offset limit.
+
     tep8 at max_seq_len 1048576 (the `kv_rows` cells): `PrefillTarget._attn_ctx` calls it
     once per layer, eager, on a step whose context KV fits the bounded workspace of 2**19
     rows. q is the step's context rows of the [T, 64, 576] fused_q scratch (this rank's 8
@@ -884,8 +922,9 @@ class FlashMlaSparsePrefill(OpWrapper):
       indices     rows x topk int32 offset      2**31 at 1048576 rows          not reached
       kv          index x 1152 bytes            2**31 at index 1864136         not reached:
                   index x 576 elements          2**31 at index 3728271         the workspace
-                                                path stops at N = 2**19, indices to 524287
-                                                read and passed
+                                                path stops at N = 2**19 (2**20 on the sm_107
+                                                dep4 target), indices to 1048575 read and
+                                                passed on sm_107
       indices     through fp32                  2**24 + 1                      not reached
                                                 (largest 524287)
     Not certified: h_q 128 at these shapes, kv past 2**19 rows (the target takes the
