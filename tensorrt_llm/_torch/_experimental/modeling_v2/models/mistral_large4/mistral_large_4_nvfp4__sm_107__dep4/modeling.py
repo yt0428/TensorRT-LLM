@@ -230,6 +230,7 @@ from .ops.comm.lamport_moe_combine import lamport_moe_combine
 from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
 from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 from .ops.gemm.mla_v_up_fp8_block_scale_linear import mla_v_up_fp8_block_scale_linear
+from .ops.moe.moe_finalize import moe_finalize
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -561,17 +562,21 @@ def _partial_out(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]):
     return None
 
 
-def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) -> torch.Tensor:
+def _routed_experts(
+    core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None, finalize: bool = False
+) -> torch.Tensor:
     """This rank's expert window over every dispatched row, in calls of at most
     `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial: `out`
     when given (`_partial_out`), else a fresh one. A row whose experts all lie outside the
-    window, or whose ids are all -1, comes back +0.0."""
+    window, or whose ids are all -1, comes back +0.0. With `finalize` each call returns the
+    runner's permuted output and `moe_finalize` sums its rows: the runner's own finalize,
+    bitwise, in a faster launch at the decode step's gathered rows."""
     codes, scales, ids, weights = gathered
     total = codes.shape[0]
     sf_row = scales.numel() // total
     call = core.expert_call_tokens
     routed_all = out
-    if out is None and total > call:
+    if out is None and (total > call or finalize):
         routed_all = codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
     for lo in range(0, total, call):
         hi = min(lo + call, total)
@@ -579,11 +584,16 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) 
             None, None, codes[lo:hi], scales[lo * sf_row : hi * sf_row].view(torch.float8_e4m3fn),
             m.fc1_w, m.fc1_s, None, None, None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate,
             m.out2, core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
-            core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
+            core.local_experts, None, _MOE_ROUTING_METHOD, not finalize, _MOE_ACT_SWIGLU,
             topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
             tune_max_num_tokens=core.expert_tune_tokens,
-            output=None if out is None else out[lo:hi],
-        )[0]  # fmt: skip
+            output=None if out is None or finalize else out[lo:hi],
+        )  # fmt: skip
+        if finalize:
+            permuted, _, idx = part
+            moe_finalize(permuted, idx, weights[lo:hi], routed_all[lo:hi])
+            continue
+        part = part[0]
         if out is not None:
             continue
         if routed_all is None:
@@ -1963,7 +1973,7 @@ class DecodeTarget:
         with torch.cuda.stream(side):
             shared = self._dense(o, L)
         gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts), finalize=True)
         if _one_shot(core, counts):
             main.wait_stream(side)
             x = lamport_moe_combine(
