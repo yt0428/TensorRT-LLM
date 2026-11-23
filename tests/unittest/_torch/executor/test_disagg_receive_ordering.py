@@ -58,6 +58,7 @@ def _manager() -> Mock:
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
     manager._has_cp_helix = False
+    manager._disk_tier_enabled = False
     manager.num_extra_kv_tokens = 0
     manager.kv_cache_map = {}
     manager.prepare_context_cache.return_value = 0

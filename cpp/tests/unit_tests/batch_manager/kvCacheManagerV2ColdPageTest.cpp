@@ -459,6 +459,10 @@ TEST_F(KvCacheManagerV2DiskIoTest, OnboardingReadsHoldNoStream)
     ASSERT_EQ(pages.size(), 2u);
     pressure(kHotLevel);
     pressure(kHostLevel);
+    // The evictions wrote the pages out fenced, so the reads below wait on those writes' events. Let the
+    // writes land before holding new I/O back.
+    engine().drain();
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     engine().setPausedForTest(true);
     auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
