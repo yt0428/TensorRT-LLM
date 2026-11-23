@@ -1797,7 +1797,15 @@ void StorageManager::maintainHostReserve()
         }
         if (anyShortfall)
         {
-            evictForHostReserve(level, shortfall, writesBacklogged);
+            try
+            {
+                evictForHostReserve(level, shortfall, writesBacklogged);
+            }
+            catch (OutOfPagesError const&)
+            {
+                // The level below cannot take the pages, e.g. held pages that a full disk tier has no
+                // room for. The eviction was rolled back; the reserve is best effort.
+            }
         }
     }
 }

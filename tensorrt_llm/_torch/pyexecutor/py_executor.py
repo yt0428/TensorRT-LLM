@@ -4319,9 +4319,11 @@ class PyExecutor:
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
-        self._pad_attention_dp_dummy_request()
-
+        # Before the attention-DP padding, which must see requests held back for onboarding as
+        # unschedulable.
         self._prefetch_for_context_requests()
+
+        self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
             # Honor permanent disable flag based on rolling acceptance first
