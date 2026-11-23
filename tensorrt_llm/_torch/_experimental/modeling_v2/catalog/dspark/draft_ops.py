@@ -28,8 +28,29 @@ _ATTN_SPLITS_FEW = 32
 _ATTN_SPLITS_MANY = 8
 _ATTN_FEW_SEQUENCES = 4
 _ATTN_WARPS = 4
+#: At 64 heads (dep4) a sequence's 192 query rows take 32-row programs: (rows, key tile, splits,
+#: warps, stages) for up to the given number of sequences, each the fastest of 144
+#: configurations on VR200 over contexts of 120k to 150k keys. Measured at 1/4/8/16/32 sequences:
+#: 8.8, 19.3, 34.3, 58.4 and 110.4 us; the 16-head configuration took 12.7, 41.2, 45.0, 98.5 and
+#: 209.3 us.
+_ATTN_64_HEADS = (
+    (2, (16, 128, 16, 4, 2)),
+    (4, (32, 64, 8, 8, 3)),
+    (8, (32, 32, 8, 4, 3)),
+    (None, (32, 128, 2, 8, 3)),
+)
 #: The Markov logit add and argmax read the vocabulary in chunks of this many columns.
 _ARGMAX_BLOCK = 4096
+
+
+def _attn_config(batch: int, heads: int) -> tuple[int, int, int, int, int | None]:
+    """(rows per program, key tile, window splits, warps, stages or None for Triton's default)."""
+    if heads == 64:
+        for most, config in _ATTN_64_HEADS:
+            if most is None or batch <= most:
+                return config
+    splits = _ATTN_SPLITS_FEW if batch <= _ATTN_FEW_SEQUENCES else _ATTN_SPLITS_MANY
+    return _ATTN_ROWS, _ATTN_BLOCK_T, splits, _ATTN_WARPS, None
 
 
 def _rotate(x: torch.Tensor, table: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -59,10 +80,11 @@ class TritonDraftAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
     note = """
-    The window is a multiple of 16 * 64 keys; heads 16 (tp4), 8 (tp8) or 64 (dep4); the pool's
-    last dim contiguous. A masked key loads as zero, so pool rows past a sequence's length may
-    hold any bits, NaN included. The split counts were measured at 16 heads; at 64 heads a
-    sequence's 192 query rows take 12 CTAs of 16 rows per split, each reading the split's keys.
+    The window is a multiple of 16 * 64 keys (of 16 * 128 at 64 heads); heads 16 (tp4), 8 (tp8)
+    or 64 (dep4); the pool's last dim contiguous. A masked key loads as zero, so pool rows past a
+    sequence's length may hold any bits, NaN included. The 16- and 8-head launch shares one split
+    table, measured at 16 heads; 64 heads take their own (`_ATTN_64_HEADS`): 32-row programs over
+    fewer, longer splits, so fewer programs read each split's keys.
     """
     #: A decode step's draft block: 3 query rows per sequence, up to 16 sequences a rank at
     #: tp4/tp8 and up to 32 (the decode graph's largest batch) at dep4.
@@ -107,20 +129,21 @@ class TritonDraftAttention(OpWrapper):
         batch, block, heads, _ = query.shape
         qrows = block * heads
         page = pool.shape[1]
-        nsplit = _ATTN_SPLITS_FEW if batch <= _ATTN_FEW_SEQUENCES else _ATTN_SPLITS_MANY
+        rows_per, block_t, nsplit, warps, stages = _attn_config(batch, heads)
         splits = nsplit + 1
         partial_max = query.new_empty((batch, splits, qrows), dtype=torch.float32)
         partial_sum = torch.empty_like(partial_max)
         partial_out = query.new_empty((batch, splits, qrows, LAT), dtype=torch.float32)
         out = query.new_empty((batch, block, heads, LAT))
-        grid = (batch, splits, triton.cdiv(qrows, _ATTN_ROWS))
+        grid = (batch, splits, triton.cdiv(qrows, rows_per))
+        launch = {} if stages is None else dict(num_stages=stages)
         _kernels.draft_attention_partial_kernel[grid](
             query, pool, pool.stride(0), pool.stride(1), page_table, page_table.stride(0),
             table_rows, lengths, block_kv, partial_max, partial_sum, partial_out, float(scale),
             page_table.shape[1] * page - 1,
             PAGE=page, WINDOW=window, BLOCK=block, QROWS=qrows, NSPLIT=nsplit,
-            BLOCK_T=_ATTN_BLOCK_T, ROWS=_ATTN_ROWS, LAT=LAT, PE=PE, num_warps=_ATTN_WARPS,
-            enable_fp_fusion=False,
+            BLOCK_T=block_t, ROWS=rows_per, LAT=LAT, PE=PE, num_warps=warps,
+            enable_fp_fusion=False, **launch,
         )  # fmt: skip
         _kernels.draft_attention_combine_kernel[(batch * qrows,)](
             partial_max, partial_sum, partial_out, out, QROWS=qrows, SPLITS=splits, LAT=LAT,
