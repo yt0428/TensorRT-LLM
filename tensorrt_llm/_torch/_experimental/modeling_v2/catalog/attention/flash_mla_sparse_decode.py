@@ -1533,8 +1533,8 @@ class FlashMlaSparseDecode(OpWrapper):
     sequences of 4 rows, 64 heads, four dummies) and a graph captured on one sched meta
     replays bitwise an eager call when the lengths change between replays (tested). On
     sm_107 at a dep8 GEN rank's step (16 sequences x 4 rows, 12 of them of 72K-188K keys,
-    four dummies; 72 layers in one graph with the slot conversion), the group took 13.5%
-    less (4 captures each, interleaved; 38.3 -> 33.1 us a layer).
+    four dummies; 72 layers in one graph with the slot conversion), the group took 10.6%
+    less (4 captures each, interleaved, each within 0.04 us; 38.39 -> 34.32 us a layer).
 
     Hard limits (sm_103)
       rows          get_decoding_sched_meta takes 4 * (5 * rows + 1) bytes of dynamic
