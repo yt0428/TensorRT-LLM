@@ -92,7 +92,10 @@ class FlashMlaSparseDecode(OpWrapper):
     shared by every call of one step with the same rows, h_q and topk. Writes `out`
     (bf16 `[rows, h_out, 512]`, any strides) and returns it; with `out` None, returns the
     kernel's own `[rows, h_q, 512]` output (a view, no copy), whose first heads a caller
-    reads in place. At most `MAX_ROWS` rows.
+    reads in place. At most `MAX_ROWS` rows. `topk_length` (keyword, int32 `[rows]`, or
+    None for every row's whole `topk`): row r reads only `indices[r, :topk_length[r]]`,
+    which must hold all of its valid slots (FlashMLA's own argument; the scheduler sizes
+    each row's work by it, so a sched meta is shared only by calls with the same lengths).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -1518,6 +1521,21 @@ class FlashMlaSparseDecode(OpWrapper):
     sweep is large and a pre-merge share runs the 103 row counts of `_RAGGED_SHARE`; walked
     largest or smallest r first it reserved 7.91 GiB either way.
 
+    `topk_length`: the sm_107 dep4 decode step passes each row's selection length
+    (`_selection_lengths` in its modeling, min(end, 2048) of row t of a sequence of
+    `kv_len` keys and `next_n` rows, end = kv_len - next_n + t + 1), so a CUDA-graph padding
+    dummy's row (kv_len = next_n) or a short sequence's costs the scheduler and the kernel
+    its few keys' blocks instead of 32. That is exact only while the selection holds those
+    slots first and -1 after, which the dep4 target's selectors are tested to do
+    (`test_modeling_v2_decode_selection_lengths.py`). A row of length 0 (no key) returns
+    zeros either way. The lengths move the scheduler's split partition, so a row's output is
+    a reordering of the same fp32 sums (in the band, tested at the DSpark step shape: 16
+    sequences of 4 rows, 64 heads, four dummies) and a graph captured on one sched meta
+    replays bitwise an eager call when the lengths change between replays (tested). On
+    sm_107 at a dep8 GEN rank's step (16 sequences x 4 rows, 12 of them of 72K-188K keys,
+    four dummies; 72 layers in one graph with the slot conversion), the group took 13.5%
+    less (4 captures each, interleaved; 38.3 -> 33.1 us a layer).
+
     Hard limits (sm_103)
       rows          get_decoding_sched_meta takes 4 * (5 * rows + 1) bytes of dynamic
                     shared memory, against the device's opt-in 232448, which caps one
@@ -1564,6 +1582,8 @@ class FlashMlaSparseDecode(OpWrapper):
         sched_meta,
         softmax_scale: float,
         out: torch.Tensor | None,
+        *,
+        topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         rows, h_q = q.shape[0], q.shape[1]
         o, _ = _flash_mla_with_kvcache(
@@ -1576,6 +1596,7 @@ class FlashMlaSparseDecode(OpWrapper):
             softmax_scale=softmax_scale,
             is_fp8_kvcache=True,
             indices=indices.view(rows, 1, indices.shape[-1]),
+            topk_length=topk_length,
         )
         if out is None:
             return o[:, 0]
@@ -1590,17 +1611,21 @@ class FlashMlaSparseDecode(OpWrapper):
         sched_meta,
         softmax_scale: float,
         out: torch.Tensor | None,
+        *,
+        topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """fp32, exact dequantization, softmax over the valid slots; a new tensor shaped
-        like `out` (`[rows, h_q, 512]` when `out` is None), rounded to bf16 once. Ignores
+        """fp32, exact dequantization, softmax over the valid slots of each row's first
+        `topk_length` (all of them when None); a new tensor shaped like `out`
+        (`[rows, h_q, 512]` when `out` is None), rounded to bf16 once. Ignores
         `sched_meta`."""
         shape = (q.shape[0], q.shape[1], D_NOPE) if out is None else tuple(out.shape)
         h_out = shape[1]
         flat = kv_cache.view(torch.uint8).reshape(-1, ROW_BYTES)
         res = torch.zeros(shape, dtype=torch.float32, device=q.device)
         with true_fp32_matmul():
+            lengths = None if topk_length is None else topk_length.tolist()
             for r in range(q.shape[0]):
-                idx = indices[r]
+                idx = indices[r] if lengths is None else indices[r, : lengths[r]]
                 idx = idx[idx >= 0].long()
                 if idx.numel() == 0:
                     continue
@@ -1622,6 +1647,8 @@ class FlashMlaSparseDecode(OpWrapper):
         sched_meta,
         softmax_scale: float,
         out: torch.Tensor | None,
+        *,
+        topk_length: torch.Tensor | None = None,
     ) -> None:
         if q.shape[1] not in KERNEL_HEADS:
             raise ValueError(f"h_q {q.shape[1]} is not one of the kernel's {KERNEL_HEADS}")
@@ -1629,6 +1656,13 @@ class FlashMlaSparseDecode(OpWrapper):
             raise ValueError("out names more heads than q carries")
         if indices.dtype != torch.int32:
             raise ValueError("indices must be int32 slots")
+        if topk_length is not None and (
+            topk_length.dtype != torch.int32
+            or topk_length.shape != (q.shape[0],)
+            or not topk_length.is_contiguous()
+            or topk_length.device != q.device
+        ):
+            raise ValueError("topk_length must be a contiguous int32 [rows] tensor beside q")
         if kv_cache.shape[-1] != ROW_BYTES or kv_cache.dim() != 4 or kv_cache.shape[2] != 1:
             raise ValueError("kv_cache must be [pages, page_size, 1, 656]")
         if q.shape[0] > MAX_ROWS:
