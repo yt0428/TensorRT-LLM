@@ -128,6 +128,9 @@ class KVCacheV2IterationStatsReport:
     # Blocks the disk-prefetch mechanism actually migrated from disk to host during this
     # iteration. Counts prefetch movement only, not reuse hits served from disk.
     disk_prefetch_blocks: int = 0
+    # Disk tier I/O, host-reserve and onboarding counters for this iteration, keyed by their
+    # output names; empty without a disk tier.
+    disk_io: dict[str, float] = field(default_factory=dict)
     # Initial current-residency cached-token attribution for requests admitted during this
     # iteration, indexed by cache level so entry i is the i-th configured tier.
     cached_tokens_by_level: list[int] = field(default_factory=list)
@@ -226,6 +229,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
     stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
     stats_dict["iterDiskPrefetchBlocks"] = kv_iter_stats.disk_prefetch_blocks
+    if kv_iter_stats.disk_io:
+        stats_dict["iterDiskIo"] = dict(kv_iter_stats.disk_io)
     stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
     if kv_iter_stats.cache_level_tiers:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)

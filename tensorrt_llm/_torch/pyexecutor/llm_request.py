@@ -948,6 +948,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Set while the KV cache reads this request's reused prefix from disk; the scheduler
+        # leaves the request out of the batch until the reads land.
+        self.py_kv_onboard_pending = False
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
 

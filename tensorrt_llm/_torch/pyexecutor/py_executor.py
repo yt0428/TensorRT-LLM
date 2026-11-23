@@ -4142,26 +4142,38 @@ class PyExecutor:
 
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
-        """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
+        """Move reused disk blocks into host memory before their context requests run.
+
+        A request whose matched prefix has blocks on disk waits outside the batch
+        (``py_kv_onboard_pending``) until the reads land. Its forward pass then copies the
+        blocks from host, instead of making the whole step wait for the disk.
+        ``disk_prefetch_num_reqs`` bounds the requests onboarding at once.
+        """
         if not self._is_kv_manager_v2:
             return
-        if not self.kv_cache_manager.enable_block_reuse:
+        kv_cache_manager = self.kv_cache_manager
+        if not kv_cache_manager.enable_block_reuse:
             return
-        if self.kv_cache_manager.disk_prefetch_num_reqs <= 0:
+        if kv_cache_manager.disk_prefetch_num_reqs <= 0:
             return
-        max_prefetch = self.kv_cache_manager.disk_prefetch_num_reqs
-        candidates = []
-        for req in self.active_requests:
-            if len(candidates) >= max_prefetch:
-                break
-            if (req.is_first_context_chunk and req.py_request_id
-                    not in self.kv_cache_manager.kv_cache_map
-                    and req.py_request_id not in self._prefetched_request_ids):
-                candidates.append(req)
-                self._prefetched_request_ids.add(req.py_request_id)
+        for request in kv_cache_manager.poll_context_onboards():
+            request.py_kv_onboard_pending = False
 
-        if candidates:
-            self.kv_cache_manager.prefetch_for_context_tokens(candidates)
+        gate = kv_cache_manager.can_gate_context_onboards
+        budget = (kv_cache_manager.disk_prefetch_num_reqs -
+                  kv_cache_manager.num_context_onboards)
+        for req in self.active_requests:
+            if budget <= 0:
+                break
+            if (not req.is_first_context_chunk or req.is_dummy
+                    or req.is_disagg_generation_init_state
+                    or req.py_request_id in kv_cache_manager.kv_cache_map
+                    or req.py_request_id in self._prefetched_request_ids):
+                continue
+            self._prefetched_request_ids.add(req.py_request_id)
+            if kv_cache_manager.start_context_onboard(req):
+                budget -= 1
+                req.py_kv_onboard_pending = gate
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:

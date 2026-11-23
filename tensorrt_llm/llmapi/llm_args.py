@@ -5053,9 +5053,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
-        "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
-    )
+        "Maximum number of context requests that read their reused KV cache blocks from the disk tier "
+        "into host memory at once, before they are scheduled. Where each rank schedules its own "
+        "requests (attention TP 1, no PP or CP), such a request stays out of the batch until its "
+        "reads complete, so the disk latency is not added to the steps of other requests. "
+        "Set to 0 to disable: disk blocks are then read when the request is scheduled. "
+        "Only effective with KV cache manager v2 and block reuse enabled.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     fp8_context_mla_kv_len_cap: Optional[int] = Field(
