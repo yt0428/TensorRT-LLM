@@ -16,13 +16,17 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/cudaEvent.h"
 
+#include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -112,6 +116,129 @@ TEST(KvCacheManagerV2SlotAllocatorTest, RejectsSlotIdsOutsideThePool)
     EXPECT_TRUE(allocator.isValidSlotId(SlotId{0}));
     EXPECT_TRUE(allocator.isValidSlotId(SlotId{7}));
     EXPECT_FALSE(allocator.isValidSlotId(SlotId{8}));
+}
+
+// Events recorded on mStream stay pending until openGate(): the stream starts with a host function
+// that spins until the gate opens.
+class KvCacheManagerV2SlotAllocatorEventTest : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&mStream, cudaStreamNonBlocking), cudaSuccess);
+        ASSERT_EQ(cudaLaunchHostFunc(mStream, &waitForGate, &mGateOpen), cudaSuccess);
+    }
+
+    void TearDown() override
+    {
+        openGate();
+        EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        EXPECT_EQ(cudaStreamDestroy(mStream), cudaSuccess);
+    }
+
+    CachedCudaEvent pendingEvent() const
+    {
+        return CachedCudaEvent{reinterpret_cast<CudaStream>(mStream)};
+    }
+
+    // Lets the stream run and waits until every event recorded on it has completed.
+    void completeEvents()
+    {
+        openGate();
+        ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    }
+
+private:
+    void openGate()
+    {
+        mGateOpen.store(true);
+    }
+
+    static void CUDART_CB waitForGate(void* gate)
+    {
+        auto const& open = *static_cast<std::atomic<bool> const*>(gate);
+        while (!open.load())
+        {
+            std::this_thread::yield();
+        }
+    }
+
+    cudaStream_t mStream{};
+    std::atomic<bool> mGateOpen{false};
+};
+
+// A released slot whose event is still pending goes out after every never-issued id, and then only
+// together with that event, so its next user still waits for the previous one.
+TEST_F(KvCacheManagerV2SlotAllocatorEventTest, PendingSlotIsTakenLastWithItsEvent)
+{
+    SlotAllocator allocator{SlotCount{3}};
+    auto slots = allocateSlots(allocator, 1);
+    slots[0].readyEvent = pendingEvent();
+    CUevent const pending = slots[0].readyEvent.handle();
+    releaseSlots(allocator, slots);
+
+    auto fresh = allocator.allocateMultiple(SlotCount{2});
+    ASSERT_EQ(fresh.size(), 2U);
+    EXPECT_EQ(fresh[0].slotId(), SlotId{1});
+    EXPECT_EQ(fresh[1].slotId(), SlotId{2});
+
+    auto reused = allocateSlots(allocator, 1);
+    EXPECT_EQ(reused[0].slotId(), SlotId{0});
+    EXPECT_EQ(reused[0].readyEvent.handle(), pending);
+    EXPECT_FALSE(reused[0].readyEvent.queryComplete());
+
+    completeEvents();
+    releaseSlots(allocator, fresh);
+    releaseSlots(allocator, reused);
+    allocator.synchronize();
+}
+
+// release() leaves the event alone; the next allocation finds it complete, retires it and reuses the
+// slot ahead of a never-issued id.
+TEST_F(KvCacheManagerV2SlotAllocatorEventTest, AllocationRetiresEventsOfReleasedSlots)
+{
+    SlotAllocator allocator{SlotCount{2}};
+    auto slots = allocateSlots(allocator, 1);
+    slots[0].readyEvent = pendingEvent();
+    // Shares the event's payload, so it observes when the allocator retires the event.
+    CachedCudaEvent const observer = slots[0].readyEvent;
+    releaseSlots(allocator, slots);
+    completeEvents();
+    EXPECT_FALSE(observer.isClosed());
+
+    auto reused = allocateSlots(allocator, 1);
+    EXPECT_EQ(reused[0].slotId(), SlotId{0});
+    EXPECT_TRUE(reused[0].readyEvent.isClosed());
+    EXPECT_TRUE(observer.isClosed());
+
+    releaseSlots(allocator, reused);
+    allocator.synchronize();
+}
+
+// allocateMultiple() scrubs once for the batch and still hands out every completed recycled slot,
+// oldest first, before any never-issued id.
+TEST_F(KvCacheManagerV2SlotAllocatorEventTest, AllocateMultipleReusesCompletedSlotsFirst)
+{
+    SlotAllocator allocator{SlotCount{8}};
+    auto slots = allocateSlots(allocator, 4);
+    for (auto& slot : slots)
+    {
+        slot.readyEvent = pendingEvent();
+    }
+    releaseSlots(allocator, slots);
+    completeEvents();
+
+    auto reused = allocator.allocateMultiple(SlotCount{4});
+    ASSERT_EQ(reused.size(), 4U);
+    for (std::size_t i = 0; i < reused.size(); ++i)
+    {
+        EXPECT_EQ(reused[i].slotId(), SlotId{static_cast<SlotCount>(i)});
+        EXPECT_TRUE(reused[i].readyEvent.isClosed());
+    }
+
+    releaseSlots(allocator, reused);
+    allocator.synchronize();
 }
 
 } // namespace

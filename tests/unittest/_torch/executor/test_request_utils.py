@@ -12,10 +12,12 @@ This module tests:
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
@@ -134,6 +136,83 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+@pytest.mark.parametrize(
+    "make_tokens",
+    [
+        pytest.param(list, id="list"),
+        pytest.param(lambda t: np.asarray(t, dtype=np.int32), id="int32_ndarray"),
+        pytest.param(lambda t: np.asarray(t, dtype=np.int64), id="int64_ndarray"),
+        pytest.param(lambda t: np.asarray(t, dtype=np.int32)[::2], id="strided_int32_ndarray"),
+        pytest.param(lambda t: torch.tensor(t, dtype=torch.int32), id="int32_tensor"),
+    ],
+)
+def test_llm_request_takes_input_tokens_from_any_int_sequence(make_tokens) -> None:
+    tokens = list(range(1000, 1064))
+    source = make_tokens(tokens)
+    expected = list(source.tolist() if hasattr(source, "tolist") else source)
+
+    llm_request = LlmRequest(
+        request_id=1,
+        max_new_tokens=4,
+        input_tokens=source,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=False,
+    )
+
+    assert llm_request.get_tokens(0) == expected
+    assert llm_request.prompt_len == len(expected)
+
+
+def test_llm_request_copies_the_prompt_of_an_executor_request() -> None:
+    tokens = [5, 70000, 2**31 - 1, 0, 123]
+    executor_request = trtllm.Request(input_token_ids=tokens, max_tokens=4)
+
+    llm_request = LlmRequest(
+        request_id=1,
+        max_new_tokens=4,
+        input_tokens=executor_request,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=False,
+    )
+    del executor_request
+
+    assert llm_request.get_tokens(0) == tokens
+    assert llm_request.prompt_len == len(tokens)
+
+
+def test_llm_request_rejects_non_token_input() -> None:
+    with pytest.raises(TypeError):
+        LlmRequest(
+            request_id=1,
+            max_new_tokens=4,
+            input_tokens=None,
+            sampling_config=trtllm.SamplingConfig(),
+            is_streaming=False,
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4097])
+def test_executor_request_to_llm_request_keeps_prompt(num_tokens) -> None:
+    tokens = [(7 * i) % 200003 for i in range(num_tokens)]
+    executor_request = trtllm.Request(
+        input_token_ids=tokens,
+        max_tokens=4,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+
+    llm_request = executor_request_to_llm_request(
+        3,
+        executor_request,
+        child_req_ids=[4],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.get_tokens(0) == tokens
+    assert llm_request.orig_prompt_len == num_tokens
+    assert llm_request.child_requests[0].get_tokens(0) == tokens
+    assert executor_request.input_token_ids == tokens
 
 
 def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:

@@ -188,7 +188,12 @@ public:
     void synchronize();
 
 private:
+    // Advances the ready prefix of mRecycledSlots past slots whose events have completed, retiring
+    // those events. Stops at the first pending event.
     void scrubEvents();
+    // Takes a ready recycled slot if there is one, else a never-issued id, else the oldest recycled
+    // slot together with its pending event. The caller checks capacity and scrubs first.
+    Slot takeSlot();
     [[nodiscard]] bool check() const noexcept;
 
     SlotCount mCapacity;

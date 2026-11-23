@@ -110,7 +110,11 @@ Slot SlotAllocator::allocate()
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
     scrubEvents();
+    return takeSlot();
+}
 
+Slot SlotAllocator::takeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -145,11 +149,14 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     {
         throw OutOfPagesError("SlotAllocator: not enough free slots");
     }
+    // One scrub covers the whole batch. Querying again per slot would mostly repeat a failing query
+    // on the same pending event; a slot taken while its event is still pending carries that event.
+    scrubEvents();
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeSlot());
     }
     return result;
 }
@@ -177,7 +184,8 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // No scrub here: a released slot's event is normally still pending, so a scrub would cost one
+    // failing query per slot. The next allocation scrubs before it picks a slot.
     TLLM_CHECK_DEBUG(check());
 }
 

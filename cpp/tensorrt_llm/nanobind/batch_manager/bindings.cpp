@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
+#include "tensorrt_llm/nanobind/common/tokenArrays.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
@@ -361,8 +362,9 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
-                executor::SamplingConfig sampling_config, bool is_streaming,
+                tb::LlmRequest::SizeType32 max_new_tokens,
+                // list[int], an int32 array, or an executor Request whose prompt is copied in C++.
+                nb::handle input_tokens, executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
@@ -401,7 +403,10 @@ void initBindings(nb::module_& m)
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
+                auto tokens = nb::isinstance<tle::Request>(input_tokens)
+                    ? nb::cast<tle::Request const&>(input_tokens).getInputTokenIds()
+                    : NanobindUtils::tokensFromPython<tb::LlmRequest::TokenIdType>(input_tokens);
+                new (self) tb::LlmRequest{request_id, max_new_tokens, std::move(tokens), sampling_config, is_streaming,
                     prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
                     multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
                     kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
