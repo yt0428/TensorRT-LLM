@@ -231,6 +231,7 @@ from .ops.comm.lamport_moe_combine import lamport_moe_combine
 from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
 from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 from .ops.gemm.mla_v_up_fp8_block_scale_linear import mla_v_up_fp8_block_scale_linear
+from .ops.moe.moe_finalize import moe_finalize
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -520,15 +521,26 @@ def _rank_counts(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> 
     return tuple(counts)
 
 
-def _own_expert_inputs(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
-    """The routed experts' inputs of this rank's own rows: the router's fp32 logits through
-    the renormalized top-k routing (expert ids int32, weights bf16), and the rows' NVFP4 codes
-    with their linear e4m3 scales under the layer's static global scale. Both are row-wise, so
-    a row's routing and codes do not depend on which rows share its call, except through the
-    router GEMM's row count, which may pick another tactic and round a logit differently."""
+def _own_routing(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
+    """The routing of this rank's own rows: the router's fp32 logits through the renormalized
+    top-k (expert ids int32, weights bf16). Row-wise, except through the router GEMM's row
+    count, which may pick another tactic and round a logit differently."""
     logits = cublas_mm(o, m.router, None, torch.float32)
-    ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-    codes, scales = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+    return renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
+
+
+def _own_codes(m, o: torch.Tensor) -> tuple:
+    """This rank's own rows' NVFP4 codes with their linear e4m3 scales under the layer's static
+    global scale. Row-wise."""
+    return fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+
+
+def _own_expert_inputs(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
+    """The routed experts' inputs of this rank's own rows: codes, scales (`_own_codes`), ids
+    and weights (`_own_routing`). A row's inputs do not depend on which rows share its call,
+    except through the router GEMM's row count."""
+    ids, weights = _own_routing(core, m, o)
+    codes, scales = _own_codes(m, o)
     return codes, scales, ids, weights
 
 
@@ -574,17 +586,21 @@ def _partial_out(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]):
     return None
 
 
-def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) -> torch.Tensor:
+def _routed_experts(
+    core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None, finalize: bool = False
+) -> torch.Tensor:
     """This rank's expert window over every dispatched row, in calls of at most
     `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial: `out`
     when given (`_partial_out`), else a fresh one. A row whose experts all lie outside the
-    window, or whose ids are all -1, comes back +0.0."""
+    window, or whose ids are all -1, comes back +0.0. With `finalize` each call returns the
+    runner's permuted output and `moe_finalize` sums its rows: the runner's own finalize,
+    bitwise, in a faster launch at the decode step's gathered rows."""
     codes, scales, ids, weights = gathered
     total = codes.shape[0]
     sf_row = scales.numel() // total
     call = core.expert_call_tokens
     routed_all = out
-    if out is None and total > call:
+    if out is None and (total > call or finalize):
         routed_all = codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
     for lo in range(0, total, call):
         hi = min(lo + call, total)
@@ -592,11 +608,16 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) 
             None, None, codes[lo:hi], scales[lo * sf_row : hi * sf_row].view(torch.float8_e4m3fn),
             m.fc1_w, m.fc1_s, None, None, None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate,
             m.out2, core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
-            core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
+            core.local_experts, None, _MOE_ROUTING_METHOD, not finalize, _MOE_ACT_SWIGLU,
             topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
             tune_max_num_tokens=core.expert_tune_tokens,
-            output=None if out is None else out[lo:hi],
-        )[0]  # fmt: skip
+            output=None if out is None or finalize else out[lo:hi],
+        )  # fmt: skip
+        if finalize:
+            permuted, _, idx = part
+            moe_finalize(permuted, idx, weights[lo:hi], routed_all[lo:hi])
+            continue
+        part = part[0]
         if out is not None:
             continue
         if routed_all is None:
@@ -1834,13 +1855,16 @@ class DecodeTarget:
         # events fork it from and join it to the main stream. The indexer's key half runs ahead
         # of it there; its two events fork it and mark its keys and head weights ready. On a
         # layer without an indexer the latent runs on the main stream instead, and its event
-        # marks it ready for the query half's rope append.
+        # marks it ready for the query half's rope append. In the MoE block the routed experts'
+        # NVFP4 codes are quantized there ahead of the shared expert; their event marks them
+        # ready for the dispatch.
         self._latent_stream = core._side_stream
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
         self._keys_fork = torch.cuda.Event()
         self._keys_ready = torch.cuda.Event()
         self._latent_ready = torch.cuda.Event()
+        self._codes_ready = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1960,23 +1984,32 @@ class DecodeTarget:
         input norm: `(x, residual)`. The shared expert runs on its own rows on the side stream,
         beside the routed experts over every rank's gathered rows.
 
-        The router, the routing and the NVFP4 quantization run on this rank's own rows; their
-        codes, scales, ids and weights are gathered from every rank unpadded (`counts`), so
-        every rank holds the identical rows in rank order -- beside a prefilling peer up to
-        `world_size * max_num_tokens` of them, so the expert calls' chunking is this target's
-        too. While no rank holds more than the workspace (`_one_shot`, every captured decode
-        graph) the reduce-scatter is the one-shot kernel that also adds the shared expert and
-        `residual` (in place) and applies the next layer's norm; past it, the alltoall or NCCL
-        (`_alltoall`) and the adds and norm as separate ops."""
+        The router, the routing and the NVFP4 quantization run on this rank's own rows, the
+        quantization on the side stream beside the router and the routing; the dispatch waits
+        for its codes. The shared expert follows it there once the routing is issued, so the
+        router and the routing run without it beside them. Their codes, scales, ids and weights are
+        gathered from every rank unpadded (`counts`), so every rank holds the identical rows in
+        rank order -- beside a prefilling peer up to `world_size * max_num_tokens` of them, so
+        the expert calls' chunking is this target's too. While no rank holds more than the
+        workspace (`_one_shot`, every captured decode graph) the reduce-scatter is the one-shot
+        kernel that also adds the shared expert and `residual` (in place) and applies the next
+        layer's norm; past it, the alltoall or NCCL (`_alltoall`) and the adds and norm as
+        separate ops."""
         core = self.core
         m = L.moe
         side = core._side_stream
         main = torch.cuda.current_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
+            codes, scales = _own_codes(m, o)
+            self._codes_ready.record()
+        ids, weights = _own_routing(core, m, o)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
+        self._codes_ready.wait()
+        gathered = _dispatch(core, (codes, scales, ids, weights), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts), finalize=True)
         if _one_shot(core, counts):
             main.wait_stream(side)
             x = lamport_moe_combine(
