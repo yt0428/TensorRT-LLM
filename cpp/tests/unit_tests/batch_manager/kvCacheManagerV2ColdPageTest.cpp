@@ -531,6 +531,29 @@ TEST_F(KvCacheManagerV2DiskIoTest, FailedReadDropsPagesAndReportsFailed)
     EXPECT_GE(stats.io.readErrors, 1u);
 }
 
+// A request that reuses part of a block copies it into a private page, which then replaces the source
+// in the request. A failed read of that source must still reach pollDiskReads().
+TEST_F(KvCacheManagerV2DiskIoTest, FailedReadOfPartialReuseSourceReportsFailed)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    ASSERT_EQ(commitPrefix(tokenSpan, 8).size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+
+    engine().injectFaults(DiskIoKind::kRead, 1 << 20, EIO);
+    auto reader = mManager->createKvCache({}, TokenSpan{tokens.data(), 2}, mNextCacheId++);
+    ASSERT_EQ(reader->historyLength(), 2);
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kFailed);
+    reader->close();
+    engine().injectFaults(DiskIoKind::kRead, 0, 0);
+    EXPECT_GE(storage().getAndResetDiskIoStats().failedPages, 1u);
+}
+
 TEST_F(KvCacheManagerV2DiskIoTest, FailedWriteDropsPages)
 {
     makeManager();

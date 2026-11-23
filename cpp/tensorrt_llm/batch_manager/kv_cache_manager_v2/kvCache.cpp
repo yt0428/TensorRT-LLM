@@ -798,6 +798,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
             storageMgr.waitForPageIo(*lock->page());
+            mDeferredCopySourceFailed = mDeferredCopySourceFailed || lock->page()->ioFailed;
             storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
@@ -962,6 +963,10 @@ DiskIoStatus KvCache::pollDiskReads(bool wait)
     if (diskIo == nullptr)
     {
         return DiskIoStatus::kOk;
+    }
+    if (mDeferredCopySourceFailed)
+    {
+        return DiskIoStatus::kFailed;
     }
     auto& engine = diskIo->engine();
     std::vector<SharedPtr<Page>> pages;
@@ -1353,6 +1358,12 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
     }
 
     auto& storageMgr = mManager->storage();
+    // A page whose disk transfer failed holds garbage, which must not reach the tree.
+    storageMgr.waitForPageIo(*srcPage);
+    if (srcPage->ioFailed)
+    {
+        return nullptr;
+    }
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
@@ -1370,7 +1381,6 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.waitForPageIo(*srcPage);
         storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
 
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));

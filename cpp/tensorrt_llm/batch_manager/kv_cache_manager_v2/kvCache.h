@@ -810,6 +810,9 @@ private:
     BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
     bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
+    // A deferred copy read a page whose disk read failed. The private copy replaced that page, so
+    // pollDiskReads() can no longer find the failure on the cache's own pages.
+    bool mDeferredCopySourceFailed = false;
 
     PendingStats mPendingStats;
 
