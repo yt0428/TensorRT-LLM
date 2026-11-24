@@ -212,6 +212,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_para
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.flash_mla import get_mla_metadata
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -225,6 +226,20 @@ from .ops.comm.moe_tail_allreduce import (
 )
 from .ops.comm.symm_logits_gather import build_workspace as build_logits_gather
 from .ops.comm.symm_logits_gather import symm_logits_gather_softcap
+from .ops.dsa._hist_topk import (
+    DG_SCHEDULE_BLOCK_KV,
+    ISS_WORLD_SIZES,
+    MAX_SHARD,
+    SHARD_ALIGN,
+    default_iss_min_ctx_len,
+    get_hist_topk_workspace,
+    hist_topk_supported,
+    iss_enabled,
+    shard_capacity,
+    should_use_iss,
+)
+from .ops.dsa.hist_shard_meta import hist_shard_meta
+from .ops.dsa.hist_topk import hist_topk
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
 
@@ -795,6 +810,8 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         # The prefill scorer's handle, built on the first step.
         self._ix_logits = None
         self._ix_topk_verify = None
+        self._hist_workspace = None
+        self._hist_buffers = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
@@ -821,6 +838,8 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         # the MPI session's, or the TP process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.tp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+        if iss_enabled() and self.tp_size in ISS_WORLD_SIZES and hist_topk_supported(mapping):
+            self._hist_workspace = get_hist_topk_workspace(mapping)
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -906,7 +925,82 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                 contiguous: build_ix_k_cache(dev, is_neox=False, cache_contiguous=contiguous)
                 for contiguous in (False, True)
             }
+        if self._hist_workspace is not None and md.tokens_per_block > 0 and (
+            SHARD_ALIGN % md.tokens_per_block == 0
+        ):
+            cap = min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
+            if cap > 0:
+                self._ensure_hist_buffers(cap, md.tokens_per_block, torch.device("cuda", dev))
         self._derived_for = md.kv_cache_manager
+
+    def _ensure_hist_buffers(
+        self, capacity: int, tokens_per_block: int, device: torch.device
+    ) -> dict:
+        """Allocate or reuse persistent ISS shard-metadata buffers for CUDA-graph stability."""
+        buffers = self._hist_buffers
+        if (
+            buffers is None
+            or buffers["capacity"] < capacity
+            or buffers["tokens_per_block"] != tokens_per_block
+            or buffers["shard_ctx"].device != device
+        ):
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            self._hist_buffers = dict(
+                capacity=capacity,
+                tokens_per_block=tokens_per_block,
+                shard_ctx=torch.zeros(1, dtype=torch.int32, device=device),
+                shard_block_table=torch.zeros(
+                    (1, -(-capacity // tokens_per_block)), dtype=torch.int32, device=device
+                ),
+                schedule=torch.zeros((sms + 1, 2), dtype=torch.int32, device=device),
+                sms=sms,
+            )
+            buffers = self._hist_buffers
+        return buffers
+
+    def _prepare_iss_step(self, step: dict, rows: int, skip_gen: bool) -> dict | None:
+        """Prepare rank-local key-shard metadata once per decode step when ISS-8/16 is active."""
+        num_seqs = step["num_seqs"]
+        kv_len = int(step["kv_lens_host"][0]) if num_seqs == 1 else 0
+        capturing = torch.cuda.is_current_stream_capturing()
+        tokens_per_block = step["tokens_per_block"]
+        if not should_use_iss(
+            kv_len,
+            self._max_ctx_len,
+            num_seqs,
+            rows,
+            self.tp_size,
+            tokens_per_block,
+            default_iss_min_ctx_len(self.tp_size),
+            capturing=capturing,
+            has_workspace=self._hist_workspace is not None,
+            skip_gen=skip_gen,
+            enabled=iss_enabled(),
+        ):
+            return None
+        cap = (
+            shard_capacity(self._max_ctx_len, self.tp_size)
+            if capturing
+            else min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
+        )
+        kv_lens_cuda = step["kv_lens_cuda"][:1]
+        buffers = self._ensure_hist_buffers(cap, tokens_per_block, kv_lens_cuda.device)
+        hist_shard_meta(
+            kv_lens_cuda,
+            step["indexer_k_cache_block_offsets"][0],
+            buffers["shard_ctx"],
+            buffers["shard_block_table"],
+            self.tp_size,
+            self.tp_rank,
+            tokens_per_block,
+        )
+        buffers["schedule"].copy_(
+            get_paged_mqa_logits_metadata(
+                buffers["shard_ctx"].view(-1, 1), DG_SCHEDULE_BLOCK_KV, buffers["sms"]
+            ),
+            non_blocking=True,
+        )
+        return buffers
 
     def _select_indexer_decode(
         self,
@@ -1648,7 +1742,7 @@ class DecodeTarget:
         flashinfer_rmsnorm(kv, L.kv_norm, core.eps, out=nope_lat[:, : core.kv_lora])
         return nope_lat
 
-    def _indexer(self, step, x, pos, L, topk_buf, skip_gen: bool):
+    def _indexer(self, step, x, pos, L, topk_buf, skip_gen: bool, iss=None):
         """Append this step's keys to the layer's key pool; unless the engine skipped the
         indexer (every sequence within index_topk), score every sequence's paged keys and
         select `index_topk` positions per row into `topk_buf`."""
@@ -1685,6 +1779,26 @@ class DecodeTarget:
         num_gens = step["num_seqs"]
         next_n = rows // num_gens
         kv_lens = step["kv_lens_cuda"][:num_gens]
+        if iss is not None:
+            logits = cute_dsl_fp8_paged_mqa_logits(
+                torch.reshape(q_fp8, [1, next_n, core.idx_heads, core.idx_dim]),
+                k_pool,
+                weights,
+                iss["shard_ctx"],
+                iss["shard_block_table"],
+                iss["schedule"],
+                iss["capacity"],
+            )
+            hist_topk(
+                logits,
+                kv_lens,
+                topk_buf,
+                core._hist_workspace.comm_buffer,
+                core._hist_workspace.state,
+                next_n,
+                core.tp_size,
+            )
+            return
         logits = cute_dsl_fp8_paged_mqa_logits(
             torch.reshape(q_fp8, [num_gens, next_n, core.idx_heads, core.idx_dim]),
             k_pool,
@@ -1772,6 +1886,7 @@ class DecodeTarget:
         else:
             topk_buf = torch.empty([rows, core.idx_topk], dtype=torch.int32, device=dev)
         scratch = self._scratch(rows, h.dtype, dev)
+        iss = core._prepare_iss_step(step, rows, skip_gen)
         # A MoE layer's NVFP4 quantization and its routed + shared add fold into the all-reduces
         # around it (each the same bits as the separate op). Those are one-shot kernels, so a
         # step of more rows than they take keeps the separate ops: per step, by its row count.
@@ -1781,7 +1896,9 @@ class DecodeTarget:
         residual = h
         spec_metadata = kwargs.get("spec_metadata")
         for layer_idx, L in enumerate(self._layers):
-            attn_out = self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen)
+            attn_out = self._attention(
+                step, L, x, pos, req_idx, topk_buf, scratch, skip_gen, iss=iss
+            )
             partial = self._linear_fp8(attn_out, L.wo, L.wo_s)
             quantized = None
             if one_shot and L.moe is not None:
@@ -1833,7 +1950,7 @@ class DecodeTarget:
             sched=get_mla_metadata()[0] if core.gen_attn_flash_mla else None,
         )
 
-    def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
+    def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool, iss=None):
         """One layer's attention block into `s.attn_out` (returned): the indexer's selection and
         its pool slots; the query with SSMax, the absorbed query, the owner's rope and
         fp8_ds_mla append; sparse decode over the pool, and the V up-projection of the latent
@@ -1848,7 +1965,7 @@ class DecodeTarget:
 
         def select():
             if L.indexer is not None:
-                self._indexer(step, x, pos, L, topk_buf, skip_gen)
+                self._indexer(step, x, pos, L, topk_buf, skip_gen, iss=iss)
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
@@ -2517,7 +2634,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
         shared lm_head: the symmetric gather when the step's rows fit it, else the NCCL
         gather, the upcast and the soft-cap. Every rank takes the same side."""
         gather = self._logits_gather
-        if hidden.shape[0] > gather.rows:
+        if gather is None or hidden.shape[0] > gather.rows:
             logits = self.logits_processor(hidden, self.lm_head, attn_metadata, True)
             return tanh_softcap(logits, self.softcap)
         local = self.lm_head.apply_linear(hidden, self.lm_head.bias)
@@ -2544,13 +2661,23 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             self.draft_model._build_fused_kv_buffers()
         if self.spec_worker is not None:
             # The route fixes the lm_head the gather is written for: a bf16 column shard of the
-            # whole vocabulary on every rank of the 4- or 8-rank TP group, gathered, no padding.
+            # whole vocabulary on every rank of the TP group, gathered, no padding. At tp_size > 8
+            # (TP16) keep the NCCL fallback unless explicitly opted in (Track 2 vocab-parallel
+            # eliminates full-vocab gather on the decode path).
             mapping = self.model_config.mapping
             lm_head = self.lm_head
             assert lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.gather_output
             assert lm_head.padding_size == 0 and lm_head.weight.dtype == torch.bfloat16
-            # Collective: every rank of the TP group (the process group the Lamport workspace
-            # brought up) builds it at load, with the same arguments.
-            self._logits_gather = build_logits_gather(
-                _LOGITS_GATHER_ROWS, self.lm_head.weight.shape[0], mapping.tp_rank, mapping.tp_size
-            )
+            if mapping.tp_size <= 8 or (
+                os.environ.get("TRTLLM_ML4_ENABLE_TP16_SYMM_LOGITS_GATHER", "0") == "1"
+            ):
+                # Collective: every rank of the TP group (the process group the Lamport workspace
+                # brought up) builds it at load, with the same arguments.
+                self._logits_gather = build_logits_gather(
+                    _LOGITS_GATHER_ROWS,
+                    self.lm_head.weight.shape[0],
+                    mapping.tp_rank,
+                    mapping.tp_size,
+                )
+            else:
+                self._logits_gather = None
