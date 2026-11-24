@@ -805,7 +805,7 @@ def _run_one_rank(mpi: bool) -> int:
 
         COMM = MPI.COMM_WORLD
         rank, world = COMM.Get_rank(), COMM.Get_size()
-        local = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+        local = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
         hosts = COMM.allgather(socket.gethostname())
         NODES = len(set(hosts))
     else:

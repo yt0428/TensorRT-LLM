@@ -812,6 +812,9 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         self._ix_topk_verify = None
         self._hist_workspace = None
         self._hist_buffers = None
+        self._iss_stats = dict(capture=0, eager_hit=0, eager_miss=0)
+        self._iss_logged_capture = False
+        self._iss_logged_eager_hit = False
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
@@ -840,6 +843,37 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         self.tp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
         if iss_enabled() and self.tp_size in ISS_WORLD_SIZES and hist_topk_supported(mapping):
             self._hist_workspace = get_hist_topk_workspace(mapping)
+            if self.tp_rank == 0:
+                import atexit
+
+                logger.info(
+                    f"[ML4-ISS] workspace ready: tp_size={self.tp_size}, "
+                    f"l_thresh={default_iss_min_ctx_len(self.tp_size)}"
+                )
+
+                def _log_iss_exit(
+                    ws=self._hist_workspace,
+                    stats=self._iss_stats,
+                    n_idx=len(self.indexer_layers),
+                    tp=self.tp_size,
+                ) -> None:
+                    try:
+                        exchanges = int(ws.state[:2].view(torch.int64).item()) // 64
+                        logger.info(
+                            f"[ML4-ISS] summary tp_size={tp}: gpu_hist_exchanges={exchanges}, "
+                            f"est_iss_steps={exchanges / max(n_idx, 1):.1f}, "
+                            f"capture={stats['capture']}, eager_hit={stats['eager_hit']}, "
+                            f"eager_miss={stats['eager_miss']}"
+                        )
+                    except Exception:
+                        pass
+
+                atexit.register(_log_iss_exit)
+        elif self.tp_rank == 0 and self.tp_size in ISS_WORLD_SIZES:
+            logger.info(
+                f"[ML4-ISS] disabled: tp_size={self.tp_size}, enabled={iss_enabled()}, "
+                f"supported={hist_topk_supported(mapping)}"
+            )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -964,6 +998,7 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         kv_len = int(step["kv_lens_host"][0]) if num_seqs == 1 else 0
         capturing = torch.cuda.is_current_stream_capturing()
         tokens_per_block = step["tokens_per_block"]
+        l_thresh = default_iss_min_ctx_len(self.tp_size)
         if not should_use_iss(
             kv_len,
             self._max_ctx_len,
@@ -971,18 +1006,38 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             rows,
             self.tp_size,
             tokens_per_block,
-            default_iss_min_ctx_len(self.tp_size),
+            l_thresh,
             capturing=capturing,
             has_workspace=self._hist_workspace is not None,
             skip_gen=skip_gen,
             enabled=iss_enabled(),
         ):
+            if not capturing and hasattr(self, "_iss_stats"):
+                self._iss_stats["eager_miss"] += 1
             return None
         cap = (
             shard_capacity(self._max_ctx_len, self.tp_size)
             if capturing
             else min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
         )
+        if hasattr(self, "_iss_stats"):
+            if capturing:
+                self._iss_stats["capture"] += 1
+                if self.tp_rank == 0 and not getattr(self, "_iss_logged_capture", False):
+                    self._iss_logged_capture = True
+                    logger.info(
+                        f"[ML4-ISS] captured ISS-{self.tp_size} decode graph: rows={rows}, "
+                        f"cap={cap}, max_ctx_len={self._max_ctx_len}, l_thresh={l_thresh}, "
+                        f"tpb={tokens_per_block}"
+                    )
+            else:
+                self._iss_stats["eager_hit"] += 1
+                if self.tp_rank == 0 and not getattr(self, "_iss_logged_eager_hit", False):
+                    self._iss_logged_eager_hit = True
+                    logger.info(
+                        f"[ML4-ISS] eager ISS-{self.tp_size} activated: kv_len={kv_len}, "
+                        f"rows={rows}, cap={cap}, l_thresh={l_thresh}"
+                    )
         kv_lens_cuda = step["kv_lens_cuda"][:1]
         buffers = self._ensure_hist_buffers(cap, tokens_per_block, kv_lens_cuda.device)
         hist_shard_meta(
