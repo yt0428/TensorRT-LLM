@@ -36,7 +36,7 @@ def _weights(n, k, seed):
 
 
 @pytest.mark.parametrize("m", (1, 3, 4, 8, 12, 16))
-@pytest.mark.parametrize("k", (768, 1024, 1536, 2048, 3072, 6144))
+@pytest.mark.parametrize("k", (384, 512, 768, 1024, 1536, 2048, 3072, 6144))
 @pytest.mark.parametrize("seed", (11, 23, 47))
 def test_fused_matches_k128_reference(m, k, seed):
     weight, scale = _weights(128, k, seed + 1)
@@ -71,7 +71,7 @@ def test_fused_changing_input_graph(m, k):
 
 
 @pytest.mark.parametrize("m", (1, 3, 4, 8, 12, 16))
-@pytest.mark.parametrize("k", (768, 1024, 1536, 2048, 3072, 6144))
+@pytest.mark.parametrize("k", (384, 512, 768, 1024, 1536, 2048, 3072, 6144))
 @pytest.mark.parametrize("seed", (11, 23, 47))
 def test_fused_quantization_byte_contract(m, k, seed):
     from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
@@ -158,7 +158,19 @@ def test_fused_catalog_protection(m):
     assert_within_ulp(actual, expected, element_ulp=4, rms_ulp=2)
 
 
-@pytest.mark.parametrize("n,k", ((1024, 6144), (1536, 6144), (6144, 768), (6144, 1024)))
+@pytest.mark.parametrize(
+    "n,k",
+    (
+        (512, 6144),
+        (768, 6144),
+        (6144, 384),
+        (6144, 512),
+        (1024, 6144),
+        (1536, 6144),
+        (6144, 768),
+        (6144, 1024),
+    ),
+)
 def test_fused_catalog_changing_input_graph(n, k):
     weight, scale = _weights(n, k, 23)
     x = _input(4, k, 11).contiguous()
@@ -179,8 +191,8 @@ def test_fused_catalog_changing_input_graph(n, k):
 # indexer's wq_b (4096 wide) at 16 rows, where the table has no cell.
 @pytest.mark.parametrize(
     "m,n,fused",
-    ((4, 1024, True), (16, 2048, True), (32, 1024, False), (16, 4096, False)),
-    ids=("tp8", "tp4", "m32", "untuned"),
+    ((4, 512, True), (4, 1024, True), (16, 2048, True), (32, 1024, False), (16, 4096, False)),
+    ids=("tp16", "tp8", "tp4", "m32", "untuned"),
 )
 def test_decode_target_dispatch(m, n, fused):
     from importlib import import_module

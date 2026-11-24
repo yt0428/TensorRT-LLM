@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sparse MQA of one query row per sequence over an fp8_ds_mla pool, 8 or 16 query heads
+"""Sparse MQA of one query row per sequence over an fp8_ds_mla pool, 4, 8 or 16 query heads
 unpadded: a CuTe DSL kernel that computes FlashMLA's sm100f sparse fp8 decode."""
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
     `page * page_size + offset`. `indices`: int32 `[rows, 2048]` slots, -1 padded,
     contiguous. `q`: bf16 `[rows, h_q, 576]`, contiguous, the real heads first: h_q is the
     caller's scratch width (the heads themselves, or a padded scratch another kernel shares)
-    and `out` (bf16 `[rows, heads, 512]`, contiguous) names how many heads are real, 8 or 16.
+    and `out` (bf16 `[rows, heads, 512]`, contiguous) names how many heads are real, 4, 8 or 16.
     `compiled`: `build(device, num_heads=heads)`. Writes `out` and returns it.
     """
 
@@ -164,6 +164,85 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
                 ),
             )
             for b in (1, 2, 4, 8, 16, 64, 256)
+        )
+        + tuple(
+            Cell(
+                why=f"tp16 decode batch {b}: 4 heads, graph replay, 3 layers",
+                spec=dict(
+                    rows=b,
+                    heads=4,
+                    h_q=4,
+                    topk=2048,
+                    kv_len=32768,
+                    page_size=32,
+                    owners=63,
+                    pages=1100 * b // 16 + 64,
+                    layers=3,
+                    captured=True,
+                ),
+            )
+            for b in (1, 2, 4, 8, 16, 64, 256)
+        )
+        + (
+            Cell(
+                why="mixed step at world 16: 4 of the prefill scratch's 64 heads",
+                spec=dict(
+                    rows=5,
+                    heads=4,
+                    h_q=64,
+                    topk=2048,
+                    kv_len=9000,
+                    page_size=32,
+                    owners=63,
+                    pages=512,
+                    layers=1,
+                ),
+            ),
+            Cell(
+                why="short sequences at 4 heads: -1 tails and scattered holes",
+                spec=dict(
+                    rows=16,
+                    heads=4,
+                    h_q=4,
+                    topk=2048,
+                    kv_len=700,
+                    page_size=32,
+                    owners=63,
+                    pages=512,
+                    layers=1,
+                    holes=True,
+                ),
+            ),
+            Cell(
+                why="NoPE layer at 4 heads: zero query and key rope halves",
+                spec=dict(
+                    rows=4,
+                    heads=4,
+                    h_q=4,
+                    topk=2048,
+                    kv_len=9000,
+                    page_size=32,
+                    owners=63,
+                    pages=512,
+                    layers=1,
+                    nope=True,
+                ),
+            ),
+            Cell(
+                why="64-token pages: tp16 decode batch 4: 4 heads, graph replay, 3 layers",
+                spec=dict(
+                    rows=4,
+                    heads=4,
+                    h_q=4,
+                    topk=2048,
+                    kv_len=32768,
+                    page_size=64,
+                    owners=63,
+                    pages=550 * 4 // 16 + 32,
+                    layers=3,
+                    captured=True,
+                ),
+            ),
         )
         + (
             Cell(

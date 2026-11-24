@@ -80,14 +80,16 @@ class TritonDraftAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
     note = """
-    The window is a multiple of 16 * 64 keys (of 16 * 128 at 64 heads); heads 16 (tp4), 8 (tp8)
-    or 64 (dep4); the pool's last dim contiguous. A masked key loads as zero, so pool rows past a
-    sequence's length may hold any bits, NaN included. The 16- and 8-head launch shares one split
-    table, measured at 16 heads; 64 heads take their own (`_ATTN_64_HEADS`): 32-row programs over
-    fewer, longer splits, so fewer programs read each split's keys.
+    The window is a multiple of 16 * 64 keys (of 16 * 128 at 64 heads); heads 16 (tp4), 8 (tp8),
+    4 (tp16) or 64 (dep4); the pool's last dim contiguous. A masked key loads as zero, so pool
+    rows past a sequence's length may hold any bits, NaN included. The 16-, 8- and 4-head
+    launches share one split table, measured at 16 heads (at 4 heads a sequence's 12 query rows
+    fit inside one 16-row CTA with 4 masked tail rows); 64 heads take their own
+    (`_ATTN_64_HEADS`): 32-row programs over fewer, longer splits, so fewer programs read each
+    split's keys.
     """
     #: A decode step's draft block: 3 query rows per sequence, up to 16 sequences a rank at
-    #: tp4/tp8 and up to 32 (the decode graph's largest batch) at dep4.
+    #: tp4/tp8/tp16 and up to 32 (the decode graph's largest batch) at dep4.
     CELLS = tuple(
         Cell(
             why=f"tp{tp} draft block of {batch} sequence(s), contexts {lengths}",
@@ -100,6 +102,9 @@ class TritonDraftAttention(OpWrapper):
             (4, 8, (2048,) * 8),
             (8, 1, (2047,)),
             (8, 16, tuple(range(1000, 33000, 2000))),
+            (16, 1, (17800,)),
+            (16, 4, (2048, 2049, 300000, 1)),
+            (16, 16, tuple(range(1000, 33000, 2000))),
         )
     ) + tuple(
         Cell(
@@ -205,6 +210,8 @@ class TritonLatentTail(OpWrapper):
             ("tp4 draft layer, 1 sequence", 3, 16),
             ("tp4 draft layer, 16 sequences", 48, 16),
             ("tp8 draft layer, 4 sequences", 12, 8),
+            ("tp16 draft layer, 1 sequence", 3, 4),
+            ("tp16 draft layer, 16 sequences", 48, 4),
             ("dep4 draft layer, 1 sequence", 3, 64),
             ("dep4 draft layer, 32 sequences", 96, 64),
             ("context features layer, 1 sequence", 4, None),

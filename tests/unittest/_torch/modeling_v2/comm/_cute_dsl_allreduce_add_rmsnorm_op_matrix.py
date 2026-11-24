@@ -91,8 +91,9 @@ MPI_DEADLINE_S = 900
 
 #: The spawned job's world size: the world-4 cells, on the devices of one node.
 WORLD_SIZE = 4
-#: The MPI job's: the world-8 cells, over two nodes.
+#: The MPI jobs' world sizes: world-8 over two nodes and world-16 over four nodes.
 MPI_WORLD_SIZE = 8
+MPI_WORLD_SIZES = (8, 16)
 HIDDEN = 6144
 #: Mistral Large 4's `rms_norm_eps`.
 EPS = 1e-5
@@ -434,7 +435,7 @@ def check_every_cell_names_this_configuration() -> None:
         assert _mine(), f"no cell is at world size {WORLD}"
         for cell in op.CELLS:
             spec = cell.spec
-            assert spec["world_size"] in (WORLD_SIZE, MPI_WORLD_SIZE), (cell.why, spec)
+            assert spec["world_size"] in (WORLD_SIZE, *MPI_WORLD_SIZES), (cell.why, spec)
             assert spec["hidden"] == HIDDEN and spec["eps"] == EPS, (cell.why, spec)
             assert 1 <= spec["rows"] <= spec["max_rows"], (cell.why, spec)
             if spec.get("graph"):
@@ -828,8 +829,8 @@ def _run_one_rank(mpi: bool) -> int:
     from _validating import validating as _validating_cm
 
     RANK, WORLD = rank, world
-    want = MPI_WORLD_SIZE if mpi else WORLD_SIZE
-    assert WORLD == want, f"this job drives the world-{want} cells, got {WORLD} ranks"
+    want = MPI_WORLD_SIZES if mpi else (WORLD_SIZE,)
+    assert WORLD in want, f"this job drives world sizes {want}, got {WORLD} ranks"
     if RANK == 0:
         dev = torch.cuda.current_device()
         print(

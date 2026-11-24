@@ -190,10 +190,12 @@ def route(
         getattr(cfg, "index_topk", None),
         cfg.vocab_size,
     )
-    # The targets serve 4 ranks on one node or 8 ranks over two nodes of four: every per-rank
-    # width -- heads, expert windows, shard widths -- is read off the mapping, so the two sizes
-    # are one weight layout and one forward.
+    # The targets serve 4 ranks on one node or 8 ranks over two nodes of four; on sm107,
+    # tp4 also serves 16 ranks over four nodes of four: every per-rank width -- heads, expert
+    # windows, shard widths -- is read off the mapping, so the sizes are one weight layout
+    # and one forward.
     nvfp4_world = mapping.world_size in (4, 8)
+    sm107_tp16_world = compute_capability == (10, 7) and mapping.world_size == 16
     # tep4: the attention heads, the dense and shared MLPs and lm_head sharded over every rank,
     # the routed experts too, by expert (32 per rank at 4 ranks, 16 at 8). Attention DP would
     # replicate attention: another weight layout. At 8 ranks this is the tep8 deployment;
@@ -303,7 +305,7 @@ def route(
     if (
         compute_capability in ((10, 3), (10, 7))
         and shape == _SHAPE
-        and nvfp4_world
+        and (nvfp4_world or sm107_tp16_world)
         and tp4
         and draft
         and layers
@@ -353,7 +355,8 @@ def route(
         "expert-parallel MoE (world_size=4 tp=4 pp=1 moe_ep=4 moe_tp=1, or world_size=8 tp=8 "
         "pp=1 moe_ep=8 moe_tp=1: dep8); tp4 is tensor-parallel attention, tensor-parallel MoE "
         "(every expert on every rank, cut by width), attention DP off (world_size=4 tp=4 pp=1 "
-        "moe_ep=1 moe_tp=4, or world_size=8 tp=8 pp=1 moe_ep=1 moe_tp=8: tp8). "
+        "moe_ep=1 moe_tp=4, or world_size=8 tp=8 pp=1 moe_ep=1 moe_tp=8: tp8, or on sm107 "
+        "world_size=16 tp=16 pp=1 moe_ep=1 moe_tp=16: tp16). "
         "Speculative decoding is off or native DSpark: fixed block/depth 3, layers "
         "1,18,36,54,71, three dense draft layers, window 2048, eagle norm, "
         "position-specific masks and rank-512 RNN, AUTO/VANILLA attention with "
