@@ -189,6 +189,7 @@ DiskIoTicket DiskIoEngine::submit(DiskIoKind kind, std::vector<DiskIoOp> ops, bo
     if (isWriteLike(kind))
     {
         mStats.pendingWriteBytes += bytes;
+        mStats.peakPendingWriteBytes = std::max(mStats.peakPendingWriteBytes, mStats.pendingWriteBytes);
     }
     if (activate)
     {
@@ -324,6 +325,7 @@ DiskIoStats DiskIoEngine::takeStats()
     fresh.peakQueuedReadOps = mStats.queuedReadOps;
     fresh.peakQueuedWriteOps = mStats.queuedWriteOps;
     fresh.pendingWriteBytes = mStats.pendingWriteBytes;
+    fresh.peakPendingWriteBytes = mStats.pendingWriteBytes;
     mStats = fresh;
     return result;
 }

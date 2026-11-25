@@ -51,10 +51,12 @@ class StagingBufferManager;
 struct DiskIoIterationStats
 {
     DiskIoStats io;
-    // Host pages that maintainHostReserve() wrote to disk ahead of demand, and those it dropped instead
-    // because queued writes exceeded the cap.
+    // Host pages that maintainHostReserve() wrote to disk ahead of demand, and host pages short of the
+    // reserve that it left for a later call because queued writes had reached maxPendingWriteBytes.
     uint64_t reserveEvictedPages = 0;
-    uint64_t reserveDroppedPages = 0;
+    uint64_t reserveDeferredPages = 0;
+    // Pages dropped from the last cache level to make room, which leaves them in no tier.
+    uint64_t lastLevelDroppedPages = 0;
     // Pages whose disk transfer failed and that left the radix tree.
     uint64_t failedPages = 0;
     // Whether streams wait for disk I/O with stream memory operations rather than host functions.
@@ -241,8 +243,9 @@ public:
     // Keeps each host level that spills to disk at hostReserveFraction free slots by writing its
     // coldest pages to disk. The call only queues the writes; the freed host slots carry the writes'
     // completion events, and allocation prefers slots whose events have completed, so GPU eviction
-    // into host no longer waits for a write. Above maxPendingWriteBytes of queued writes, droppable
-    // pages are dropped instead. Caller holds the manager's exclusive lock.
+    // into host no longer waits for a write. Queued writes stay within maxPendingWriteBytes: the part
+    // of the shortfall beyond it waits for a later call, and no page is dropped. Caller holds the
+    // manager's exclusive lock.
     void maintainHostReserve();
 
     // Caller holds the manager's exclusive lock.
@@ -463,9 +466,8 @@ private:
         std::vector<SharedPtr<Page>> const& pages, std::vector<DiskIoTicket> const& pageTickets, bool isRead);
     // Marks a page whose disk data is garbage and takes it out of the radix tree.
     void detachFailedPage(SharedPtr<Page> const& page);
-    // Moves the `numPages` coldest pages of a host level to the next level, or drops the droppable ones
-    // among them when `drop` is set.
-    void evictForHostReserve(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages, bool drop);
+    // Moves the `numPages` coldest pages of a host level to the next level.
+    void evictForHostReserve(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
@@ -540,7 +542,8 @@ private:
     double mHostReserveFraction = 0.0;
     size_t mMaxPendingWriteBytes = 0;
     uint64_t mReserveEvictedPages = 0;
-    uint64_t mReserveDroppedPages = 0;
+    uint64_t mReserveDeferredPages = 0;
+    uint64_t mLastLevelDroppedPages = 0;
     uint64_t mFailedPages = 0;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.

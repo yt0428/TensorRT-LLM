@@ -931,8 +931,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "peak_queued_write_ops", [](kv::DiskIoIterationStats const& self) { return self.io.peakQueuedWriteOps; })
         .def_prop_ro(
             "pending_write_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.pendingWriteBytes; })
+        .def_prop_ro("peak_pending_write_bytes",
+            [](kv::DiskIoIterationStats const& self) { return self.io.peakPendingWriteBytes; })
         .def_ro("reserve_evicted_pages", &kv::DiskIoIterationStats::reserveEvictedPages)
-        .def_ro("reserve_dropped_pages", &kv::DiskIoIterationStats::reserveDroppedPages)
+        .def_ro("reserve_deferred_pages", &kv::DiskIoIterationStats::reserveDeferredPages)
+        .def_ro("last_level_dropped_pages", &kv::DiskIoIterationStats::lastLevelDroppedPages)
         .def_ro("failed_pages", &kv::DiskIoIterationStats::failedPages)
         .def_ro("stream_mem_ops", &kv::DiskIoIterationStats::streamMemOps);
 

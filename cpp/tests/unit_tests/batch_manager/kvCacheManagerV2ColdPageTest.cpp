@@ -41,6 +41,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -575,11 +576,10 @@ TEST_F(KvCacheManagerV2DiskIoTest, FailedWriteDropsPages)
     EXPECT_EQ(storage().getAndResetDiskIoStats().failedPages, 2u);
 }
 
-TEST_F(KvCacheManagerV2DiskIoTest, HostReserveWritesColdPagesAheadOrDropsThem)
+TEST_F(KvCacheManagerV2DiskIoTest, HostReserveWritesColdPagesAhead)
 {
     DiskCacheTierConfig disk{4 << 20, "/tmp"};
     disk.hostReserveFraction = 0.5;
-    disk.maxPendingWriteBytes = 0;
     makeManager(disk);
     auto const apiLock = mManager->lockExclusive();
     auto const hostGroup = storage().getPoolGroupIndex(kHostLevel, mLifeCycle);
@@ -594,35 +594,72 @@ TEST_F(KvCacheManagerV2DiskIoTest, HostReserveWritesColdPagesAheadOrDropsThem)
     pressure(kHotLevel);
     ASSERT_LT(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
 
-    // No writes are queued, so the reserve is refilled by writing the coldest pages to disk. The
-    // writes are unfenced: their host slots come back to the pool only once the writes land.
+    // The reserve is refilled by writing the coldest pages to disk. The writes are unfenced: their host
+    // slots come back to the pool only once the writes land.
     storage().maintainHostReserve();
     engine().drain();
     storage().reapDiskIo();
     EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
-    auto stats = storage().getAndResetDiskIoStats();
+    auto const stats = storage().getAndResetDiskIoStats();
     EXPECT_GT(stats.reserveEvictedPages, 0u);
-    EXPECT_EQ(stats.reserveDroppedPages, 0u);
+    EXPECT_EQ(stats.reserveDeferredPages, 0u);
+    EXPECT_EQ(stats.lastLevelDroppedPages, 0u);
     EXPECT_EQ(mManager->radixTree().match({}, tokenSpan).numTokens, numBlocks * 4);
+}
 
-    // Take host slots back, then hold the workers so a queued write stays pending: above the
-    // zero-byte cap the reserve now drops the coldest droppable pages instead of writing them.
-    std::vector<TokenIdExt> moreTokens;
-    auto const moreSpan = span(moreTokens, numBlocks * 4, 1 << 20);
-    ASSERT_EQ(commitPrefix(moreSpan, numBlocks * 4).size(), static_cast<size_t>(numBlocks));
+TEST_F(KvCacheManagerV2DiskIoTest, HostReserveQueuesWritesWithinTheCapAndDropsNothing)
+{
+    makeManager();
+    auto const& sizes = storage().slotSize(kHostLevel, storage().getPoolGroupIndex(kHostLevel, mLifeCycle));
+    uint64_t const pageBytes = std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+    mManager->shutdown();
+
+    // Room for two pages of queued writes.
+    DiskCacheTierConfig disk{4 << 20, "/tmp"};
+    disk.hostReserveFraction = 0.5;
+    disk.maxPendingWriteBytes = 2 * pageBytes;
+    makeManager(disk);
+    auto const apiLock = mManager->lockExclusive();
+    auto const hostGroup = storage().getPoolGroupIndex(kHostLevel, mLifeCycle);
+    auto const hostSlots = storage().getStatistics(kHostLevel, hostGroup).total;
+    auto const reserve = static_cast<SlotCount>(std::ceil(hostSlots * 0.5));
+
+    int const numBlocks = static_cast<int>(hostSlots * 3 / 4);
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, numBlocks * 4);
+    ASSERT_EQ(commitPrefix(tokenSpan, numBlocks * 4).size(), static_cast<size_t>(numBlocks));
     pressure(kHotLevel);
+    SlotCount const shortfall = reserve - storage().getStatistics(kHostLevel, hostGroup).free;
+    ASSERT_GT(shortfall, 2);
+
+    // Hold the workers so the writes stay queued. The first call queues the two pages the cap allows and
+    // defers the rest; the next one, at the cap, queues nothing.
     engine().setPausedForTest(true);
-    TypedVec<PoolGroupIndex, SlotCount> one(storage().numPoolGroups(kHostLevel), SlotCount{0});
-    one[hostGroup] = 1;
-    storage().forceEvict(kHostLevel, one);
-    ASSERT_GT(engine().pendingWriteBytes(), 0u);
+    storage().maintainHostReserve();
+    auto stats = storage().getAndResetDiskIoStats();
+    EXPECT_EQ(stats.reserveEvictedPages, 2u);
+    EXPECT_EQ(stats.reserveDeferredPages, static_cast<uint64_t>(shortfall - 2));
+    EXPECT_GT(engine().pendingWriteBytes(), 0u);
     storage().maintainHostReserve();
     stats = storage().getAndResetDiskIoStats();
-    EXPECT_GT(stats.reserveDroppedPages, 0u);
     EXPECT_EQ(stats.reserveEvictedPages, 0u);
-    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    EXPECT_EQ(stats.reserveDeferredPages, static_cast<uint64_t>(shortfall - 2));
+    EXPECT_EQ(stats.io.peakPendingWriteBytes, engine().pendingWriteBytes());
+    // Nothing left every tier: the whole prefix still matches.
+    EXPECT_EQ(mManager->radixTree().match({}, tokenSpan).numTokens, numBlocks * 4);
+
+    // Once the writes land, later calls fill the reserve two pages at a time.
     engine().setPausedForTest(false);
+    for (SlotCount i = 0; i < hostSlots && storage().getStatistics(kHostLevel, hostGroup).free < reserve; ++i)
+    {
+        engine().drain();
+        storage().maintainHostReserve();
+    }
     engine().drain();
+    storage().reapDiskIo();
+    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    EXPECT_EQ(storage().getAndResetDiskIoStats().lastLevelDroppedPages, 0u);
+    EXPECT_EQ(mManager->radixTree().match({}, tokenSpan).numTokens, numBlocks * 4);
 }
 
 KVCacheManagerConfig makeDiskTieredConfig()

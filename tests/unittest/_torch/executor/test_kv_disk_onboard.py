@@ -12,6 +12,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache import (
+    kv_cache_manager_v2 as kv_cache_manager_v2_module,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -49,6 +52,9 @@ def _manager(*kv_caches, block_reuse=True):
     manager._iter_onboarded_requests = 0
     manager._iter_onboard_failures = 0
     manager._iter_onboard_wait_s = 0.0
+    manager._disk_io_stats_window = {}
+    manager._disk_io_log_window = {}
+    manager._disk_io_log_start = 0.0
     manager._context_reuse_tokens = lambda req: [1, 2, 3]
     manager._derive_reuse_salt = lambda cache_salt: None
     manager.impl = SimpleNamespace(create_kv_cache=Mock(side_effect=list(kv_caches)))
@@ -106,6 +112,93 @@ def test_poll_reports_each_request_once_and_closes_its_cache(final_status):
     assert manager.poll_context_onboards() == []
     assert manager._iter_onboarded_requests == 1
     assert manager._iter_onboard_failures == (1 if final_status == DiskIoStatus.FAILED else 0)
+
+
+_DISK_IO_FIELDS = (
+    "read_bytes",
+    "write_bytes",
+    "read_ops",
+    "write_ops",
+    "read_busy_ns",
+    "write_busy_ns",
+    "read_errors",
+    "write_errors",
+    "read_batches",
+    "read_batch_latency_ns_sum",
+    "read_batch_latency_ns_max",
+    "queued_read_ops",
+    "queued_write_ops",
+    "peak_queued_read_ops",
+    "peak_queued_write_ops",
+    "pending_write_bytes",
+    "peak_pending_write_bytes",
+    "reserve_evicted_pages",
+    "reserve_deferred_pages",
+    "last_level_dropped_pages",
+    "failed_pages",
+)
+
+
+def _disk_io_sample(**counters):
+    return SimpleNamespace(**{**dict.fromkeys(_DISK_IO_FIELDS, 0), **counters})
+
+
+def test_disk_io_counters_reach_both_the_iteration_stats_and_the_log(monkeypatch):
+    gib = 1 << 30
+    manager = _manager()
+    manager.impl.get_and_reset_disk_io_stats = Mock(
+        side_effect=[
+            _disk_io_sample(
+                write_bytes=3 * gib,
+                pending_write_bytes=5 * gib,
+                peak_pending_write_bytes=6 * gib,
+                reserve_deferred_pages=7,
+            ),
+            _disk_io_sample(
+                write_bytes=gib,
+                pending_write_bytes=gib,
+                peak_pending_write_bytes=2 * gib,
+                last_level_dropped_pages=4,
+            ),
+            _disk_io_sample(write_bytes=gib),
+        ]
+    )
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        kv_cache_manager_v2_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    log = Mock()
+    monkeypatch.setattr(kv_cache_manager_v2_module, "logger", log)
+    manager._disk_io_log_start = 100.0
+
+    # Inside the interval the log neither drains nor logs.
+    clock.now = 159.0
+    manager._maybe_log_disk_io()
+    assert manager.impl.get_and_reset_disk_io_stats.call_count == 0
+    log.info.assert_not_called()
+
+    stats = manager._drain_disk_io_stats()
+    assert stats["writeBytes"] == 3 * gib
+    assert stats["reserveDeferredPages"] == 7
+
+    # The log line covers both drains since the previous line.
+    clock.now = 161.0
+    manager._maybe_log_disk_io()
+    line = log.info.call_args.args[0]
+    assert "last 61 s" in line
+    assert "wrote 4.00 GiB" in line
+    assert "deferred 7" in line
+    assert "pending writes 1.00 GiB, peak 6.00 GiB" in line
+    assert "dropped from the last tier 4 pages" in line
+
+    # The iteration stats still get what the log drained: sums add, gauges keep the latest value and
+    # peaks the largest.
+    stats = manager._drain_disk_io_stats()
+    assert stats["writeBytes"] == 2 * gib
+    assert stats["lastLevelDroppedPages"] == 4
+    assert stats["pendingWriteBytes"] == 0
+    assert stats["peakPendingWriteBytes"] == 2 * gib
+    assert manager._disk_io_log_window["writeBytes"] == gib
 
 
 def test_cancel_closes_the_cache():

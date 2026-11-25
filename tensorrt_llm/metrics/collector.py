@@ -76,6 +76,13 @@ class MetricsCollector:
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
             trtllm_kv_cache_disk_prefetch_blocks_total
+            trtllm_kv_cache_disk_write_bytes_total
+            trtllm_kv_cache_disk_read_bytes_total
+            trtllm_kv_cache_disk_pending_write_bytes
+            trtllm_kv_cache_disk_failed_pages_total
+            trtllm_kv_cache_host_reserve_written_pages_total
+            trtllm_kv_cache_host_reserve_deferred_pages_total
+            trtllm_kv_cache_last_tier_dropped_pages_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -310,6 +317,57 @@ class MetricsCollector:
                 "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
             labelnames=self.labels.keys())
+        # V2 disk tier counters, from the iteration stats' iterDiskIo.
+        self.kv_cache_disk_write_bytes_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_write_bytes_total",
+            documentation="Total bytes the KV cache wrote to its disk tier",
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_read_bytes_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_read_bytes_total",
+            documentation="Total bytes the KV cache read from its disk tier",
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_pending_write_bytes = Gauge(
+            name=self.metric_prefix + "kv_cache_disk_pending_write_bytes",
+            documentation="Disk tier write bytes queued but not yet complete",
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_failed_pages_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_failed_pages_total",
+            documentation=(
+                "Total KV cache pages whose disk read or write failed and "
+                "that left prefix reuse"),
+            labelnames=self.labels.keys())
+        self.kv_cache_host_reserve_written_pages_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_host_reserve_written_pages_total",
+            documentation=(
+                "Total host pages written to disk ahead of demand to keep "
+                "the host tier's reserve of free slots"),
+            labelnames=self.labels.keys())
+        self.kv_cache_host_reserve_deferred_pages_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_host_reserve_deferred_pages_total",
+            documentation=(
+                "Host pages short of the reserve that were left for a later "
+                "step because queued disk writes were at their cap, summed "
+                "over steps"),
+            labelnames=self.labels.keys())
+        self.kv_cache_last_tier_dropped_pages_total = Counter(
+            name=self.metric_prefix + "kv_cache_last_tier_dropped_pages_total",
+            documentation=(
+                "Total KV cache pages dropped from the last cache tier to "
+                "make room, which leaves them in no tier"),
+            labelnames=self.labels.keys())
+        self._disk_io_counters = (
+            ("writeBytes", self.kv_cache_disk_write_bytes_total),
+            ("readBytes", self.kv_cache_disk_read_bytes_total),
+            ("failedPages", self.kv_cache_disk_failed_pages_total),
+            ("reserveEvictedPages",
+             self.kv_cache_host_reserve_written_pages_total),
+            ("reserveDeferredPages",
+             self.kv_cache_host_reserve_deferred_pages_total),
+            ("lastLevelDroppedPages",
+             self.kv_cache_last_tier_dropped_pages_total),
+        )
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
             documentation=
@@ -879,6 +937,14 @@ class MetricsCollector:
         if disk_prefetch_blocks > 0:
             self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
                               disk_prefetch_blocks)
+        if disk_io := iteration_stats.get("iterDiskIo"):
+            for key, counter in self._disk_io_counters:
+                value = disk_io.get(key, 0)
+                if value > 0:
+                    self._log_counter(counter, {}, value)
+            if "pendingWriteBytes" in disk_io:
+                self._log_gauge(self.kv_cache_disk_pending_write_bytes,
+                                disk_io["pendingWriteBytes"])
 
         self._log_cached_tokens_by_level(
             iteration_stats.get("iterCachedTokensByLevel"),

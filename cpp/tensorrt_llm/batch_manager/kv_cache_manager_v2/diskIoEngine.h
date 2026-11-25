@@ -90,8 +90,9 @@ struct DiskIoStats
     uint64_t queuedWriteOps = 0;
     uint64_t peakQueuedReadOps = 0;
     uint64_t peakQueuedWriteOps = 0;
-    //! Bytes of write and copy batches submitted but not completed, at the time of the call.
+    //! Bytes of write and copy batches submitted but not completed, at the time of the call and at their peak.
     uint64_t pendingWriteBytes = 0;
+    uint64_t peakPendingWriteBytes = 0;
 };
 
 //! Multi-threaded disk I/O with separate read and write queues.

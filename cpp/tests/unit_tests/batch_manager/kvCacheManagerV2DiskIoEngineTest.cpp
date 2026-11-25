@@ -199,6 +199,9 @@ TEST_F(DiskIoEngineTest, InactiveBatchWaitsForActivation)
     EXPECT_EQ(engine->wait(ticket), kv::DiskIoStatus::kOk);
     activator.join();
     EXPECT_EQ(engine->pendingWriteBytes(), 0u);
+    // The peak outlives the write until takeStats() starts the next window at the current level.
+    EXPECT_EQ(engine->takeStats().peakPendingWriteBytes, kPage);
+    EXPECT_EQ(engine->takeStats().peakPendingWriteBytes, 0u);
 
     auto check = alignedBuffer(kPage);
     ASSERT_EQ(kv::diskReadAll(file.fd(), 0, check.get(), kPage), 0);

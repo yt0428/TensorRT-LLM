@@ -113,8 +113,8 @@ struct DiskCacheTierConfig
     //! own step. Zero disables the reserve.
     double hostReserveFraction = 0.1;
 
-    //! Queued disk-write bytes above which maintainHostReserve() drops the coldest droppable host pages
-    //! instead of writing them: losing a reuse hit is cheaper than making the forward pass wait.
+    //! Queued disk-write bytes that maintainHostReserve() keeps within. Writes beyond it wait for a later
+    //! call rather than being dropped, which bounds how long a write inside a step queues behind them.
     size_t maxPendingWriteBytes = size_t{8} << 30;
 
     [[nodiscard]] CacheTier tier() const noexcept

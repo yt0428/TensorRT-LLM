@@ -185,6 +185,27 @@ _GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVE
 # reasons about "no request is active" has to exclude these.
 _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 
+# How a disk tier counter combines over a window of drains: these keep their latest value, these their
+# maximum, and every other counter is summed.
+_DISK_IO_GAUGE_KEYS = frozenset(
+    {"queuedReadOps", "queuedWriteOps", "pendingWriteBytes", "onboardsInFlight"}
+)
+_DISK_IO_PEAK_KEYS = frozenset(
+    {"readBatchLatencyMsMax", "peakQueuedReadOps", "peakQueuedWriteOps", "peakPendingWriteBytes"}
+)
+# Seconds between a rank's disk tier activity log lines.
+_DISK_IO_LOG_INTERVAL_S = 60.0
+
+
+def _merge_disk_io_sample(window: dict[str, float], sample: dict[str, float]) -> None:
+    for key, value in sample.items():
+        if key not in window or key in _DISK_IO_GAUGE_KEYS:
+            window[key] = value
+        elif key in _DISK_IO_PEAK_KEYS:
+            window[key] = max(window[key], value)
+        else:
+            window[key] += value
+
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
     """``1``/``on``/``true``/``zero`` -> 0.0, ``nan`` -> NaN, a number ->
@@ -1821,6 +1842,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self._iter_onboarded_requests = 0
         self._iter_onboard_failures = 0
         self._iter_onboard_wait_s = 0.0
+        # Disk tier counters drained from the native manager but not yet reported, one window for the
+        # iteration stats and one for the periodic log line.
+        self._disk_io_stats_window: dict[str, float] = {}
+        self._disk_io_log_window: dict[str, float] = {}
+        self._disk_io_log_start = time.monotonic()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
         # to groups that are actually windowed. Only used by the debug-level
@@ -4321,6 +4347,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # After this iteration's allocations, so the next one finds host slots whose disk
             # writes already ran.
             self.impl.maintain_host_reserve()
+            self._maybe_log_disk_io()
 
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
@@ -5455,8 +5482,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _drain_disk_io_stats(self) -> dict[str, float]:
         """Disk tier counters for this iteration window; busy times are summed over I/O workers."""
+        self._collect_disk_io_stats()
+        stats, self._disk_io_stats_window = self._disk_io_stats_window, {}
+        return stats
+
+    def _collect_disk_io_stats(self) -> None:
+        """Move the native disk tier counters into both reporting windows."""
         io = self.impl.get_and_reset_disk_io_stats()
-        stats = {
+        sample = {
             "readBytes": io.read_bytes,
             "writeBytes": io.write_bytes,
             "readOps": io.read_ops,
@@ -5473,8 +5506,10 @@ class KVCacheManagerV2(BaseResourceManager):
             "peakQueuedReadOps": io.peak_queued_read_ops,
             "peakQueuedWriteOps": io.peak_queued_write_ops,
             "pendingWriteBytes": io.pending_write_bytes,
+            "peakPendingWriteBytes": io.peak_pending_write_bytes,
             "reserveEvictedPages": io.reserve_evicted_pages,
-            "reserveDroppedPages": io.reserve_dropped_pages,
+            "reserveDeferredPages": io.reserve_deferred_pages,
+            "lastLevelDroppedPages": io.last_level_dropped_pages,
             "failedPages": io.failed_pages,
             "onboardedRequests": self._iter_onboarded_requests,
             "onboardFailures": self._iter_onboard_failures,
@@ -5484,7 +5519,30 @@ class KVCacheManagerV2(BaseResourceManager):
         self._iter_onboarded_requests = 0
         self._iter_onboard_failures = 0
         self._iter_onboard_wait_s = 0.0
-        return stats
+        _merge_disk_io_sample(self._disk_io_stats_window, sample)
+        _merge_disk_io_sample(self._disk_io_log_window, sample)
+
+    def _maybe_log_disk_io(self) -> None:
+        """Log this rank's disk tier activity once per ``_DISK_IO_LOG_INTERVAL_S``."""
+        now = time.monotonic()
+        elapsed = now - self._disk_io_log_start
+        if elapsed < _DISK_IO_LOG_INTERVAL_S:
+            return
+        self._collect_disk_io_stats()
+        window, self._disk_io_log_window = self._disk_io_log_window, {}
+        self._disk_io_log_start = now
+        gib = float(1 << 30)
+        logger.info(
+            f"KV cache manager v2 disk tier, last {elapsed:.0f} s: "
+            f"wrote {window['writeBytes'] / gib:.2f} GiB, read {window['readBytes'] / gib:.2f} GiB; "
+            f"host reserve wrote {window['reserveEvictedPages']} pages "
+            f"and deferred {window['reserveDeferredPages']} (summed over steps); "
+            f"pending writes {window['pendingWriteBytes'] / gib:.2f} GiB, "
+            f"peak {window['peakPendingWriteBytes'] / gib:.2f} GiB; "
+            f"dropped from the last tier {window['lastLevelDroppedPages']} pages; "
+            f"failed {window['failedPages']} pages; "
+            f"onboarded {window['onboardedRequests']} requests, {window['onboardFailures']} failed"
+        )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)

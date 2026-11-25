@@ -902,6 +902,7 @@ void StorageManager::forceEvict(
             {
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
             }
+            mLastLevelDroppedPages += pages.size();
         }
         if (dropRecorder)
         {
@@ -1084,6 +1085,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 dropRecorder(ev, lvlId);
             }
+            mLastLevelDroppedPages += ev.size();
             ev.clear();
 
             freeAfterEviction = storage.numFreeSlots(pgIdx);
@@ -1112,6 +1114,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 accepted.insert(
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
+                // Fallen pages the last level has no room for are dropped.
+                mLastLevelDroppedPages += fallenPages.at(lifeCycle).size();
                 fallenPages.at(lifeCycle).clear();
             }
         }
@@ -1822,26 +1826,18 @@ void StorageManager::reapDiskIo()
     }
 }
 
-void StorageManager::evictForHostReserve(
-    CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages, bool drop)
+void StorageManager::evictForHostReserve(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages)
 {
     TLLM_CHECK_DEBUG(!isLastLevel(level));
     auto evicted = mLevels.at(level).controller.evict(numPages);
-    // On failure every evicted page goes back to the front of its queue, dropped ones included: they are
-    // still referenced by `evicted`, which outlives the guard.
+    // On failure every evicted page goes back to the front of its queue.
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
     PagesByLifeCycle fallen(numLifeCycles());
-    uint64_t numDropped = 0;
     uint64_t numMoved = 0;
     for (auto const& pages : evicted)
     {
         for (auto const& page : pages)
         {
-            if (drop && page->status() == PageStatus::DROPPABLE)
-            {
-                ++numDropped;
-                continue;
-            }
             fallen.at(page->lifeCycle).push_back(page);
             ++numMoved;
         }
@@ -1862,8 +1858,6 @@ void StorageManager::evictForHostReserve(
     }
     rescheduleEvictedPagesOnFailure.cancel();
     mReserveEvictedPages += numMoved;
-    mReserveDroppedPages += numDropped;
-    // Dropped pages lose their last reference with `evicted`, which unlinks them and frees their slots.
 }
 
 void StorageManager::maintainHostReserve()
@@ -1877,7 +1871,6 @@ void StorageManager::maintainHostReserve()
     {
         return;
     }
-    bool const writesBacklogged = mDiskIo->engine().pendingWriteBytes() > mMaxPendingWriteBytes;
     for (CacheLevel level{1}; level + 1 < numCacheLevels(); ++level)
     {
         if (cacheTier(level) != CacheTier::HOST_MEM || cacheTier(level + 1) != CacheTier::DISK)
@@ -1903,11 +1896,45 @@ void StorageManager::maintainHostReserve()
                 anyShortfall = anyShortfall || shortfall[pgIdx] > 0;
             }
         }
+        if (!anyShortfall)
+        {
+            continue;
+        }
+        // Queued writes stay within maxPendingWriteBytes. The rest of the shortfall waits for a later call
+        // rather than being dropped: a dropped page is lost to every later request that would reuse it,
+        // while a GPU eviction that finds no free host slot before then only writes inside its own step.
+        uint64_t const pendingBytes = mDiskIo->engine().pendingWriteBytes();
+        uint64_t const budget = mMaxPendingWriteBytes > pendingBytes ? mMaxPendingWriteBytes - pendingBytes : 0;
+        uint64_t shortfallBytes = 0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < shortfall.size(); ++pgIdx)
+        {
+            auto const& sizes = slotSize(level, pgIdx);
+            shortfallBytes
+                += static_cast<uint64_t>(shortfall[pgIdx]) * std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+        }
+        if (shortfallBytes > budget)
+        {
+            anyShortfall = false;
+            for (PoolGroupIndex pgIdx{0}; pgIdx < shortfall.size(); ++pgIdx)
+            {
+                // Each group gets the same share of its shortfall.
+                auto allowed = static_cast<SlotCount>(std::floor(static_cast<double>(shortfall[pgIdx])
+                    * static_cast<double>(budget) / static_cast<double>(shortfallBytes)));
+                if (pendingBytes == 0 && shortfall[pgIdx] > 0)
+                {
+                    // With nothing queued, a cap smaller than a page still lets one page per group go.
+                    allowed = std::max(allowed, SlotCount{1});
+                }
+                mReserveDeferredPages += static_cast<uint64_t>(shortfall[pgIdx] - allowed);
+                shortfall[pgIdx] = allowed;
+                anyShortfall = anyShortfall || allowed > 0;
+            }
+        }
         if (anyShortfall)
         {
             try
             {
-                evictForHostReserve(level, shortfall, writesBacklogged);
+                evictForHostReserve(level, shortfall);
             }
             catch (OutOfPagesError const&)
             {
@@ -1927,7 +1954,8 @@ DiskIoIterationStats StorageManager::getAndResetDiskIoStats()
     }
     stats.io = mDiskIo->engine().takeStats();
     stats.reserveEvictedPages = std::exchange(mReserveEvictedPages, 0);
-    stats.reserveDroppedPages = std::exchange(mReserveDroppedPages, 0);
+    stats.reserveDeferredPages = std::exchange(mReserveDeferredPages, 0);
+    stats.lastLevelDroppedPages = std::exchange(mLastLevelDroppedPages, 0);
     stats.failedPages = std::exchange(mFailedPages, 0);
     stats.streamMemOps = mDiskIo->usesStreamMemOps();
     return stats;
