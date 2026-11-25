@@ -47,6 +47,8 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .spec_tail_kernels import prepare_next_new_tokens, strict_accept
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 
 def rejection_sampling_one_model(
@@ -1159,6 +1161,10 @@ class SpecMetadata:
         if self.is_cuda_graph:
             return self
 
+        # Slot-indexed state persists across steps that may run eagerly or under
+        # different graphs, so every view must share one allocation.
+        self.prepare_rejection_sampling_buffers()
+        self.prepare_penalty_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -1822,6 +1828,21 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         self._d2t = getattr(getattr(draft_model, "model", None), "d2t", None)
 
+    def set_target_model(self, target_model: nn.Module) -> None:
+        """Called at construction with the target model that owns this worker.
+
+        Workers that select target tokens from a vocab-sharded head override
+        this and decide after loading; see :attr:`target_vocab_parallel_head`.
+        """
+        del target_model
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        """The head whose vocab-shard logits this worker's
+        :meth:`target_logits` returns, as :class:`VocabShardedLogits`, in
+        place of the gathered target logits. None to receive gathered logits."""
+        return None
+
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         """
         Prepare attention metadata before speculative decoding draft token generation.
@@ -1990,8 +2011,22 @@ class SpecWorkerBase(nn.Module, ABC):
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
-        if logits.dim() == 1:
+        if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
+
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        if ((spec_metadata is None or not spec_metadata.is_ragged_verify)
+                and target_tokens.is_cuda):
+            accepted_tokens, num_accepted_tokens = strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size)
+            return accepted_tokens, self._apply_force_accepted_tokens(
+                num_accepted_tokens,
+                num_contexts,
+                runtime_draft_len,
+                spec_metadata=spec_metadata)
 
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -2000,10 +2035,6 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
@@ -3095,6 +3126,10 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             next_new_tokens: [batch_size, runtime_draft_len + 1] - Input tokens for next iteration
         """
+        if (accepted_tokens.is_cuda and accepted_tokens.stride(-1) == 1
+                and next_draft_tokens.stride(-1) == 1):
+            return prepare_next_new_tokens(accepted_tokens, next_draft_tokens,
+                                           num_accepted_tokens, batch_size)
         next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
                                           num_accepted_tokens - 1].unsqueeze(1)
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
@@ -3217,6 +3252,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        if isinstance(logits, VocabShardedLogits):
+            return logits.select_tokens(spec_metadata)
         if not spec_metadata.is_all_greedy_sample:
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured

@@ -80,14 +80,14 @@ class TritonDraftAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_107})
     note = """
-    The window is a multiple of 16 * 64 keys (of 16 * 128 at 64 heads); heads 16 (tp4), 8 (tp8)
-    or 64 (dep4); the pool's last dim contiguous. A masked key loads as zero, so pool rows past a
-    sequence's length may hold any bits, NaN included. The 16- and 8-head launch shares one split
-    table, measured at 16 heads; 64 heads take their own (`_ATTN_64_HEADS`): 32-row programs over
-    fewer, longer splits, so fewer programs read each split's keys.
+    The window is a multiple of 16 * 64 keys (of 16 * 128 at 64 heads); heads 16 (tp4), 8 (tp8),
+    4 (tp16) or 64 (dep4); the pool's last dim contiguous. A masked key loads as zero, so pool rows
+    past a sequence's length may hold any bits, NaN included. The 16-, 8- and 4-head launch shares
+    one split table, measured at 16 heads; 64 heads take their own (`_ATTN_64_HEADS`): 32-row
+    programs over fewer, longer splits, so fewer programs read each split's keys.
     """
     #: A decode step's draft block: 3 query rows per sequence, up to 16 sequences a rank at
-    #: tp4/tp8 and up to 32 (the decode graph's largest batch) at dep4.
+    #: tp4/tp8/tp16 and up to 32 (the decode graph's largest batch) at dep4.
     CELLS = tuple(
         Cell(
             why=f"tp{tp} draft block of {batch} sequence(s), contexts {lengths}",
@@ -100,6 +100,8 @@ class TritonDraftAttention(OpWrapper):
             (4, 8, (2048,) * 8),
             (8, 1, (2047,)),
             (8, 16, tuple(range(1000, 33000, 2000))),
+            (16, 1, (17800,)),
+            (16, 4, (2048, 2049, 300000, 1)),
         )
     ) + tuple(
         Cell(
@@ -205,6 +207,9 @@ class TritonLatentTail(OpWrapper):
             ("tp4 draft layer, 1 sequence", 3, 16),
             ("tp4 draft layer, 16 sequences", 48, 16),
             ("tp8 draft layer, 4 sequences", 12, 8),
+            ("tp16 draft layer, 1 sequence", 3, 4),
+            ("tp16 draft layer, 4 sequences", 12, 4),
+            ("tp16 draft layer, 16 sequences", 48, 4),
             ("dep4 draft layer, 1 sequence", 3, 64),
             ("dep4 draft layer, 32 sequences", 96, 64),
             ("context features layer, 1 sequence", 4, None),
@@ -265,6 +270,111 @@ class TritonLatentTail(OpWrapper):
             pe = q.view(rows, heads, -1)[..., nope:]
             query.view(rows, heads, LAT + PE)[..., LAT:] = _rotate(pe, table, positions)
         return out
+
+
+class TritonQueryRopeTail(OpWrapper):
+    """For every row and head: ``query[r, h, LAT:] = rope(q[r, h, nope:])``.
+
+    The query-rope half of :class:`TritonLatentTail`, split into its own kernel
+    so a draft block's Q path can run on the main stream while its KV path
+    (``kv_a`` + ``triton_latent_tail`` with ``q=None``) runs concurrently on an
+    auxiliary stream without any write hazard. Bit-identical to the torch chain.
+    """
+
+    ARCHS = frozenset({Arch.SM_107})
+    CELLS = tuple(
+        Cell(why=f"{what}: {rows} rows, {heads} heads", spec=dict(rows=rows, heads=heads))
+        for what, rows, heads in (
+            ("tp4 draft layer, 1 sequence", 3, 16),
+            ("tp4 draft layer, 16 sequences", 48, 16),
+            ("tp8 draft layer, 1 sequence", 3, 8),
+            ("tp8 draft layer, 4 sequences", 12, 8),
+            ("tp16 draft layer, 1 sequence", 3, 4),
+            ("tp16 draft layer, 4 sequences", 12, 4),
+            ("tp16 draft layer, 16 sequences", 48, 4),
+            ("dep4 draft layer, 1 sequence", 3, 64),
+        )
+    )
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        table: torch.Tensor,
+        query: torch.Tensor,
+        nope: int = 128,
+    ) -> torch.Tensor:
+        rows = q.shape[0]
+        heads = query.shape[-2]
+        _kernels.query_rope_tail_kernel[(rows,)](
+            q, q.stride(0), query, heads * (LAT + PE), positions, table,
+            HEADS=heads, NOPE=nope, QK=nope + PE, LAT=LAT, PE=PE, num_warps=4,
+            enable_fp_fusion=False,
+        )  # fmt: skip
+        return query
+
+    def reference(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        table: torch.Tensor,
+        query: torch.Tensor,
+        nope: int = 128,
+    ) -> torch.Tensor:
+        rows = q.shape[0]
+        heads = query.shape[-2]
+        pe = q.view(rows, heads, -1)[..., nope:]
+        query.view(rows, heads, LAT + PE)[..., LAT:] = _rotate(pe, table, positions.reshape(-1))
+        return query
+
+
+class TritonEmbedDraftBlock(OpWrapper):
+    """Build ``[batch, block, hidden]`` draft noise embeddings in one launch.
+
+    Slot 0 is ``embed[anchors[b]]`` (zeros for out-of-vocab sentinels) and
+    slots ``1..block-1`` are the learned position-specific mask embeddings
+    ``masks[0..block-2]``. Copies only, so bit-identical to the torch chain.
+    """
+
+    ARCHS = frozenset({Arch.SM_107})
+    CELLS = tuple(
+        Cell(why=f"{batch} sequence(s), block {block}", spec=dict(batch=batch, block=block))
+        for batch in (1, 4, 16, 32)
+        for block in (3,)
+    )
+
+    def __call__(
+        self,
+        anchors: torch.Tensor,
+        embed: torch.Tensor,
+        masks: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        batch = anchors.shape[0]
+        vocab, hidden = embed.shape
+        out = embed.new_empty((batch, block_size, hidden))
+        if batch == 0 or block_size == 0:
+            return out
+        hid_block = 1024
+        grid = (batch * block_size, triton.cdiv(hidden, hid_block))
+        _kernels.embed_draft_block_kernel[grid](
+            anchors, embed, masks, out, vocab,
+            BLOCK=block_size, HIDDEN=hidden, HID_BLOCK=hid_block, num_warps=4,
+        )  # fmt: skip
+        return out
+
+    def reference(
+        self,
+        anchors: torch.Tensor,
+        embed: torch.Tensor,
+        masks: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        valid = (anchors >= 0) & (anchors < embed.shape[0])
+        embedded = torch.nn.functional.embedding(anchors.clamp(0, embed.shape[0] - 1), embed)
+        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
+        expanded_masks = masks[: block_size - 1].unsqueeze(0).expand(anchors.shape[0], -1, -1)
+        return torch.cat((embedded.unsqueeze(1), expanded_masks), dim=1)
 
 
 class TritonMarkovInput(OpWrapper):
@@ -380,6 +490,8 @@ class TritonMarkovLogits(OpWrapper):
 
 triton_draft_attention = TritonDraftAttention()
 triton_latent_tail = TritonLatentTail()
+triton_query_rope_tail = TritonQueryRopeTail()
+triton_embed_draft_block = TritonEmbedDraftBlock()
 triton_markov_input = TritonMarkovInput()
 triton_markov_gate = TritonMarkovGate()
 triton_markov_logits = TritonMarkovLogits()
