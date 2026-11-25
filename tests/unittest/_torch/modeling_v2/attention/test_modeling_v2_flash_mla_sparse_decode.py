@@ -22,6 +22,12 @@ sub-batch's (a split row is merged in fp32 and rounds differently, inside the ba
 whole-sub-batch call run once over its rows, each call's split rows and every row not
 bitwise the whole call's are gated, every other row must be bitwise the whole call's, and
 each call's rel L2 counts every row.
+
+The `topk_length` tests drive the dep4 decode step's shape (16 sequences of 4 DSpark
+verification rows, all 64 heads; padding dummies, sequences across 2048 keys, one row of no
+key) with each row's selection length: the call with lengths and the one without both gate
+against the reference, the row of no key is zero, and a graph captured on one sched meta
+replays bitwise an eager call when the lengths change between replays.
 """
 
 import collections
@@ -1075,3 +1081,99 @@ def test_v_b_over_the_view_bit_equal_to_over_the_copy(h_out, rows) -> None:
     bmm_out(torch.transpose(view, 0, 1), v_b_t, torch.transpose(new.view(rows, h_out, 128), 0, 1))
     bmm_out(torch.transpose(out, 0, 1), v_b_t, torch.transpose(old.view(rows, h_out, 128), 0, 1))
     assert torch.equal(new.view(torch.int16), old.view(torch.int16))
+
+
+# --- `topk_length`: the dep4 decode step's per-row selection lengths
+
+#: One dep8 GEN rank's DSpark decode step: 16 sequences of 4 verification rows (64 rows, all 64
+#: heads), four of them padding dummies of 4 keys, the others across 2048 and up to 12345 keys.
+_DSPARK_NEXT_N = 4
+_DSPARK_KV = (4, 4, 4, 4, 3, 5, 100, 2047, 2048, 2049, 2050, 2051, 4096, 9000, 12345, 7777)
+
+
+def _dspark_step(kv_lens, next_n: int, g: torch.Generator):
+    """q `[rows, 64, 576]`, a pool `[pages, 32, 1, 656]`, selections and lengths as the dep4
+    decode step has them: row b * next_n + t ends at `end = kv - next_n + t + 1` keys, holds
+    min(end, 2048) distinct causal slots first (in key order when end <= 2048, as the dense
+    selection and the selector at that width write them; else in random order) and -1 after."""
+    page, owners, row = 32, 2, 1
+    blocks = sum(-(-k // page) for k in kv_lens) + 1
+    kv = ds_mla_rows(blocks * owners * page, g).view(blocks * owners, page, 1, 656)
+    perm = torch.randperm(blocks, generator=g)
+    rows = len(kv_lens) * next_n
+    idx = torch.full((rows, 2048), -1, dtype=torch.int32)
+    lengths = []
+    used = 0
+    for b, k in enumerate(kv_lens):
+        table = perm[used : used + -(-k // page)]
+        used += table.numel()
+        for t in range(next_n):
+            end = max(0, k - next_n + t + 1)
+            n = min(end, 2048)
+            lengths.append(n)
+            pos = torch.arange(end) if end <= 2048 else torch.randperm(end, generator=g)[:n]
+            slots = (table[pos // page] * owners + row) * page + pos % page
+            idx[b * next_n + t, :n] = slots.int()
+    q = torch.randn(rows, 64, 576, generator=g).to(torch.bfloat16)
+    tl = torch.tensor(lengths, dtype=torch.int32)
+    return q.cuda(), kv.cuda(), idx.cuda(), tl.cuda()
+
+
+def test_topk_length_dspark_decode_step() -> None:
+    """Old versus new on one DSpark decode step: the call with `topk_length` and the one
+    without both gate against the fp32 reference (which, the masked tails being -1, is one
+    and the same), and a row of no valid slot (topk_length 0) is zero either way."""
+    g = torch.Generator().manual_seed(11)
+    q, kv, idx, tl = _dspark_step(_DSPARK_KV, _DSPARK_NEXT_N, g)
+    out = torch.empty(q.shape[0], 64, 512, dtype=torch.bfloat16, device="cuda")
+    with validating(op):
+        new = op(q, kv, idx, get_mla_metadata()[0], SCALE, None, topk_length=tl).clone()
+        old = op(q, kv, idx, get_mla_metadata()[0], SCALE, out)
+    ref = op.reference(q, kv, idx, None, SCALE, None, topk_length=tl)
+    assert torch.equal(ref, op.reference(q, kv, idx, None, SCALE, None))
+    live = tl > 0
+    _gate(new[live], ref[live])
+    _gate(old[live], ref[live])
+    assert not bool(new[~live].any()) and not bool(old[~live].any())
+    assert int((~live).sum()) == 1
+
+
+def test_topk_length_dspark_graph_replay() -> None:
+    """The decode step's capture: 3 layers on one sched meta made in the graph from the
+    step's `topk_length`, replayed on new queries, selections and lengths (other sequences
+    at other key counts); each replay is bitwise an eager call on a fresh sched meta of the
+    same lengths, and in the band of the reference."""
+    g = torch.Generator().manual_seed(12)
+    q, kv, idx, tl = _dspark_step(_DSPARK_KV, _DSPARK_NEXT_N, g)
+    meta = get_mla_metadata()[0]
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        op(q, kv, idx, get_mla_metadata()[0], SCALE, None, topk_length=tl)
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(3):
+            res = op(q, kv, idx, meta, SCALE, None, topk_length=tl)
+    for kv_lens in (_DSPARK_KV[::-1], (4,) * 15 + (12345,), (2500,) * 16):
+        q2, kv2, idx2, tl2 = _dspark_step(kv_lens, _DSPARK_NEXT_N, g)
+        assert kv2.shape[0] <= kv.shape[0]
+        kv[: kv2.shape[0]].copy_(kv2)
+        q.copy_(q2), idx.copy_(idx2), tl.copy_(tl2)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = op(q, kv, idx, get_mla_metadata()[0], SCALE, None, topk_length=tl)
+        assert torch.equal(res.view(torch.int16), eager.view(torch.int16))
+        live = tl > 0
+        ref = op.reference(q, kv, idx, None, SCALE, None, topk_length=tl)
+        _gate(res[live], ref[live])
+    del graph
+
+
+def test_is_valid_refuses_a_bad_topk_length() -> None:
+    g = torch.Generator().manual_seed(13)
+    q, kv, idx, tl = _dspark_step((4, 3000), _DSPARK_NEXT_N, g)
+    for bad in (tl.long(), tl[:-1], tl.cpu(), torch.stack([tl, tl], 1)[:, 0]):
+        with pytest.raises(ValueError, match="topk_length"):
+            op.is_valid(q, kv, idx, None, SCALE, None, topk_length=bad)
+    op.is_valid(q, kv, idx, None, SCALE, None, topk_length=tl)

@@ -46,7 +46,8 @@ The absorbed form throughout: `fused_q = [q_nope @ W_UK | rope(q_pe)]` (576 wide
 pooled `[c_kv | k_pe]` latent rows, then `@ W_UV`. Context rows attend over the selection (the
 engine's causal index on a step it skipped the indexer) with FlashMLA's bf16 sparse prefill
 over the requests' latent rows dequantized out of the pool, so they read the FP8-rounded latent
-as the reference does; generation rows run FlashMLA's sparse fp8 decode over the pool itself.
+as the reference does; generation rows run FlashMLA's sparse fp8 decode over the pool itself,
+the decode step's each over its own selection length.
 Both kernels take the rank's 64 heads in one call.
 
 No path is selected by the serving configuration: each step chooses from its own sizes, and
@@ -130,11 +131,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    build_split as build_ix_topk_verify,
+    build_cluster as build_ix_topk_verify,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    cluster_radix_topk_decode,
     cute_dsl_radix_topk_decode,
-    split_radix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
     ds_mla_dequant_gather_tiled,
@@ -230,6 +231,7 @@ from .ops.comm.lamport_moe_combine import lamport_moe_combine
 from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe_dispatch
 from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 from .ops.gemm.mla_v_up_fp8_block_scale_linear import mla_v_up_fp8_block_scale_linear
+from .ops.moe.moe_finalize import moe_finalize
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -340,14 +342,14 @@ _TOPK_WAVE_TILE_KEYS = 1 << 17
 # whose width it serves (`_derive_first_step`). next_n 1: cute_dsl_radix_topk_decode, one CTA
 # per row selecting the op's set (up to exact ties), at 4096 columns (where the op splits each
 # row) to 65536 (one CTA scans a whole row). DSpark verification (next_n 4):
-# split_radix_topk_decode, ten partitions plus a radix merge, at 20480 columns (the narrowest
-# row the op splits into ten blocks) to 1048584 (the 1M envelope with DSpark's headroom, the
-# split kernel's widest row), on the rows of a rank's padded graph batches 1, 2, 4, 8 and 16.
-# The split kernel takes at most 64 rows, so the graph batches padding adds above 16 when
-# max_batch_size allows them (24 and 32: 96 and 128 rows) keep the op, as do a mixed
-# step's generation rows at other counts. split_radix_topk_decode itself keeps the op for a
-# call the op would not split into ten blocks, or whose rows are not 32-byte aligned with a
-# width that is a multiple of 8.
+# cluster_radix_topk_decode, the set of the op's ten-block split selected by one cluster of CTAs
+# per row in one launch, at 20480 columns (the narrowest row the op splits into ten blocks) to
+# 1048584 (the 1M envelope with DSpark's headroom, the selector's widest row), on the rows of a
+# rank's padded graph batches 1, 2, 4, 8 and 16. The selector takes at most 64 rows, so the
+# graph batches padding adds above 16 when max_batch_size allows them (24 and 32: 96 and 128
+# rows) keep the op, as do a mixed step's generation rows at other counts.
+# cluster_radix_topk_decode itself keeps the op for a call the op would not split into ten
+# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
@@ -495,6 +497,18 @@ def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict
     )
 
 
+def _selection_lengths(kv_lens: torch.Tensor, next_n: int, topk: int) -> torch.Tensor:
+    """Each decode row's selection length, int32 `[len(kv_lens) * next_n]`.
+
+    Row `b * next_n + t` (sequence `b`'s `t`-th new token) attends to the
+    `end = kv_lens[b] - next_n + t + 1` keys before it, and both of its selections -- the
+    indexer's top-k and the engine's dense one for a step that skips it -- hold its
+    `min(end, topk)` selected slots first and -1 after, so that clamp is FlashMLA's
+    `topk_length` for the row."""
+    offsets = torch.arange(1 - next_n, 1, dtype=torch.int32, device=kv_lens.device)
+    return torch.clamp(kv_lens.unsqueeze(1) + offsets, 0, topk).view(-1)
+
+
 def _rank_counts(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> tuple[int, ...]:
     """Every rank's row count this step, in rank order: the gathered set's layout and the size
     every rank's expert-path collectives are chosen by. Every rank reads the same list, so every
@@ -507,15 +521,26 @@ def _rank_counts(core: "MistralLarge4Dep4ModelingV2", step: dict, rows: int) -> 
     return tuple(counts)
 
 
-def _own_expert_inputs(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
-    """The routed experts' inputs of this rank's own rows: the router's fp32 logits through
-    the renormalized top-k routing (expert ids int32, weights bf16), and the rows' NVFP4 codes
-    with their linear e4m3 scales under the layer's static global scale. Both are row-wise, so
-    a row's routing and codes do not depend on which rows share its call, except through the
-    router GEMM's row count, which may pick another tactic and round a logit differently."""
+def _own_routing(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
+    """The routing of this rank's own rows: the router's fp32 logits through the renormalized
+    top-k (expert ids int32, weights bf16). Row-wise, except through the router GEMM's row
+    count, which may pick another tactic and round a logit differently."""
     logits = cublas_mm(o, m.router, None, torch.float32)
-    ids, weights = renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
-    codes, scales = fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+    return renorm_moe_routing_op(logits, core.topk, torch.bfloat16)
+
+
+def _own_codes(m, o: torch.Tensor) -> tuple:
+    """This rank's own rows' NVFP4 codes with their linear e4m3 scales under the layer's static
+    global scale. Row-wise."""
+    return fp4_quantize(o, m.gscale, _NVFP4_SF_VEC, False, _NVFP4_SF_LINEAR)
+
+
+def _own_expert_inputs(core: "MistralLarge4Dep4ModelingV2", m, o: torch.Tensor) -> tuple:
+    """The routed experts' inputs of this rank's own rows: codes, scales (`_own_codes`), ids
+    and weights (`_own_routing`). A row's inputs do not depend on which rows share its call,
+    except through the router GEMM's row count."""
+    ids, weights = _own_routing(core, m, o)
+    codes, scales = _own_codes(m, o)
     return codes, scales, ids, weights
 
 
@@ -561,17 +586,21 @@ def _partial_out(core: "MistralLarge4Dep4ModelingV2", counts: tuple[int, ...]):
     return None
 
 
-def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) -> torch.Tensor:
+def _routed_experts(
+    core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None, finalize: bool = False
+) -> torch.Tensor:
     """This rank's expert window over every dispatched row, in calls of at most
     `expert_call_tokens` rows, each writing its rows of one `[rows, hidden]` bf16 partial: `out`
     when given (`_partial_out`), else a fresh one. A row whose experts all lie outside the
-    window, or whose ids are all -1, comes back +0.0."""
+    window, or whose ids are all -1, comes back +0.0. With `finalize` each call returns the
+    runner's permuted output and `moe_finalize` sums its rows: the runner's own finalize,
+    bitwise, in a faster launch at the decode step's gathered rows."""
     codes, scales, ids, weights = gathered
     total = codes.shape[0]
     sf_row = scales.numel() // total
     call = core.expert_call_tokens
     routed_all = out
-    if out is None and total > call:
+    if out is None and (total > call or finalize):
         routed_all = codes.new_empty((total, core.hidden), dtype=torch.bfloat16)
     for lo in range(0, total, call):
         hi = min(lo + call, total)
@@ -579,11 +608,16 @@ def _routed_experts(core: "MistralLarge4Dep4ModelingV2", m, gathered, out=None) 
             None, None, codes[lo:hi], scales[lo * sf_row : hi * sf_row].view(torch.float8_e4m3fn),
             m.fc1_w, m.fc1_s, None, None, None, None, m.fc2_w, m.fc2_s, None, m.out1, m.out1_gate,
             m.out2, core.num_experts, core.topk, None, None, core.moe_inter, core.expert_offset,
-            core.local_experts, None, _MOE_ROUTING_METHOD, True, _MOE_ACT_SWIGLU,
+            core.local_experts, None, _MOE_ROUTING_METHOD, not finalize, _MOE_ACT_SWIGLU,
             topk_weights=weights[lo:hi], topk_ids=ids[lo:hi],
             tune_max_num_tokens=core.expert_tune_tokens,
-            output=None if out is None else out[lo:hi],
-        )[0]  # fmt: skip
+            output=None if out is None or finalize else out[lo:hi],
+        )  # fmt: skip
+        if finalize:
+            permuted, _, idx = part
+            moe_finalize(permuted, idx, weights[lo:hi], routed_all[lo:hi])
+            continue
+        part = part[0]
         if out is not None:
             continue
         if routed_all is None:
@@ -1068,7 +1102,7 @@ class MistralLarge4Dep4ModelingV2(DecoderModel):
             and lo <= logits.shape[1] <= hi
             and logits.dtype == torch.float32
         ):
-            return split_radix_topk_decode(
+            return cluster_radix_topk_decode(
                 logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
             )
         if next_n != 1 or self._ix_topk is None:
@@ -1821,13 +1855,16 @@ class DecodeTarget:
         # events fork it from and join it to the main stream. The indexer's key half runs ahead
         # of it there; its two events fork it and mark its keys and head weights ready. On a
         # layer without an indexer the latent runs on the main stream instead, and its event
-        # marks it ready for the query half's rope append.
+        # marks it ready for the query half's rope append. In the MoE block the routed experts'
+        # NVFP4 codes are quantized there ahead of the shared expert; their event marks them
+        # ready for the dispatch.
         self._latent_stream = core._side_stream
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
         self._keys_fork = torch.cuda.Event()
         self._keys_ready = torch.cuda.Event()
         self._latent_ready = torch.cuda.Event()
+        self._codes_ready = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1947,23 +1984,32 @@ class DecodeTarget:
         input norm: `(x, residual)`. The shared expert runs on its own rows on the side stream,
         beside the routed experts over every rank's gathered rows.
 
-        The router, the routing and the NVFP4 quantization run on this rank's own rows; their
-        codes, scales, ids and weights are gathered from every rank unpadded (`counts`), so
-        every rank holds the identical rows in rank order -- beside a prefilling peer up to
-        `world_size * max_num_tokens` of them, so the expert calls' chunking is this target's
-        too. While no rank holds more than the workspace (`_one_shot`, every captured decode
-        graph) the reduce-scatter is the one-shot kernel that also adds the shared expert and
-        `residual` (in place) and applies the next layer's norm; past it, the alltoall or NCCL
-        (`_alltoall`) and the adds and norm as separate ops."""
+        The router, the routing and the NVFP4 quantization run on this rank's own rows, the
+        quantization on the side stream beside the router and the routing; the dispatch waits
+        for its codes. The shared expert follows it there once the routing is issued, so the
+        router and the routing run without it beside them. Their codes, scales, ids and weights are
+        gathered from every rank unpadded (`counts`), so every rank holds the identical rows in
+        rank order -- beside a prefilling peer up to `world_size * max_num_tokens` of them, so
+        the expert calls' chunking is this target's too. While no rank holds more than the
+        workspace (`_one_shot`, every captured decode graph) the reduce-scatter is the one-shot
+        kernel that also adds the shared expert and `residual` (in place) and applies the next
+        layer's norm; past it, the alltoall or NCCL (`_alltoall`) and the adds and norm as
+        separate ops."""
         core = self.core
         m = L.moe
         side = core._side_stream
         main = torch.cuda.current_stream()
         side.wait_stream(main)
         with torch.cuda.stream(side):
+            codes, scales = _own_codes(m, o)
+            self._codes_ready.record()
+        ids, weights = _own_routing(core, m, o)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
             shared = self._dense(o, L)
-        gathered = _dispatch(core, _own_expert_inputs(core, m, o), counts)
-        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts))
+        self._codes_ready.wait()
+        gathered = _dispatch(core, (codes, scales, ids, weights), counts)
+        routed_all = _routed_experts(core, m, gathered, _partial_out(core, counts), finalize=True)
         if _one_shot(core, counts):
             main.wait_stream(side)
             x = lamport_moe_combine(
@@ -2011,7 +2057,7 @@ class DecodeTarget:
             topk_buf = step["topk_indices_buffer"][:rows]
         else:
             topk_buf = torch.empty([rows, core.idx_topk], dtype=torch.int32, device=dev)
-        scratch = self._scratch(rows, h.dtype, dev)
+        scratch = self._scratch(step, rows, h.dtype, dev)
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         # The attention block adds into the residual in place, so the residual starts in a
@@ -2036,14 +2082,18 @@ class DecodeTarget:
                 spec_metadata.maybe_capture_hidden_states(layer_idx, residual)
         return x
 
-    def _scratch(self, rows: int, dtype, dev) -> SimpleNamespace:
+    def _scratch(self, step, rows: int, dtype, dev) -> SimpleNamespace:
         """Per-step scratch every layer rewrites in turn: the absorbed query at the kernel's 64
         heads (this rank's first, the rest zero for the step), a NoPE owner's 576-wide latent
         rows (the rope key zero for the step), the latent attention output the unfused glue
-        copies FlashMLA's live heads into, and the FlashMLA scheduler the step's first layer
-        fills and the rest share (captured with the step)."""
+        copies FlashMLA's live heads into, the FlashMLA scheduler the step's first layer
+        fills and the rest share (captured with the step), and each row's selection length
+        (`_selection_lengths`), FlashMLA's `topk_length`: a padding dummy's or short
+        sequence's row costs the decode its few keys' blocks instead of all of
+        `index_topk`'s."""
         core = self.core
         bf16 = dict(dtype=dtype, device=dev)
+        num_seqs = step["num_seqs"]
         return SimpleNamespace(
             fused_q=torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16),
             nope_lat=None if core.unfused_glue else torch.zeros([rows, core.lat_dim], **bf16),
@@ -2051,6 +2101,9 @@ class DecodeTarget:
                 torch.empty([rows, core.heads, core.kv_lora], **bf16) if core.unfused_glue else None
             ),
             sched=get_mla_metadata()[0],
+            topk_len=_selection_lengths(
+                step["kv_lens_cuda"][:num_seqs], rows // num_seqs, core.idx_topk
+            ),
         )
 
     def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
@@ -2145,12 +2198,14 @@ class DecodeTarget:
         )
         if core.unfused_glue:
             lat = flash_mla_sparse_decode(
-                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out
-            )
+                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, s.lat_out,
+                topk_length=s.topk_len,
+            )  # fmt: skip
         else:
             lat = flash_mla_sparse_decode(
-                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None
-            )[:, : core.heads]
+                s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None,
+                topk_length=s.topk_len,
+            )[:, : core.heads]  # fmt: skip
         return mla_v_up_fp8_block_scale_linear(lat, L.v_b_t, L.wo, L.wo_s)
 
     def dspark_forward(

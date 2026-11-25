@@ -12,6 +12,7 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from .._op import Arch, Cell, OpWrapper
+from . import _cluster_radix_topk_decode as _cluster_kernel
 from . import _radix_topk_decode as _kernel
 from .indexer_topk_decode import indexer_topk_decode
 
@@ -582,6 +583,50 @@ def build_split(
     return handle
 
 
+def _split_call_runs(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    aux_indices: torch.Tensor,
+    aux_logits: torch.Tensor,
+    *,
+    next_n: int,
+    device_id: int,
+    sm_count: int,
+) -> bool:
+    """Validate a split or cluster selector call; whether its kernels run it, else the op.
+
+    The kernels serve the shapes the op splits into ten blocks per row, with rows 32-byte
+    aligned and a width that is a multiple of 8, which their vector reads require."""
+    if logits.ndim != 2 or logits.dtype != torch.float32 or not logits.is_cuda:
+        raise ValueError("logits must be a two-dimensional CUDA float32 tensor")
+    rows, width = logits.shape
+    if not 4096 <= width <= 1048584 or rows > 64:
+        raise ValueError("split radix requires width 4096..1048584 and at most 64 rows")
+    if logits.stride(1) != 1 or logits.stride(0) < width:
+        raise ValueError("logits must have unit column stride and non-overlapping rows")
+    if seq_lens.shape != (rows // next_n,) or rows % next_n:
+        raise ValueError("seq_lens must contain one length per request")
+    if indices.shape != (rows, TOP_K):
+        raise ValueError(f"indices must have shape ({rows}, {TOP_K})")
+    native_partitions = blocks_per_row(rows, width, sm_count)
+    needed = rows * native_partitions * TOP_K
+    for name, tensor, dtype in (
+        ("seq_lens", seq_lens, torch.int32),
+        ("indices", indices, torch.int32),
+        ("aux_indices", aux_indices, torch.int32),
+        ("aux_logits", aux_logits, torch.float32),
+    ):
+        if tensor.dtype != dtype or tensor.device != logits.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous {dtype} on {logits.device}")
+    if logits.device.index != device_id:
+        raise ValueError("compiled selector and logits must be on the same CUDA device")
+    if aux_indices.numel() < needed or aux_logits.numel() < needed:
+        raise ValueError(f"scratch must hold at least {needed} elements")
+    vector_rows = logits.data_ptr() % 32 == 0 and logits.stride(0) % 8 == 0 and width % 8 == 0
+    return native_partitions == _MAX_BLOCKS_PER_ROW and vector_rows
+
+
 def split_radix_topk_decode(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -600,40 +645,138 @@ def split_radix_topk_decode(
     preserving that shape's sentinel and nonfinite behavior, and when its rows are not
     32-byte aligned with a width that is a multiple of 8, which its vector reads require.
     """
-    if logits.ndim != 2 or logits.dtype != torch.float32 or not logits.is_cuda:
-        raise ValueError("logits must be a two-dimensional CUDA float32 tensor")
-    rows, width = logits.shape
-    if not 4096 <= width <= 1048584 or rows > 64:
-        raise ValueError("split radix requires width 4096..1048584 and at most 64 rows")
-    if logits.stride(1) != 1 or logits.stride(0) < width:
-        raise ValueError("logits must have unit column stride and non-overlapping rows")
-    if seq_lens.shape != (rows // compiled.next_n,) or rows % compiled.next_n:
-        raise ValueError("seq_lens must contain one length per request")
-    if indices.shape != (rows, TOP_K):
-        raise ValueError(f"indices must have shape ({rows}, {TOP_K})")
-    native_partitions = blocks_per_row(rows, width, compiled.sm_count)
-    needed = rows * native_partitions * TOP_K
-    for name, tensor, dtype in (
-        ("seq_lens", seq_lens, torch.int32),
-        ("indices", indices, torch.int32),
-        ("aux_indices", aux_indices, torch.int32),
-        ("aux_logits", aux_logits, torch.float32),
-    ):
-        if tensor.dtype != dtype or tensor.device != logits.device or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous {dtype} on {logits.device}")
-    if logits.device.index != compiled.device_id:
-        raise ValueError("compiled selector and logits must be on the same CUDA device")
-    if aux_indices.numel() < needed or aux_logits.numel() < needed:
-        raise ValueError(f"scratch must hold at least {needed} elements")
-    vector_rows = logits.data_ptr() % 32 == 0 and logits.stride(0) % 8 == 0 and width % 8 == 0
-    if rows:
-        if native_partitions != compiled.partitions or not vector_rows:
+    runs = _split_call_runs(
+        logits, seq_lens, indices, aux_indices, aux_logits,
+        next_n=compiled.next_n, device_id=compiled.device_id, sm_count=compiled.sm_count,
+    )  # fmt: skip
+    if logits.shape[0]:
+        if not runs:
             return indexer_topk_decode(
                 logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
             )
         flat_i, flat_l = aux_indices.view(-1), aux_logits.view(-1)
         compiled.stage1(logits, seq_lens, flat_i, flat_l)
         compiled.stage2(flat_i, flat_l, indices)
+    return indices
+
+
+@dataclass(frozen=True)
+class CompiledClusterRadixTopkDecode:
+    """The precompiled one-launch selector; scratch is supplied by the caller."""
+
+    launch: object
+    device_id: int
+    next_n: int
+    cluster: int
+    threads: int
+    unroll: int
+    pipe: bool
+    min_blocks: int
+    use_pdl: bool
+    sm_count: int
+
+
+_CLUSTER_COMPILED: dict[tuple, CompiledClusterRadixTopkDecode] = {}
+
+
+def build_cluster(
+    device_id: int,
+    *,
+    next_n: int = 4,
+    cluster: int = 8,
+    threads: int = 512,
+    unroll: int = 2,
+    pipe: bool = True,
+    min_blocks: int = 0,
+    use_pdl: bool = True,
+) -> CompiledClusterRadixTopkDecode:
+    """Compile `cluster_radix_topk_decode`'s launch before capture: `cluster` CTAs of `threads`
+    threads per row, `unroll` vectors per thread per batch, `pipe` and `min_blocks` as
+    `_cluster_radix_topk_decode.ClusterRadixTopkDecodeKernel` takes them. Rows, width and row
+    stride are symbolic."""
+    if next_n not in (1, 4):
+        raise ValueError("cluster radix requires next_n 1 or 4")
+    if (
+        cluster not in (2, 4, 8, 16)
+        or threads not in (256, 512, 1024)
+        or unroll not in (1, 2, 4, 8)
+    ):
+        raise ValueError(
+            "cluster radix requires cluster 2/4/8/16, threads 256/512/1024, unroll 1/2/4/8"
+        )
+    if min_blocks not in (0, 1, 2, 4):
+        raise ValueError("cluster radix requires min_blocks 0, 1, 2 or 4")
+    key = (
+        int(device_id), int(next_n), int(cluster), int(threads), int(unroll), bool(pipe),
+        int(min_blocks), bool(use_pdl),
+    )  # fmt: skip
+    if key in _CLUSTER_COMPILED:
+        return _CLUSTER_COMPILED[key]
+    with torch.cuda.device(device_id):
+        rows, cols, batch, size = (cute.sym_int() for _ in range(4))
+        stride = cute.sym_int64()
+        fake_logits = make_fake_tensor(
+            cutlass.Float32, (rows, cols), stride=(stride, 1), assumed_align=4
+        )
+        fake_lens = make_fake_compact_tensor(cutlass.Int32, (batch,), assumed_align=4)
+        fake_aux_i = make_fake_compact_tensor(cutlass.Int32, (size,), assumed_align=4)
+        fake_aux_l = make_fake_compact_tensor(cutlass.Float32, (size,), assumed_align=4)
+        fake_out = make_fake_compact_tensor(
+            cutlass.Int32, (rows, TOP_K), stride_order=(1, 0), assumed_align=4
+        )
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = _cluster_kernel.ClusterRadixTopkDecodeKernel(
+            next_n, cluster, threads, unroll, use_pdl, pipe=pipe, min_blocks=min_blocks
+        )
+        launch = cute.compile(
+            kernel,
+            fake_logits,
+            fake_lens,
+            fake_aux_i,
+            fake_aux_l,
+            fake_out,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        sm_count = torch.cuda.get_device_properties(device_id).multi_processor_count
+        handle = CompiledClusterRadixTopkDecode(launch, *key, int(sm_count))
+        logits = torch.zeros((next_n, 4096), dtype=torch.float32, device="cuda")
+        lens = torch.full((1,), 4096, dtype=torch.int32, device="cuda")
+        out = torch.empty((next_n, TOP_K), dtype=torch.int32, device="cuda")
+        aux_i = torch.empty(next_n * _MAX_BLOCKS_PER_ROW * TOP_K, dtype=torch.int32, device="cuda")
+        aux_l = torch.empty_like(aux_i, dtype=torch.float32)
+        launch(logits, lens, aux_i, aux_l, out)
+        torch.cuda.synchronize()
+    _CLUSTER_COMPILED[key] = handle
+    return handle
+
+
+def cluster_radix_topk_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    aux_indices: torch.Tensor,
+    aux_logits: torch.Tensor,
+    *,
+    compiled: CompiledClusterRadixTopkDecode,
+) -> torch.Tensor:
+    """`split_radix_topk_decode`'s selection and contract in one cluster launch per call.
+
+    The same set per row (ties at the k-th key taken in no particular order, columns before
+    the op's pads), valid columns first in no particular order, then -1. The scratch buffers
+    are read only for rows holding a negative NaN, which take the split selector's code; the
+    native op serves the shapes `split_radix_topk_decode` gives it.
+    """
+    runs = _split_call_runs(
+        logits, seq_lens, indices, aux_indices, aux_logits,
+        next_n=compiled.next_n, device_id=compiled.device_id, sm_count=compiled.sm_count,
+    )  # fmt: skip
+    if logits.shape[0]:
+        if not runs:
+            return indexer_topk_decode(
+                logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
+            )
+        compiled.launch(logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), indices)
     return indices
 
 
