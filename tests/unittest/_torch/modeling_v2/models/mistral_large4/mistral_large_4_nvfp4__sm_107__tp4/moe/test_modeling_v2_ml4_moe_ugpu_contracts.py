@@ -144,6 +144,64 @@ class TestLocalityMapContracts(unittest.TestCase):
         self.assertEqual(_LOCALITY.recommend_moe_locality_mode(768), "n_split")
         self.assertEqual(_LOCALITY.recommend_moe_locality_mode(384), "none")
 
+    def test_harvested_sm_fallback_to_none(self) -> None:
+        # Harvested-SM VR200 (212 SMs total, 2 domains x 80 SMs + 52 remainder):
+        # 94 routed CTAs/domain exceeds 80 SMs/domain, so all uGPU modes must degrade cleanly to 'none'.
+        req_shared = _LOCALITY.required_moe_ctas_per_domain(212, shared=True)
+        req_unshared = _LOCALITY.required_moe_ctas_per_domain(212, shared=False)
+        self.assertEqual(req_shared, 94)
+        self.assertEqual(req_unshared, 96)
+
+        self.assertEqual(
+            _LOCALITY.recommend_moe_locality_mode(
+                768, sms_per_domain=80, required_per_domain=req_shared
+            ),
+            "none",
+        )
+        self.assertEqual(
+            _LOCALITY.recommend_moe_locality_mode(
+                768, sms_per_domain=100, required_per_domain=req_shared
+            ),
+            "n_split",
+        )
+
+        for requested in ("auto", "n_split", "expert_half"):
+            mode, reason = _LOCALITY.resolve_moe_locality_mode(
+                requested, 768, sms_per_domain=80, required_per_domain=req_shared
+            )
+            self.assertEqual(mode, "none")
+            self.assertIsNotNone(reason)
+            assert reason is not None
+            self.assertIn("80", reason)
+            self.assertIn("94", reason)
+
+        # Full-SM VR200 (100 SMs/domain) preserves n_split and explicit expert_half without fallback.
+        self.assertEqual(
+            _LOCALITY.resolve_moe_locality_mode(
+                "auto", 768, sms_per_domain=100, required_per_domain=req_shared
+            ),
+            ("n_split", None),
+        )
+        self.assertEqual(
+            _LOCALITY.resolve_moe_locality_mode(
+                "expert_half", 768, sms_per_domain=100, required_per_domain=req_shared
+            ),
+            ("expert_half", None),
+        )
+        # TP16 auto -> 'none' emits no harvested-SM warning.
+        self.assertEqual(
+            _LOCALITY.resolve_moe_locality_mode(
+                "auto", 384, sms_per_domain=80, required_per_domain=req_shared
+            ),
+            ("none", None),
+        )
+
+        # Direct host logical_map builder remains fail-closed when per_domain > sms_per_domain.
+        harvested_doms = [list(range(0, 80)), list(range(80, 160))]
+        harvested_rem = list(range(160, 212))
+        with self.assertRaises(ValueError):
+            _LOCALITY.build_logical_map_host(harvested_doms, harvested_rem, 212, 94, 24)
+
     def test_fp8_linear_and_lm_head_granule_splits(self) -> None:
         # ix_wq_b [4096, 6144] FP8 = 24 MiB -> 12+12 MiB exact.
         hb, phb, exact = _LOCALITY.plan_n_split_bytes((4096, 6144), 1, dim=0, granule=self.gran)

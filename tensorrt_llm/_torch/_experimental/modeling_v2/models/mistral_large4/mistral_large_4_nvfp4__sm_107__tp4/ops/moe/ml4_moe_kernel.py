@@ -25,7 +25,12 @@ try:
 except ImportError:  # pragma: no cover - CPU pure-Python helpers stay importable without torch
     torch = None  # type: ignore[assignment]
 
-from ..gemm.locality import LocalityMap, PlacedSplit, recommend_moe_locality_mode
+from ..gemm.locality import (
+    LocalityMap,
+    PlacedSplit,
+    required_moe_ctas_per_domain,
+    resolve_moe_locality_mode,
+)
 
 __all__ = [
     "AR_PUSH_LAMPORT_3SLOT",
@@ -819,20 +824,46 @@ class Ml4MoeState:
         self.m = num_tokens
 
         sms_all = torch.cuda.get_device_properties(self.device).multi_processor_count
+        max_routed = HIDDEN // 32  # 192
+        nsh = SHARED_CTAS if self.shared else 0
+        default_ctas = min(max_routed, sms_all - nsh)
+        req_per_domain = required_moe_ctas_per_domain(
+            sms_all,
+            shared=self.shared,
+            shared_ctas=SHARED_CTAS,
+            max_routed=max_routed,
+            num_ctas=num_ctas,
+        )
         resolved_mode: LocalityModeStr
-        if locality_mode == "auto":
-            resolved_mode = recommend_moe_locality_mode(inter, NUM_EXPERTS)
-        else:
-            resolved_mode = locality_mode
-        if resolved_mode not in _LOCALITY_TO_INT:
-            raise ValueError(f"ml4_moe: unknown locality_mode={locality_mode!r}")
+        resolved_mode, _ = resolve_moe_locality_mode(locality_mode, inter, NUM_EXPERTS)
 
         self.locality_map: Optional[LocalityMap] = None
         if resolved_mode != "none":
-            self.locality_map = LocalityMap.get(self.device)
+            try:
+                lm = LocalityMap.get(self.device)
+            except (ImportError, RuntimeError) as err:
+                if logger is not None:
+                    logger.warning(
+                        f"[ML4 sm_107] ml4_moe_engine: LocalityMap unavailable on {self.device} "
+                        f"({err}); falling back to 'none'"
+                    )
+                resolved_mode = "none"
+            else:
+                resolved_mode, fallback_reason = resolve_moe_locality_mode(
+                    resolved_mode,
+                    inter,
+                    NUM_EXPERTS,
+                    sms_per_domain=lm.sms_per_domain,
+                    required_per_domain=req_per_domain,
+                )
+                if fallback_reason is not None:
+                    if logger is not None:
+                        logger.warning(
+                            f"[ML4 sm_107] ml4_moe_engine on {self.device}: {fallback_reason}"
+                        )
+                elif resolved_mode != "none":
+                    self.locality_map = lm
 
-        max_routed = HIDDEN // 32  # 192
-        default_ctas = min(max_routed, sms_all - (SHARED_CTAS if self.shared else 0))
         resolved_ctas = default_ctas if num_ctas is None else num_ctas
         if resolved_mode != "none" and resolved_ctas % 2 != 0:
             resolved_ctas -= 1
@@ -840,14 +871,12 @@ class Ml4MoeState:
             raise ValueError(
                 f"ml4_moe: num_ctas={resolved_ctas} must be in [{MIN_CTAS}, {max_routed}]"
             )
-        if resolved_ctas + (SHARED_CTAS if self.shared else 0) > sms_all:
+        if resolved_ctas + nsh > sms_all:
             raise ValueError(
-                f"ml4_moe: {resolved_ctas} routed + {SHARED_CTAS if self.shared else 0} shared "
-                f"exceeds {sms_all} SMs"
+                f"ml4_moe: {resolved_ctas} routed + {nsh} shared exceeds {sms_all} SMs"
             )
         self.num_ctas = resolved_ctas
         self.locality_mode: LocalityModeStr = resolved_mode
-        nsh = SHARED_CTAS if self.shared else 0
         grid_ctas = sms_all if resolved_mode != "none" else (self.num_ctas + nsh)
 
         if self.locality_map is not None:

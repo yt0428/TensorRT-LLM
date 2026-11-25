@@ -45,6 +45,8 @@ __all__ = [
     "plan_expert_half_bytes",
     "plan_n_split_bytes",
     "recommend_moe_locality_mode",
+    "required_moe_ctas_per_domain",
+    "resolve_moe_locality_mode",
 ]
 
 DEFAULT_VMM_GRANULARITY = 2 * 1024 * 1024  # 2 MiB on Rubin VR200
@@ -227,21 +229,71 @@ def plan_expert_half_bytes(
     return split_expert, half_bytes, padded_half, exact
 
 
+def required_moe_ctas_per_domain(
+    num_sms: int,
+    *,
+    shared: bool = True,
+    shared_ctas: int = 24,
+    max_routed: int = 192,
+    num_ctas: int | None = None,
+) -> int:
+    """Return the routed CTAs per locality domain required by the persistent MoE engine."""
+    default_ctas = min(max_routed, num_sms - (shared_ctas if shared else 0))
+    resolved_ctas = default_ctas if num_ctas is None else num_ctas
+    if resolved_ctas % 2 != 0:
+        resolved_ctas -= 1
+    return max(0, resolved_ctas // 2)
+
+
 def recommend_moe_locality_mode(
     moe_inter: int,
     num_experts: int = 128,
+    *,
+    sms_per_domain: int | None = None,
+    required_per_domain: int = 94,
 ) -> Literal["n_split", "none"]:
     """Choose the default Paradigm-B MoE locality mode for a per-rank intermediate width.
 
     * For ``moe_inter >= 512`` with 128-aligned half-width (TP4 ``I=1536``, TP8 ``I=768``),
-      ``n_split`` places FC1 and FC2 halves in die-local HBM4 with deterministic 50/50 balance.
-    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``), ``none`` stays lowest-latency while
-      ``n_split`` and ``expert_half`` remain available when requested explicitly.
+      ``n_split`` places FC1 and FC2 halves in die-local HBM4 with deterministic 50/50 balance,
+      provided the GPU has at least ``required_per_domain`` SMs per locality domain.
+    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``) or harvested-SM GPUs with
+      ``sms_per_domain < required_per_domain``, falls back to ``none``.
     """
     del num_experts
+    if sms_per_domain is not None and sms_per_domain < required_per_domain:
+        return "none"
     if moe_inter >= 512 and (moe_inter // 2) % 128 == 0:
         return "n_split"
     return "none"
+
+
+def resolve_moe_locality_mode(
+    requested_mode: str,
+    moe_inter: int,
+    num_experts: int = 128,
+    *,
+    sms_per_domain: int | None = None,
+    required_per_domain: int = 94,
+) -> tuple[Literal["none", "n_split", "expert_half"], str | None]:
+    """Resolve ``requested_mode`` against hardware ``sms_per_domain``, falling back to ``'none'``
+    with a diagnostic reason string when a GPU lacks enough per-domain SMs."""
+    if requested_mode == "auto":
+        mode: Literal["none", "n_split", "expert_half"] = recommend_moe_locality_mode(
+            moe_inter, num_experts
+        )
+    elif requested_mode in ("none", "n_split", "expert_half"):
+        mode = requested_mode  # type: ignore[assignment]
+    else:
+        raise ValueError(f"ml4_moe: unknown locality_mode={requested_mode!r}")
+
+    if mode != "none" and sms_per_domain is not None and sms_per_domain < required_per_domain:
+        reason = (
+            f"locality mode {mode!r} requires {required_per_domain} CTAs/domain "
+            f"but device has sms_per_domain={sms_per_domain}; falling back to 'none'"
+        )
+        return "none", reason
+    return mode, None
 
 
 # -----------------------------------------------------------------------------

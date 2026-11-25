@@ -1370,17 +1370,20 @@ def place_target_ugpu_weights(
         return None
     if not layers:
         return None
-    from .ops.gemm.locality import LocalityMap, recommend_moe_locality_mode
+    from .ops.gemm.locality import (
+        LocalityMap,
+        required_moe_ctas_per_domain,
+        resolve_moe_locality_mode,
+    )
     from .ops.gemm.ml4_mx_gemv import prepare_ugpu_gemv_weight
 
-    resolved_moe_mode = moe_locality_mode
-    if resolved_moe_mode == "auto":
-        moe_layer = next((L.moe for L in layers if L.moe is not None), None)
-        if moe_layer is not None:
-            inter = moe_layer.fc1_w.shape[1] // 2
-            resolved_moe_mode = recommend_moe_locality_mode(inter, moe_layer.fc1_w.shape[0])
-        else:
-            resolved_moe_mode = "none"
+    moe_layer = next((L.moe for L in layers if L.moe is not None), None)
+    inter = moe_layer.fc1_w.shape[1] // 2 if moe_layer is not None else 0
+    num_experts = moe_layer.fc1_w.shape[0] if moe_layer is not None else 128
+    if moe_layer is None:
+        resolved_moe_mode = "none"
+    else:
+        resolved_moe_mode, _ = resolve_moe_locality_mode(moe_locality_mode, inter, num_experts)
 
     if resolved_moe_mode == "none" and not gemv_ugpu:
         return None
@@ -1392,6 +1395,21 @@ def place_target_ugpu_weights(
         lm = LocalityMap.get(dev)
     except (ImportError, RuntimeError) as err:
         logger.warning(f"[ML4 sm_107] uGPU placement unavailable ({err}); staying unplaced")
+        return None
+
+    if resolved_moe_mode != "none":
+        req_per_domain = required_moe_ctas_per_domain(lm.num_sms, shared=True)
+        resolved_moe_mode, fallback_reason = resolve_moe_locality_mode(
+            resolved_moe_mode,
+            inter,
+            num_experts,
+            sms_per_domain=lm.sms_per_domain,
+            required_per_domain=req_per_domain,
+        )
+        if fallback_reason is not None:
+            logger.warning(f"[ML4 sm_107] Paradigm-B MoE uGPU disabled on {dev}: {fallback_reason}")
+
+    if resolved_moe_mode == "none" and not gemv_ugpu:
         return None
 
     for L in layers:
