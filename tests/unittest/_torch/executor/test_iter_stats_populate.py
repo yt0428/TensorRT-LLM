@@ -154,6 +154,7 @@ class _StubQueueItem:
             request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         self.request = types.SimpleNamespace(
             input_token_ids=input_token_ids,
+            num_input_tokens=len(input_token_ids),
             request_type=request_type,
         )
         self.is_normal_request = is_normal_request
@@ -186,7 +187,7 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
         channel so regression tests can verify ``_update_iter_stats`` uses
         the explicit scheduled-batch stats argument instead.
     """
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _GpuMemUsageSampler
 
     fake = MagicMock()
     fake.max_num_active_requests = 64
@@ -201,6 +202,7 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
     fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
+    fake._gpu_mem_usage = _GpuMemUsageSampler()
     return fake
 
 
@@ -1103,6 +1105,71 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
 # runs in a later loop than the one that built the batch, so re-stamping from
 # the live counter mislabels the record by 1+ iterations.
 # ---------------------------------------------------------------------------
+
+
+def test_gpu_mem_usage_is_cached_between_refreshes():
+    """``gpu_mem_usage`` keeps its meaning (device total - free) but is re-read
+    from the driver only once per refresh interval."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import _GpuMemUsageSampler
+
+    clock = [100.0]
+    mem_get_info = MagicMock(side_effect=[(3 << 30, 8 << 30), (1 << 30, 8 << 30)])
+    with (
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.time.monotonic", lambda: clock[0]),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info", mem_get_info),
+    ):
+        sampler = _GpuMemUsageSampler(refresh_interval_s=2.0)
+        assert sampler.get() == 5 << 30
+        clock[0] += 1.9
+        assert sampler.get() == 5 << 30
+        assert mem_get_info.call_count == 1
+        clock[0] += 0.1
+        assert sampler.get() == 7 << 30
+        assert mem_get_info.call_count == 2
+
+
+def test_update_iter_stats_reports_used_gpu_memory():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states=None)
+    stats = IterationStats()
+    stats.inflight_batching_stats = InflightBatchingStats()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(3 << 30, 8 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+        )
+
+    assert stats.gpu_mem_usage == 5 << 30
+
+
+def test_queued_token_counts_do_not_read_prompts():
+    """Queued prompt lengths come from ``num_input_tokens``; building
+    ``input_token_ids`` would copy every queued prompt into a Python list on
+    every iteration."""
+
+    class _LengthOnlyRequest(types.SimpleNamespace):
+        @property
+        def input_token_ids(self):
+            raise AssertionError("queued counters must not materialize input_token_ids")
+
+    from tensorrt_llm.bindings.executor import RequestType
+
+    item = _StubQueueItem(input_token_ids=list(range(300)))
+    item.request = _LengthOnlyRequest(
+        num_input_tokens=300, request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY
+    )
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), [item], num_ctx_tokens=0)
+
+    assert stats.inflight_batching_stats.num_queued_gen_requests == 1
+    assert stats.inflight_batching_stats.num_queued_gen_kv_tokens == 300
 
 
 def test_update_iter_stats_does_not_overwrite_construction_iter():

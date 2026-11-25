@@ -258,6 +258,32 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 # minute, while cutting the collective rate by an order of magnitude.
 KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 
+# Longest time IterationStats.gpu_mem_usage may lag the device.
+_GPU_MEM_USAGE_REFRESH_INTERVAL_S = 2.0
+
+
+class _GpuMemUsageSampler:
+    """Device-wide GPU memory in use (total - free), re-read at most once per interval.
+
+    cudaMemGetInfo takes a driver lock that other processes on the node can hold
+    for tens of milliseconds. Reading it on every iteration stalls the executor
+    loop, and with it every rank waiting at the next collective, whenever they do.
+    """
+
+    def __init__(self,
+                 refresh_interval_s: float = _GPU_MEM_USAGE_REFRESH_INTERVAL_S):
+        self._refresh_interval_s = refresh_interval_s
+        self._used_bytes = 0
+        self._next_refresh_time = -math.inf
+
+    def get(self) -> int:
+        now = time.monotonic()
+        if now >= self._next_refresh_time:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            self._used_bytes = total_bytes - free_bytes
+            self._next_refresh_time = now + self._refresh_interval_s
+        return self._used_bytes
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -1026,6 +1052,7 @@ class PyExecutor:
 
         self.stats_lock = threading.Lock()
         self.stats = []
+        self._gpu_mem_usage = _GpuMemUsageSampler()
         self._latest_kv_iter_stats = None
         self._last_kv_iter_stats_fetch_iter = None
         self._kv_iter_stats_interval = getattr(
@@ -2510,8 +2537,7 @@ class PyExecutor:
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
-        end, total_gpu_memory = torch.cuda.mem_get_info()
-        stats.gpu_mem_usage = total_gpu_memory - end
+        stats.gpu_mem_usage = self._gpu_mem_usage.get()
         stats.cpu_mem_usage = 0
         stats.pinned_mem_usage = 0
 
@@ -2726,7 +2752,9 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                # num_input_tokens reads the length in C++; len(input_token_ids)
+                # would first build the whole prompt as a Python list.
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -2735,7 +2763,7 @@ class PyExecutor:
                 # non-empty input_token_ids), logged so future API drift
                 # surfaces instead of being silently dropped.
                 logger.warning(f"Excluding queued item {item.id} from queued "
-                               f"counters: input_token_ids not readable "
+                               f"counters: num_input_tokens not readable "
                                f"({type(e).__name__})")
                 continue
             if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
