@@ -59,22 +59,15 @@ def shard_capacity(max_seq_len: int, group_size: int) -> int:
     return shard_size(max_seq_len, group_size)
 
 
-def iss_enabled(env: Optional[AbcMapping[str, str]] = None) -> bool:
-    """Whether ISS-8/16 key-sharded DSA indexing is enabled (TRTLLM_ML4_ENABLE_ISS != '0')."""
-    source = os.environ if env is None else env
-    return source.get("TRTLLM_ML4_ENABLE_ISS", "1") != "0"
-
-
 def default_iss_min_ctx_len(tp_size: int, env: Optional[AbcMapping[str, str]] = None) -> int:
     """Dynamic context-length threshold L_thresh for switching from local top-k to ISS.
 
-    Reads ``TRTLLM_ML4_ISS_MIN_CTX_LEN`` when set (0 activates ISS for any eligible length above
-    the skip threshold; negative disables ISS). Defaults to 131072 at TP16 and 262144 at TP8.
+    Reads ``TRTLLM_ML4_ISS_MIN_CTX_LEN`` when set; defaults to 131072 at TP16 and 262144 at TP8.
     """
     source = os.environ if env is None else env
     raw = source.get("TRTLLM_ML4_ISS_MIN_CTX_LEN")
     if raw is not None and raw != "":
-        return int(raw)
+        return max(int(raw), 0)
     return _DEFAULT_ISS_MIN_CTX_LEN_BY_TP.get(tp_size, _DEFAULT_ISS_MIN_CTX_LEN)
 
 
@@ -90,7 +83,6 @@ def should_use_iss(
     capturing: bool,
     has_workspace: bool,
     skip_gen: bool = False,
-    enabled: bool = True,
     supported_world_sizes: tuple[int, ...] = ISS_WORLD_SIZES,
 ) -> bool:
     """Decide whether this decode step takes the ISS key-sharded indexer path.
@@ -102,8 +94,7 @@ def should_use_iss(
     ``shard_capacity(max_ctx_len, tp_size) <= MAX_SHARD``.
     """
     if (
-        not enabled
-        or not has_workspace
+        not has_workspace
         or skip_gen
         or l_thresh < 0
         or tp_size not in supported_world_sizes
@@ -137,14 +128,17 @@ class HistTopkWorkspace:
 
 
 def hist_topk_supported(mapping: "Mapping") -> bool:
-    """Whether the key-sharded top-k can serve this mapping: a pure tensor-parallel group of 2 to
-    16 ranks without attention DP or context parallelism, on an MNNVL fabric."""
+    """Whether the key-sharded top-k can serve this mapping: registered C++ thops and a pure
+    tensor-parallel group of 2 to 16 ranks without attention DP or context parallelism, on an
+    MNNVL fabric."""
     import torch
 
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
     return (
-        2 <= mapping.tp_size <= MAX_RANKS
+        hasattr(torch.ops.trtllm, "glm_dsa_hist_topk")
+        and hasattr(torch.ops.trtllm, "glm_dsa_hist_shard_meta")
+        and 2 <= mapping.tp_size <= MAX_RANKS
         and mapping.world_size == mapping.tp_size
         and not mapping.has_cp()
         and not mapping.enable_attention_dp
@@ -152,9 +146,7 @@ def hist_topk_supported(mapping: "Mapping") -> bool:
     )
 
 
-def create_hist_topk_workspace(
-    mapping: "Mapping", comm: Optional[Any] = None
-) -> HistTopkWorkspace:
+def create_hist_topk_workspace(mapping: "Mapping", comm: Optional[Any] = None) -> HistTopkWorkspace:
     """Allocate the workspace on every rank of ``mapping``'s TP group (a collective call).
 
     ``comm`` is the TP-group communicator the multicast handles are exchanged over: the MNNVL

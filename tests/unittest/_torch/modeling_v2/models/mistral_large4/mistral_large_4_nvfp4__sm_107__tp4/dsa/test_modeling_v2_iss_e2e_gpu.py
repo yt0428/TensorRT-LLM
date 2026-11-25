@@ -42,9 +42,7 @@ def _step(kv_len: int, max_seq_len: int, tokens_per_block: int = 32, num_seqs: i
         tokens_per_block=tokens_per_block,
         kv_lens_host=torch.tensor([kv_len] * num_seqs, dtype=torch.int32),
         kv_lens_cuda=torch.tensor([kv_len] * num_seqs, dtype=torch.int32, device="cuda"),
-        indexer_k_cache_block_offsets=(
-            torch.arange(pages, dtype=torch.int32, device="cuda") + 1000
-        )
+        indexer_k_cache_block_offsets=(torch.arange(pages, dtype=torch.int32, device="cuda") + 1000)
         .view(1, -1)
         .expand(num_seqs, -1)
         .contiguous(),
@@ -107,5 +105,7 @@ def test_iss8_respects_max_shard_bound_on_gpu(monkeypatch) -> None:
     core = _core(tp_size=8, tp_rank=7, max_ctx_len=1_048_584)
     assert core._prepare_iss_step(_step(780_000, 1_048_584), rows=4, skip_gen=False) is not None
     assert core._hist_buffers["capacity"] == MAX_SHARD
-    assert core._prepare_iss_step(_step(8 * MAX_SHARD + 1, 1_048_584), rows=4, skip_gen=False) is None
+    assert (
+        core._prepare_iss_step(_step(8 * MAX_SHARD + 1, 1_048_584), rows=4, skip_gen=False) is None
+    )
     assert shard_capacity(786_432, 8) == MAX_SHARD

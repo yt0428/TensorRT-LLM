@@ -234,7 +234,6 @@ from .ops.dsa._hist_topk import (
     default_iss_min_ctx_len,
     get_hist_topk_workspace,
     hist_topk_supported,
-    iss_enabled,
     shard_capacity,
     should_use_iss,
 )
@@ -841,7 +840,7 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         # the MPI session's, or the TP process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.tp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-        if iss_enabled() and self.tp_size in ISS_WORLD_SIZES and hist_topk_supported(mapping):
+        if self.tp_size in ISS_WORLD_SIZES and hist_topk_supported(mapping):
             self._hist_workspace = get_hist_topk_workspace(mapping)
             if self.tp_rank == 0:
                 import atexit
@@ -869,11 +868,6 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                         pass
 
                 atexit.register(_log_iss_exit)
-        elif self.tp_rank == 0 and self.tp_size in ISS_WORLD_SIZES:
-            logger.info(
-                f"[ML4-ISS] disabled: tp_size={self.tp_size}, enabled={iss_enabled()}, "
-                f"supported={hist_topk_supported(mapping)}"
-            )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -959,8 +953,10 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                 contiguous: build_ix_k_cache(dev, is_neox=False, cache_contiguous=contiguous)
                 for contiguous in (False, True)
             }
-        if self._hist_workspace is not None and md.tokens_per_block > 0 and (
-            SHARD_ALIGN % md.tokens_per_block == 0
+        if (
+            self._hist_workspace is not None
+            and md.tokens_per_block > 0
+            and (SHARD_ALIGN % md.tokens_per_block == 0)
         ):
             cap = min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
             if cap > 0:
@@ -1010,7 +1006,6 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             capturing=capturing,
             has_workspace=self._hist_workspace is not None,
             skip_gen=skip_gen,
-            enabled=iss_enabled(),
         ):
             if not capturing and hasattr(self, "_iss_stats"):
                 self._iss_stats["eager_miss"] += 1
@@ -2716,16 +2711,14 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             self.draft_model._build_fused_kv_buffers()
         if self.spec_worker is not None:
             # The route fixes the lm_head the gather is written for: a bf16 column shard of the
-            # whole vocabulary on every rank of the TP group, gathered, no padding. At tp_size > 8
-            # (TP16) keep the NCCL fallback unless explicitly opted in (Track 2 vocab-parallel
-            # eliminates full-vocab gather on the decode path).
+            # whole vocabulary on every rank of the TP group, gathered, no padding.
+            # symm_logits_gather serves 4- and 8-rank TP groups; larger groups fall back to
+            # logits_processor + tanh_softcap in capped_logits.
             mapping = self.model_config.mapping
             lm_head = self.lm_head
             assert lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.gather_output
             assert lm_head.padding_size == 0 and lm_head.weight.dtype == torch.bfloat16
-            if mapping.tp_size <= 8 or (
-                os.environ.get("TRTLLM_ML4_ENABLE_TP16_SYMM_LOGITS_GATHER", "0") == "1"
-            ):
+            if mapping.tp_size <= 8:
                 # Collective: every rank of the TP group (the process group the Lamport workspace
                 # brought up) builds it at load, with the same arguments.
                 self._logits_gather = build_logits_gather(

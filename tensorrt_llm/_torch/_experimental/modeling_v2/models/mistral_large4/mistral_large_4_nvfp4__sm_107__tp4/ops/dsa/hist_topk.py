@@ -84,9 +84,7 @@ class GlmHistTopk(OpWrapper):
         Cell(why="4 ranks: 300,000-key request, 4 verify rows", spec=_spec(4, 300_000)),
         Cell(why="4 ranks: ties at the cut, larger keys taken", spec=_spec(4, 200_000, "ties")),
         Cell(why="4 ranks: every logit equal", spec=_spec(4, 50_000, "equal")),
-        Cell(
-            why="4 ranks: +-inf, +-0 and NaN among the logits", spec=_spec(4, 120_000, "special")
-        ),
+        Cell(why="4 ranks: +-inf, +-0 and NaN among the logits", spec=_spec(4, 120_000, "special")),
         Cell(
             why="4 ranks: one histogram bin holds more than 65,535 keys of a shard",
             spec=_spec(4, 4 * MAX_SHARD, "saturated"),

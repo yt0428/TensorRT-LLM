@@ -15,10 +15,7 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[8]
-_ML4_ROOT = (
-    _REPO_ROOT
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/mistral_large4"
-)
+_ML4_ROOT = _REPO_ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/models/mistral_large4"
 _TP4_ROOT = _ML4_ROOT / "mistral_large_4_nvfp4__sm_107__tp4"
 _CATALOG_ROOT = _REPO_ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
 
@@ -173,7 +170,9 @@ def test_hist_topk_constants_match_cpp_header():
 
 @pytest.mark.parametrize("group_size", (4, 8, 16))
 @pytest.mark.parametrize("tokens_per_block", (32, 64))
-@pytest.mark.parametrize("kv_len", (0, 1, 2048, 2049, 131_072, 262_145, 530_000, 780_000, 1_048_584))
+@pytest.mark.parametrize(
+    "kv_len", (0, 1, 2048, 2049, 131_072, 262_145, 530_000, 780_000, 1_048_584)
+)
 def test_shard_geometry_tiles_request_on_page_boundaries(group_size, tokens_per_block, kv_len):
     """Shards partition [0, kv_len) disjointly and every shard base lands on a page boundary."""
     s = _HIST.shard_size(kv_len, group_size)
@@ -198,8 +197,7 @@ def test_dynamic_iss_threshold_logic_eager_and_captured():
     assert _HIST.default_iss_min_ctx_len(16, env={}) == 131072
     assert _HIST.default_iss_min_ctx_len(8, env={}) == 262144
     assert _HIST.default_iss_min_ctx_len(16, env={"TRTLLM_ML4_ISS_MIN_CTX_LEN": "65536"}) == 65536
-    assert _HIST.iss_enabled(env={}) is True
-    assert _HIST.iss_enabled(env={"TRTLLM_ML4_ENABLE_ISS": "0"}) is False
+    assert _HIST.default_iss_min_ctx_len(16, env={"TRTLLM_ML4_ISS_MIN_CTX_LEN": "-1"}) == 0
 
     # TP16 eager: switches cleanly at L > 131072 up to 1.57M.
     assert not _HIST.should_use_iss(
@@ -262,8 +260,18 @@ def test_dynamic_iss_threshold_logic_eager_and_captured():
         300_000, 1_048_584, 1, 4, 16, 32, -1, capturing=False, has_workspace=True
     )
     assert not _HIST.should_use_iss(
-        300_000, 1_048_584, 1, 4, 16, 32, 131072, capturing=False, has_workspace=True, enabled=False
+        300_000, 1_048_584, 1, 4, 16, 32, 131072, capturing=False, has_workspace=False
     )
+
+
+def test_cpp_op_guards_present_for_graceful_fallback():
+    """ops/_cpp_fakes.py and ops/dsa/_hist_topk.py guard optional C++ thops with hasattr."""
+    fakes_src = (_TP4_ROOT / "ops/_cpp_fakes.py").read_text()
+    assert 'if hasattr(torch.ops.trtllm, "glm_dsa_hist_topk"):' in fakes_src
+    assert 'if hasattr(torch.ops.trtllm, "glm_dsa_hist_shard_meta"):' in fakes_src
+    hist_src = (_TP4_ROOT / "ops/dsa/_hist_topk.py").read_text()
+    assert 'hasattr(torch.ops.trtllm, "glm_dsa_hist_topk")' in hist_src
+    assert 'hasattr(torch.ops.trtllm, "glm_dsa_hist_shard_meta")' in hist_src
 
 
 def test_routing_source_allows_sm107_tp16_only():
