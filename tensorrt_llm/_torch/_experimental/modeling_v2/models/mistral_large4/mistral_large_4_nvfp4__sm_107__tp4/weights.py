@@ -1352,4 +1352,75 @@ class MistralLarge4Tp4Weights:
         )
 
 
+def place_target_ugpu_weights(
+    layers: list[SimpleNamespace],
+    *,
+    moe_locality_mode: str = "none",
+    gemv_ugpu: bool = False,
+    device=None,
+) -> SimpleNamespace | None:
+    """Place Target FP8 Linears (``wq``, ``wo``, ``ix_wq_b``, ``dense0``) and Routed MoE weights
+    into Paradigm-B die-aware Rubin uGPU VMM allocations on ``layers`` in place.
+
+    Original parameters in ``core.w`` are left untouched so non-die-aware consumers (``PrefillTarget``,
+    stock fallbacks) never incur cross-die traffic. Returns the resolved :class:`LocalityMap` and
+    effective ``moe_locality_mode`` (or ``None`` if dual-domain uGPU is unavailable on ``device``).
+    """
+    if moe_locality_mode == "none" and not gemv_ugpu:
+        return None
+    if not layers:
+        return None
+    from .ops.gemm.locality import LocalityMap, recommend_moe_locality_mode
+    from .ops.gemm.ml4_mx_gemv import prepare_ugpu_gemv_weight
+
+    resolved_moe_mode = moe_locality_mode
+    if resolved_moe_mode == "auto":
+        moe_layer = next((L.moe for L in layers if L.moe is not None), None)
+        if moe_layer is not None:
+            inter = moe_layer.fc1_w.shape[1] // 2
+            resolved_moe_mode = recommend_moe_locality_mode(inter, moe_layer.fc1_w.shape[0])
+        else:
+            resolved_moe_mode = "none"
+
+    if resolved_moe_mode == "none" and not gemv_ugpu:
+        return None
+
+    dev = layers[0].wq.device if device is None else torch.device(device)
+    if dev.type != "cuda":
+        return None
+    try:
+        lm = LocalityMap.get(dev)
+    except (ImportError, RuntimeError) as err:
+        logger.warning(f"[ML4 sm_107] uGPU placement unavailable ({err}); staying unplaced")
+        return None
+
+    for L in layers:
+        if gemv_ugpu:
+            L.wq_ugpu = prepare_ugpu_gemv_weight(L.wq, L.wq_s, lm)
+            L.wo_ugpu = prepare_ugpu_gemv_weight(L.wo, L.wo_s, lm)
+            if L.indexer is not None:
+                L.indexer.wq_b_ugpu = prepare_ugpu_gemv_weight(L.indexer.wq_b, L.indexer.wq_b_s, lm)
+            if L.moe is None:
+                L.mlp_gu_ugpu = prepare_ugpu_gemv_weight(L.mlp_gu, L.mlp_gu_s, lm)
+                L.mlp_dn_ugpu = prepare_ugpu_gemv_weight(L.mlp_dn, L.mlp_dn_s, lm)
+        if L.moe is not None and resolved_moe_mode in ("n_split", "expert_half"):
+            m = L.moe
+            if resolved_moe_mode == "n_split":
+                m.placed_fc1_w = lm.split_rows_padded(m.fc1_w, dim=1, mode="n_split")
+                m.placed_fc1_s = lm.split_rows_padded(m.fc1_s, dim=1, mode="n_split")
+                m.placed_fc2_w = lm.split_rows_padded(m.fc2_w, dim=1, mode="n_split")
+                m.placed_fc2_s = lm.split_rows_padded(m.fc2_s, dim=1, mode="n_split")
+            else:
+                m.placed_fc1_w = lm.place_expert_half(m.fc1_w, allow_padded=False)
+                m.placed_fc1_s = lm.place_expert_half(m.fc1_s, allow_padded=False)
+                m.placed_fc2_w = lm.place_expert_half(m.fc2_w, allow_padded=False)
+                m.placed_fc2_s = lm.place_expert_half(m.fc2_s, allow_padded=True)
+
+    logger.info(
+        f"[ML4 sm_107] Paradigm-B uGPU weights placed: moe={resolved_moe_mode}, "
+        f"gemv_ugpu={gemv_ugpu}, domains={lm.n_domains}, sms_per_domain={lm.sms_per_domain}"
+    )
+    return SimpleNamespace(locality_map=lm, moe_locality_mode=resolved_moe_mode)
+
+
 MODEL_WEIGHTS = MistralLarge4Tp4Weights()
