@@ -1235,6 +1235,34 @@ class DSparkWorker(DFlashWorker):
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
         )
 
+    def _refine_and_greedy_sample_block(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Direct greedy Markov chain sampling without materializing refined full-vocab logits."""
+        if not getattr(draft_model, "has_markov_head", False):
+            return None
+        greedy_fn = getattr(draft_model, "apply_markov_chain_greedy", None)
+        if greedy_fn is None:
+            return None
+        if gen_logits.shape[-1] != draft_model.markov_w2.shape[0]:
+            return None
+        head_kwargs = {}
+        if getattr(draft_model, "has_recurrent_markov_head", False):
+            head_kwargs["hidden_states"] = draft_hidden_states
+        tokens = greedy_fn(
+            gen_logits,
+            inputs["first_prev_tokens"],
+            **head_kwargs,
+        )
+        if self._d2t is not None:
+            tokens = self._d2t[tokens] + tokens
+        return tokens.type(torch.int32)
+
     def _refine_block_logits(
         self,
         draft_model,

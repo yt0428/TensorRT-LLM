@@ -262,16 +262,18 @@ def markov_logits_kernel(
     vocab,
     CHUNKS: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    WRITE_OUT: tl.constexpr = True,
 ):
     """`out[b] = base[b] + bias[b]` (fp32 plus a widened bf16) over one vocabulary chunk, and
-    the chunk's maximum with its first index."""
+    the chunk's maximum with its first index. When `WRITE_OUT` is False, skips writing `out`."""
     b = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1)
     v = chunk * BLOCK_V + tl.arange(0, BLOCK_V)
     mask = v < vocab
     x = tl.load(base_ptr + b * base_s_row + v, mask=mask, other=0.0)
     x = x + tl.load(bias_ptr + b * vocab + v, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + b * out_s_row + v, x, mask=mask)
+    if WRITE_OUT:
+        tl.store(out_ptr + b * out_s_row + v, x, mask=mask)
     x = tl.where(mask, x, float("-inf"))
     m = tl.max(x, axis=0)
     first = tl.min(tl.where(x == m, v, 2147483647), axis=0)

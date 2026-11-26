@@ -13,6 +13,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, mak
 
 from .._op import Arch, Cell, OpWrapper
 from . import _cluster_radix_topk_decode as _cluster_kernel
+from . import _dynamic_radix_topk_decode as _dynamic_kernel
 from . import _radix_topk_decode as _kernel
 from .indexer_topk_decode import indexer_topk_decode
 
@@ -778,6 +779,162 @@ def cluster_radix_topk_decode(
                 logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
             )
         compiled.launch(logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), indices)
+    return indices
+
+
+@dataclass(frozen=True)
+class CompiledDynamicRadixTopkDecode:
+    """Precompiled one-launch cluster=(1,1,1) dynamic CTA decode selector and persistent L2 state."""
+
+    launch: object
+    state: torch.Tensor
+    device_id: int
+    next_n: int
+    total_ctas: int
+    max_ctas_per_row: int
+    threads: int
+    unroll: int
+    pipe: bool
+    min_blocks: int
+    use_pdl: bool
+    sm_count: int
+
+
+_DYNAMIC_COMPILED: dict[tuple, CompiledDynamicRadixTopkDecode] = {}
+
+
+def build_dynamic(
+    device_id: int,
+    *,
+    next_n: int = 4,
+    total_ctas: int | None = None,
+    max_ctas_per_row: int = _dynamic_kernel.DEFAULT_MAX_CTAS_PER_ROW,
+    threads: int = 512,
+    unroll: int = 2,
+    pipe: bool = True,
+    min_blocks: int = 1,
+    use_pdl: bool = True,
+) -> CompiledDynamicRadixTopkDecode:
+    """Compile ``dynamic_radix_topk_decode`` before capture.
+
+    Defaults ``total_ctas`` to ``sm_count * max(1, min_blocks)`` so every CTA in the grid is
+    co-resident on the GPU (deadlock-free inter-CTA synchronization). Allocates one zero-initialized
+    per-handle L2 state buffer (``MAX_ROWS x STATE_WORDS_PER_ROW`` int32, ~3.16 MiB) that each
+    launch self-cleans back to all-zeros before exiting, keeping CUDA Graph replay safe.
+    """
+    if next_n not in (1, 4):
+        raise ValueError("dynamic radix requires next_n 1 or 4")
+    if threads not in (256, 512, 1024) or unroll not in (1, 2, 4, 8):
+        raise ValueError("dynamic radix requires threads 256/512/1024 and unroll 1/2/4/8")
+    if min_blocks not in (1, 2):
+        raise ValueError("dynamic radix requires min_blocks 1 or 2")
+    if max_ctas_per_row < 1:
+        raise ValueError("dynamic radix requires max_ctas_per_row >= 1")
+    sm_count = int(torch.cuda.get_device_properties(device_id).multi_processor_count)
+    ctas = sm_count * min_blocks if total_ctas is None else int(total_ctas)
+    if ctas < _dynamic_kernel.MAX_ROWS or ctas > sm_count * min_blocks:
+        raise ValueError(
+            f"dynamic radix requires total_ctas in [{_dynamic_kernel.MAX_ROWS}, "
+            f"{sm_count * min_blocks}] to guarantee co-resident sync; got {ctas}"
+        )
+    key = (
+        int(device_id),
+        int(next_n),
+        int(ctas),
+        int(max_ctas_per_row),
+        int(threads),
+        int(unroll),
+        bool(pipe),
+        int(min_blocks),
+        bool(use_pdl),
+    )
+    if key in _DYNAMIC_COMPILED:
+        return _DYNAMIC_COMPILED[key]
+    with torch.cuda.device(device_id):
+        rows, cols, batch, size = (cute.sym_int() for _ in range(4))
+        stride = cute.sym_int64()
+        fake_logits = make_fake_tensor(
+            cutlass.Float32, (rows, cols), stride=(stride, 1), assumed_align=4
+        )
+        fake_lens = make_fake_compact_tensor(cutlass.Int32, (batch,), assumed_align=4)
+        fake_aux_i = make_fake_compact_tensor(cutlass.Int32, (size,), assumed_align=4)
+        fake_aux_l = make_fake_compact_tensor(cutlass.Float32, (size,), assumed_align=4)
+        fake_state = make_fake_compact_tensor(
+            cutlass.Int32,
+            (_dynamic_kernel.MAX_ROWS, _dynamic_kernel.STATE_WORDS_PER_ROW),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        fake_out = make_fake_compact_tensor(
+            cutlass.Int32, (rows, TOP_K), stride_order=(1, 0), assumed_align=4
+        )
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = _dynamic_kernel.DynamicRadixTopkDecodeKernel(
+            next_n=next_n,
+            total_ctas=ctas,
+            max_ctas_per_row=max_ctas_per_row,
+            threads=threads,
+            unroll=unroll,
+            use_pdl=use_pdl,
+            pipe=pipe,
+            min_blocks=min_blocks,
+        )
+        launch = cute.compile(
+            kernel,
+            fake_logits,
+            fake_lens,
+            fake_aux_i,
+            fake_aux_l,
+            fake_state,
+            fake_out,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        state = torch.zeros(
+            (_dynamic_kernel.MAX_ROWS, _dynamic_kernel.STATE_WORDS_PER_ROW),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        handle = CompiledDynamicRadixTopkDecode(launch, state, *key, sm_count)
+        logits = torch.zeros((next_n, 4096), dtype=torch.float32, device="cuda")
+        lens = torch.full((1,), 4096, dtype=torch.int32, device="cuda")
+        out = torch.empty((next_n, TOP_K), dtype=torch.int32, device="cuda")
+        aux_i = torch.empty(next_n * _MAX_BLOCKS_PER_ROW * TOP_K, dtype=torch.int32, device="cuda")
+        aux_l = torch.empty_like(aux_i, dtype=torch.float32)
+        launch(logits, lens, aux_i, aux_l, state, out)
+        torch.cuda.synchronize()
+    _DYNAMIC_COMPILED[key] = handle
+    return handle
+
+
+def dynamic_radix_topk_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    aux_indices: torch.Tensor,
+    aux_logits: torch.Tensor,
+    *,
+    compiled: CompiledDynamicRadixTopkDecode,
+) -> torch.Tensor:
+    """Single-launch ``cluster=(1, 1, 1)`` length-proportional decode top-k selector.
+
+    Matches ``cluster_radix_topk_decode``'s exact selection contract (valid columns first in no
+    particular order, then -1; -NaN fallback through the 10-partition split/merge path) while
+    allocating CTAs proportional to per-row causal length to eliminate straggler tail latency and
+    GPC cluster fragmentation.
+    """
+    runs = _split_call_runs(
+        logits, seq_lens, indices, aux_indices, aux_logits,
+        next_n=compiled.next_n, device_id=compiled.device_id, sm_count=compiled.sm_count,
+    )  # fmt: skip
+    if logits.shape[0]:
+        if not runs:
+            return indexer_topk_decode(
+                logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
+            )
+        compiled.launch(
+            logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), compiled.state, indices
+        )
     return indices
 
 

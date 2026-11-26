@@ -14,8 +14,10 @@ import tensorrt_llm._torch.custom_ops  # noqa: E402,F401
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (  # noqa: E402
     TOP_K,
     build_cluster,
+    build_dynamic,
     build_split,
     cluster_radix_topk_decode,
+    dynamic_radix_topk_decode,
     split_radix_topk_decode,
 )
 
@@ -340,3 +342,62 @@ def test_cluster_radix_rejects_invalid_inputs():
     lens = torch.full((33,), 16384, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="at most 128 rows"):
         cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+
+
+@pytest.mark.parametrize("batch", [16, 20, 24, 32])
+def test_dynamic_radix_graph_replay_and_state_self_clean(batch):
+    """Dynamic cluster=(1,1,1) selector across b16..b32: exact set match against split selector,
+    CUDA Graph replay across varying KV distributions, and L2 state restored to all-zeros."""
+    device = torch.cuda.current_device()
+    compiled = build_dynamic(device, min_blocks=1)
+    split = build_split(device)
+    width = 1048584
+    logits, output, aux_i, aux_l = _buffers(batch, width)
+    edges = (_dep4_lengths(width) * 2)[:batch]
+    lens = torch.tensor(edges, dtype=torch.int32, device="cuda")
+    _fill(logits, edges, 4, 0, "ordinary")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dynamic_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+    reference = torch.empty_like(output)
+    for replay in range(4):
+        lengths = edges[replay + 1 :] + edges[: replay + 1]
+        _fill(logits, lengths, 4, replay, ("ordinary", "ties", "boundaries", "dense")[replay])
+        lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        output.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert int(compiled.state.count_nonzero().item()) == 0, "L2 state not restored to zero"
+        split_radix_topk_decode(logits, lens, reference, aux_i, aux_l, compiled=split)
+        _same_sets(logits, lengths, output, reference)
+
+
+@pytest.mark.parametrize("length,seed", [(5, 0), (2049, 17), (65536, 42), (400003, 7)])
+def test_dynamic_radix_nonfinite_and_negnan_fallback(length, seed):
+    """Dynamic selector preserves exact -NaN 10-partition fallback and restores L2 state to zero."""
+    device = torch.cuda.current_device()
+    compiled = build_dynamic(device, min_blocks=1)
+    split = build_split(device)
+    logits, output, aux_i, aux_l = _buffers(2, 1048584)
+    lengths = [length, length]
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    _fill(logits, lengths, 4, seed, "ordinary")
+    patterns = torch.tensor(
+        [0x7FC00000, 0x7F800000, -0x400000, -0x800000, -0x800001, -0x80000000],
+        dtype=torch.int32,
+        device="cuda",
+    ).view(torch.float32)
+    for row in range(8):
+        end = _end(lengths, row)
+        positions = torch.arange(row % 4, end, 19, device="cuda")
+        values = patterns[torch.arange(positions.numel(), device="cuda") % 6]
+        if row >= 4:
+            values = torch.where(values.view(torch.int32) == -0x400000, 0.5, values)
+        logits[row, positions] = values
+    reference = torch.empty_like(output)
+    split_radix_topk_decode(logits, lens, reference, aux_i, aux_l, compiled=split)
+    output.fill_(-7)
+    dynamic_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+    torch.cuda.synchronize()
+    assert int(compiled.state.count_nonzero().item()) == 0
+    _same_sets(logits, lengths, output, reference)

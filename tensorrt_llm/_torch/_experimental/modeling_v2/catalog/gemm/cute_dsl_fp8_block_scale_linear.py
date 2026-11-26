@@ -44,7 +44,7 @@ class CuteDslFp8BlockScaleLinear(OpWrapper):
     CELLS = tuple(
         Cell(f"SM107 {name}, M={m}", dict(m=m, n=n, k=k))
         for name, n, k in PROJECTIONS
-        for m in (1, 4, 16, 64, 129, 2048, 32768)
+        for m in (1, 4, 16, 64, 80, 96, 129, 2048, 32768)
     )
 
     def __call__(
@@ -53,7 +53,9 @@ class CuteDslFp8BlockScaleLinear(OpWrapper):
         codes, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
             input, use_r128c4_layout=True
         )
-        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(codes, weight, scale, weight_scale)
+        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            codes, weight, scale, weight_scale, fine_grained_m=True
+        )
 
     def reference(
         self, input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor

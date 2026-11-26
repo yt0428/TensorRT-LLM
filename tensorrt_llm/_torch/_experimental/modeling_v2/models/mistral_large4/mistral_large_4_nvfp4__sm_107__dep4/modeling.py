@@ -2401,6 +2401,35 @@ class DraftModel(nn.Module):
             previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
         return refined
 
+    def apply_markov_chain_greedy(
+        self,
+        base_logits,
+        first_prev_tokens,
+        *,
+        hidden_states,
+    ):
+        """Return the greedy Markov token chain ``[num_gens, K]`` without materializing refined
+        full-vocab logits or running a trailing full-vocab argmax."""
+        w = self.core.w
+        output = w["draft_markov_output"]
+        previous = first_prev_tokens.long()
+        state = None
+        steps = []
+        for i in range(base_logits.shape[1]):
+            joint = cublas_mm(
+                triton_markov_input(
+                    previous, w["draft_markov_embedding"], state, hidden_states[:, i]
+                ),
+                w["draft_joint"].t(),
+                w["draft_joint_bias"],
+                None,
+            )
+            state, emitted = triton_markov_gate(joint, state)
+            bias = cublas_mm(emitted, output.t(), None, None)
+            previous = triton_markov_logits(base_logits[:, i], bias, None)
+            steps.append(previous)
+        return torch.stack(steps, dim=1)
+
 
 class _VisionBlock(NamedTuple):
     """One vision transformer block's weights, as the views the ops read: the GEMM
