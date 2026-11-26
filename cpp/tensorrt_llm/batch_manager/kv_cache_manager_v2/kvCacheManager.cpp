@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/diskIoChannel.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
@@ -250,6 +251,39 @@ std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
     BlockKey const previousKey
         = blockIndex == 0 ? RootBlock::makeKey(reuseScope) : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
     return Block::makeKey(previousKey, inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
+}
+
+bool KvCacheManager::hasDiskResidentPrefix(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = lockShared();
+    auto const* diskIo = mStorage->diskIo();
+    if (diskIo == nullptr)
+    {
+        return false;
+    }
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    auto& engine = diskIo->engine();
+    for (auto const* block : match.blocks)
+    {
+        for (LifeCycleId lc{0}; lc < block->numLifeCycles(); ++lc)
+        {
+            auto const* page = block->getPage(lc);
+            if (page == nullptr)
+            {
+                continue;
+            }
+            if (mStorage->cacheTier(page->cacheLevel) == CacheTier::DISK)
+            {
+                return true;
+            }
+            if (page->diskIoTicket != kNoDiskIoTicket && engine.query(page->diskIoTicket) == DiskIoStatus::kPending)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // ---- Memory pool queries --------------------------------------------------

@@ -452,7 +452,9 @@ TEST_F(KvCacheManagerV2DiskIoTest, PrefetchedDiskPagesArriveAndRestoreData)
 // the tickets instead.
 TEST_F(KvCacheManagerV2DiskIoTest, OnboardingReadsHoldNoStream)
 {
-    makeManager();
+    DiskCacheTierConfig disk{4 << 20, "/tmp"};
+    disk.keepCopyAfterRestore = false;
+    makeManager(disk);
     auto const apiLock = mManager->lockExclusive();
     std::vector<TokenIdExt> tokens;
     auto const tokenSpan = span(tokens, 8);
@@ -660,6 +662,204 @@ TEST_F(KvCacheManagerV2DiskIoTest, HostReserveQueuesWritesWithinTheCapAndDropsNo
     EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
     EXPECT_EQ(storage().getAndResetDiskIoStats().lastLevelDroppedPages, 0u);
     EXPECT_EQ(mManager->radixTree().match({}, tokenSpan).numTokens, numBlocks * 4);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, KeepOnReadSkipsDiskRewriteAndMaintainsCounters)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    auto const pages = commitPrefix(tokenSpan, 8);
+    ASSERT_EQ(pages.size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+    static_cast<void>(storage().getAndResetDiskIoStats());
+
+    // Prefetching disk -> host retains the two disk slots.
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    auto const diskGroup = storage().getPoolGroupIndex(kDiskLevel, mLifeCycle);
+    auto diskStats = storage().getStatistics(kDiskLevel, diskGroup);
+    EXPECT_EQ(diskStats.retainedCopies, 2);
+    EXPECT_EQ(diskStats.free, diskStats.total - 2);
+    EXPECT_EQ(diskStats.available(), diskStats.total);
+    auto counters = storage().diskCopyCounters();
+    EXPECT_EQ(counters.retained, 2u);
+    EXPECT_EQ(counters.created, 2u);
+    EXPECT_EQ(counters.retained, counters.created - counters.reused - counters.reclaimed - counters.dropped);
+
+    // Promote to GPU and verify bytes, then release and evict all the way back to disk.
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    reader->close();
+    static_cast<void>(storage().getAndResetDiskIoStats());
+
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+
+    // Evicting back to disk took the retained slots back with zero disk writes.
+    auto const evictStats = storage().getAndResetDiskIoStats();
+    EXPECT_EQ(evictStats.io.writeBytes, 0u);
+    EXPECT_EQ(evictStats.retainedCopiesReused, 2u);
+    EXPECT_EQ(evictStats.retainedCopiesCurrent, 0u);
+    counters = storage().diskCopyCounters();
+    EXPECT_EQ(counters.retained, 0u);
+    EXPECT_EQ(counters.reused, 2u);
+    EXPECT_EQ(counters.retained, counters.created - counters.reused - counters.reclaimed - counters.dropped);
+
+    // Restoring once more verifies the retained bytes on disk stayed intact.
+    auto verify = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(verify->prefetch(kHostLevel));
+    EXPECT_EQ(verify->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    ASSERT_TRUE(verify->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    auto const hotGroup = storage().getPoolGroupIndex(kHotLevel, mLifeCycle);
+    auto const pageBytes = storage().slotSize(hotGroup)[PoolIndex{0}];
+    auto const pageIndices = verify->getBasePageIndices(mLifeCycle);
+    for (int i = 0; i < 2; ++i)
+    {
+        auto const address
+            = std::get<MemAddress>(storage().slotAddress(kHotLevel, hotGroup, SlotId{pageIndices[i]}, PoolIndex{0}));
+        std::vector<uint8_t> bytes(pageBytes);
+        ASSERT_EQ(cudaMemcpy(bytes.data(), reinterpret_cast<void const*>(address), pageBytes, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t value) { return value == kPattern; }));
+    }
+    verify->close();
+
+    // Destroying pages drops their retained copies cleanly.
+    mManager->clearReusableBlocks();
+    diskStats = storage().getStatistics(kDiskLevel, diskGroup);
+    EXPECT_EQ(diskStats.retainedCopies, 0);
+    EXPECT_EQ(diskStats.free, diskStats.total);
+    counters = storage().diskCopyCounters();
+    EXPECT_EQ(counters.retained, 0u);
+    EXPECT_EQ(counters.dropped, 2u);
+    EXPECT_EQ(counters.retained, counters.created - counters.reused - counters.reclaimed - counters.dropped);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, KeepOnReadAllowsHostReserveToEvictZeroWritePagesAtCap)
+{
+    makeManager();
+    auto const& sizes = storage().slotSize(kHostLevel, storage().getPoolGroupIndex(kHostLevel, mLifeCycle));
+    uint64_t const pageBytes = std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+    mManager->shutdown();
+
+    DiskCacheTierConfig disk{4 << 20, "/tmp"};
+    disk.hostReserveFraction = 0.5;
+    disk.maxPendingWriteBytes = pageBytes;
+    disk.keepCopyAfterRestore = true;
+    makeManager(disk);
+    auto const apiLock = mManager->lockExclusive();
+    auto const hostGroup = storage().getPoolGroupIndex(kHostLevel, mLifeCycle);
+    auto const hostSlots = storage().getStatistics(kHostLevel, hostGroup).total;
+    auto const reserve = static_cast<SlotCount>(std::ceil(hostSlots * 0.5));
+    int const numBlocks = static_cast<int>(hostSlots * 3 / 4);
+
+    // Push prefix to disk, then restore to host so every host page retains a disk copy.
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, numBlocks * 4);
+    ASSERT_EQ(commitPrefix(tokenSpan, numBlocks * 4).size(), static_cast<size_t>(numBlocks));
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    reader->close();
+    ASSERT_LT(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    static_cast<void>(storage().getAndResetDiskIoStats());
+
+    // Even while workers are paused, retained-copy pages cost 0 write bytes and free host slots immediately.
+    engine().setPausedForTest(true);
+    storage().maintainHostReserve();
+    auto const stats = storage().getAndResetDiskIoStats();
+    EXPECT_GE(storage().getStatistics(kHostLevel, hostGroup).free, reserve);
+    EXPECT_EQ(stats.reserveDeferredPages, 0u);
+    EXPECT_EQ(engine().pendingWriteBytes(), 0u);
+    EXPECT_EQ(stats.retainedCopiesReused, stats.reserveEvictedPages);
+    engine().setPausedForTest(false);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, KeepOnReadRespectsProtectedCopyFractionAndReclaimsOnShrink)
+{
+    DiskCacheTierConfig disk{4 << 20, "/tmp"};
+    disk.keepCopyAfterRestore = true;
+    disk.protectedCopyFraction = 0.0F;
+    makeManager(disk);
+    auto const apiLock = mManager->lockExclusive();
+    auto const diskGroup = storage().getPoolGroupIndex(kDiskLevel, mLifeCycle);
+    auto const diskTotal = storage().getStatistics(kDiskLevel, diskGroup).total;
+    ASSERT_GE(diskTotal, 8);
+
+    std::vector<TokenIdExt> firstTokens;
+    auto const firstSpan = span(firstTokens, 8, 100);
+    ASSERT_EQ(commitPrefix(firstSpan, 8).size(), 2u);
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+
+    // Restore firstSpan so its 2 disk slots become retained copies (above protectedCopyFraction = 0).
+    auto reader = mManager->createKvCache({}, firstSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    reader->close();
+    EXPECT_EQ(storage().numRetainedCopies(kDiskLevel, diskGroup), 2);
+
+    // Fill the remaining disk slots + 1 more so disk runs short: with protectedCopyFraction = 0,
+    // the 2 retained copies must be reclaimed before any disk-only page is dropped.
+    int const fillBlocks = static_cast<int>(diskTotal);
+    std::vector<TokenIdExt> fillerTokens;
+    auto const fillerSpan = span(fillerTokens, fillBlocks * 4, 10000);
+    ASSERT_EQ(commitPrefix(fillerSpan, fillBlocks * 4).size(), static_cast<size_t>(fillBlocks));
+    static_cast<void>(storage().getAndResetDiskIoStats());
+    pressure(kHotLevel);
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+
+    EXPECT_EQ(storage().numRetainedCopies(kDiskLevel, diskGroup), 0);
+    auto const stats = storage().getAndResetDiskIoStats();
+    EXPECT_EQ(stats.retainedCopiesReclaimed, 2u);
+    EXPECT_EQ(stats.lastLevelDroppedPages, 0u);
+}
+
+TEST_F(KvCacheManagerV2DiskIoTest, HasDiskResidentPrefixTracksDiskAndPendingReads)
+{
+    makeManager();
+    auto const apiLock = mManager->lockExclusive();
+    std::vector<TokenIdExt> tokens;
+    auto const tokenSpan = span(tokens, 8);
+    ASSERT_EQ(commitPrefix(tokenSpan, 8).size(), 2u);
+    EXPECT_FALSE(mManager->hasDiskResidentPrefix({}, tokenSpan));
+
+    pressure(kHotLevel);
+    EXPECT_FALSE(mManager->hasDiskResidentPrefix({}, tokenSpan));
+
+    pressure(kHostLevel);
+    engine().drain();
+    storage().reapDiskIo();
+    EXPECT_TRUE(mManager->hasDiskResidentPrefix({}, tokenSpan));
+
+    // Pause reads so the prefetched pages sit at HOST_MEM with a pending disk read ticket.
+    engine().setPausedForTest(true);
+    auto reader = mManager->createKvCache({}, tokenSpan, mNextCacheId++);
+    ASSERT_TRUE(reader->prefetch(kHostLevel));
+    EXPECT_TRUE(mManager->hasDiskResidentPrefix({}, tokenSpan));
+
+    engine().setPausedForTest(false);
+    EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
+    EXPECT_FALSE(mManager->hasDiskResidentPrefix({}, tokenSpan));
+    reader->close();
 }
 
 KVCacheManagerConfig makeDiskTieredConfig()

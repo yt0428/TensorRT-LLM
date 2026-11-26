@@ -29,8 +29,10 @@
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -59,6 +61,12 @@ struct DiskIoIterationStats
     uint64_t lastLevelDroppedPages = 0;
     // Pages whose disk transfer failed and that left the radix tree.
     uint64_t failedPages = 0;
+    // Retained disk copies: current gauge plus per-window deltas.
+    uint64_t retainedCopiesCurrent = 0;
+    uint64_t retainedCopiesCreated = 0;
+    uint64_t retainedCopiesReused = 0;
+    uint64_t retainedCopiesReclaimed = 0;
+    uint64_t retainedCopiesDropped = 0;
     // Whether streams wait for disk I/O with stream memory operations rather than host functions.
     bool streamMemOps = false;
 };
@@ -98,10 +106,12 @@ struct StorageStatistics
     SlotCount total;     // total slots
     SlotCount free;      // free (unallocated) slots
     SlotCount evictable; // scheduled for eviction
+    // Retained disk copies: duplicates of pages that live in a hotter level, released when the level needs room.
+    SlotCount retainedCopies{0};
 
     SlotCount available() const noexcept
     {
-        return free + evictable;
+        return free + evictable + retainedCopies;
     }
 
     SlotCount unavailable() const noexcept
@@ -386,6 +396,27 @@ public:
         return mSlotUtilFracMax.at(lcId);
     }
 
+    // Keep-on-read: a full committed page restored from disk keeps its immutable disk slot as a
+    // retained copy and takes it back on its next eviction to disk, skipping the write.
+
+    //! Called from Page::~Page: releases the page's retained disk copy, if any.
+    void onPageDestroyed(Page& page) noexcept;
+
+    [[nodiscard]] SlotCount numRetainedCopies(
+        CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
+
+    //! Retained disk copy counters. With one disk tier, retained == created - reused - reclaimed - dropped.
+    struct DiskCopyCounters
+    {
+        uint64_t retained{0};  //!< Retained copies held now.
+        uint64_t created{0};   //!< Copies kept after a restore from disk.
+        uint64_t reused{0};    //!< Evictions that took a retained slot back instead of writing.
+        uint64_t reclaimed{0}; //!< Copies released to make room, on resize, or after an I/O failure.
+        uint64_t dropped{0};   //!< Copies released because their page was destroyed.
+    };
+
+    [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -545,6 +576,43 @@ private:
     uint64_t mReserveDeferredPages = 0;
     uint64_t mLastLevelDroppedPages = 0;
     uint64_t mFailedPages = 0;
+    uint64_t mIterRetainedCreated = 0;
+    uint64_t mIterRetainedReused = 0;
+    uint64_t mIterRetainedReclaimed = 0;
+    uint64_t mIterRetainedDropped = 0;
+
+    struct RetainedCopy
+    {
+        Page* page;
+        CacheLevel level;
+        PoolGroupIndex pgIdx;
+        Slot slot;
+        // Set while a fallen page is about to take this slot back, so reclaiming skips it.
+        bool reserved = false;
+        // Unfenced disk read ticket that may still be reading from this slot.
+        DiskIoTicket inFlightTicket = kNoDiskIoTicket;
+    };
+
+    using RetainedCopyList = std::list<RetainedCopy>;
+
+    void addRetainedCopy(
+        Page& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot, DiskIoTicket inFlightTicket = kNoDiskIoTicket);
+    [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
+    [[nodiscard]] bool hasRetainedCopy(Page const& page, CacheLevel level) const noexcept;
+    bool validateRetainedCopy(Page const& page, CacheLevel level);
+    bool reserveRetainedCopy(Page const& page, CacheLevel level, bool reserve) noexcept;
+    void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
+    void releaseAllRetainedCopies(std::optional<CacheLevel> level);
+    void eraseRetainedCopy(RetainedCopyList::iterator iter, bool waitInFlight);
+    [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
+
+    TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;
+    TypedVec<CacheLevel, float> mProtectedCopyFractionAt;
+    // Oldest first.
+    RetainedCopyList mRetainedCopies;
+    std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
+    DiskCopyCounters mDiskCopyCounters;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

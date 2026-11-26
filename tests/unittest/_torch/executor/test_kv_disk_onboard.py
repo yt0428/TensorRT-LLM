@@ -117,6 +117,7 @@ def test_poll_reports_each_request_once_and_closes_its_cache(final_status):
 _DISK_IO_FIELDS = (
     "read_bytes",
     "write_bytes",
+    "required_write_bytes",
     "read_ops",
     "write_ops",
     "read_busy_ns",
@@ -136,6 +137,11 @@ _DISK_IO_FIELDS = (
     "reserve_deferred_pages",
     "last_level_dropped_pages",
     "failed_pages",
+    "retained_copies_current",
+    "retained_copies_created",
+    "retained_copies_reused",
+    "retained_copies_reclaimed",
+    "retained_copies_dropped",
 )
 
 
@@ -150,17 +156,23 @@ def test_disk_io_counters_reach_both_the_iteration_stats_and_the_log(monkeypatch
         side_effect=[
             _disk_io_sample(
                 write_bytes=3 * gib,
+                required_write_bytes=gib,
                 pending_write_bytes=5 * gib,
                 peak_pending_write_bytes=6 * gib,
                 reserve_deferred_pages=7,
+                retained_copies_current=12,
+                retained_copies_reused=5,
             ),
             _disk_io_sample(
                 write_bytes=gib,
                 pending_write_bytes=gib,
                 peak_pending_write_bytes=2 * gib,
                 last_level_dropped_pages=4,
+                retained_copies_current=9,
+                retained_copies_reused=3,
+                retained_copies_reclaimed=2,
             ),
-            _disk_io_sample(write_bytes=gib),
+            _disk_io_sample(write_bytes=gib, retained_copies_current=8),
         ]
     )
     clock = SimpleNamespace(now=100.0)
@@ -179,7 +191,10 @@ def test_disk_io_counters_reach_both_the_iteration_stats_and_the_log(monkeypatch
 
     stats = manager._drain_disk_io_stats()
     assert stats["writeBytes"] == 3 * gib
+    assert stats["requiredWriteBytes"] == gib
     assert stats["reserveDeferredPages"] == 7
+    assert stats["retainedCopiesCurrent"] == 12
+    assert stats["retainedCopiesReused"] == 5
 
     # The log line covers both drains since the previous line.
     clock.now = 161.0
@@ -190,6 +205,8 @@ def test_disk_io_counters_reach_both_the_iteration_stats_and_the_log(monkeypatch
     assert "deferred 7" in line
     assert "pending writes 1.00 GiB, peak 6.00 GiB" in line
     assert "dropped from the last tier 4 pages" in line
+    assert "required writes 1.00 GiB" in line
+    assert "retained copies 9 (reused 8, reclaimed 2)" in line
 
     # The iteration stats still get what the log drained: sums add, gauges keep the latest value and
     # peaks the largest.
@@ -198,6 +215,8 @@ def test_disk_io_counters_reach_both_the_iteration_stats_and_the_log(monkeypatch
     assert stats["lastLevelDroppedPages"] == 4
     assert stats["pendingWriteBytes"] == 0
     assert stats["peakPendingWriteBytes"] == 2 * gib
+    assert stats["retainedCopiesCurrent"] == 8
+    assert stats["retainedCopiesReused"] == 3
     assert manager._disk_io_log_window["writeBytes"] == gib
 
 
@@ -243,11 +262,16 @@ class _OnboardingKvManager:
         self.on_disk = set(on_disk)
         self.onboarding = {}
         self.probed = []
+        self.disk_checked = []
         self._finished = []
 
     @property
     def num_context_onboards(self):
         return len(self.onboarding)
+
+    def has_disk_prefix_to_onboard(self, request):
+        self.disk_checked.append(request.py_request_id)
+        return request.py_request_id in self.on_disk
 
     def start_context_onboard(self, request):
         self.probed.append(request.py_request_id)
@@ -292,17 +316,41 @@ def test_executor_gates_disk_hits_up_to_the_limit():
 
     PyExecutor._prefetch_for_context_requests(executor)
     assert kv_manager.probed == [1]
-    assert [r.py_kv_onboard_pending for r in requests] == [True, False, False]
+    assert kv_manager.disk_checked == [2, 3]
+    # Request 2 has no disk prefix so it can be scheduled immediately; request 3 has disk blocks so
+    # it waits for an onboarding slot rather than bypassing into a synchronous Disk->GPU resume.
+    assert [r.py_kv_onboard_pending for r in requests] == [True, False, True]
 
-    # Still reading: nothing new starts and nobody is released.
+    # Still reading: nothing new starts, nobody is released, and held request 3 is not re-probed.
     PyExecutor._prefetch_for_context_requests(executor)
     assert kv_manager.probed == [1]
-    assert requests[0].py_kv_onboard_pending
+    assert kv_manager.disk_checked == [2, 3]
+    assert [r.py_kv_onboard_pending for r in requests] == [True, False, True]
 
     kv_manager.finish(1)
     PyExecutor._prefetch_for_context_requests(executor)
-    assert kv_manager.probed == [1, 2, 3]
+    assert kv_manager.probed == [1, 3]
     assert [r.py_kv_onboard_pending for r in requests] == [False, False, True]
+
+    kv_manager.finish(3)
+    PyExecutor._prefetch_for_context_requests(executor)
+    assert [r.py_kv_onboard_pending for r in requests] == [False, False, False]
+
+
+def test_executor_releases_held_request_when_disk_blocks_already_onboarded():
+    kv_manager = _OnboardingKvManager(on_disk={1, 2}, limit=1)
+    requests = [_context_request(1), _context_request(2)]
+    executor = _executor(kv_manager, requests)
+
+    PyExecutor._prefetch_for_context_requests(executor)
+    assert [r.py_kv_onboard_pending for r in requests] == [True, True]
+
+    # Request 1 finishes and brought request 2's shared prefix into host memory as well.
+    kv_manager.on_disk.discard(2)
+    kv_manager.finish(1)
+    PyExecutor._prefetch_for_context_requests(executor)
+    assert kv_manager.probed == [1, 2]
+    assert [r.py_kv_onboard_pending for r in requests] == [False, False]
 
 
 def test_executor_onboards_without_gating_where_it_cannot_gate():

@@ -2459,6 +2459,13 @@ class TestDiskTier(TestKVCacheManagerV2):
         self.assertEqual(config.num_io_threads, 8)
         self.assertAlmostEqual(config.host_reserve_fraction, 0.1)
         self.assertEqual(config.max_pending_write_bytes, 8 << 30)
+        self.assertTrue(config.keep_copy_after_restore)
+        self.assertAlmostEqual(config.protected_copy_fraction, 1.0)
+        config.validate()
+        for bad in (-0.1, 1.5, float("nan")):
+            config.protected_copy_fraction = bad
+            with self.assertRaises(ValueError):
+                config.validate()
 
     def test_prefetch_is_polled_until_the_reads_land(self) -> None:
         prompt = [self.next_token() for _ in range(64)]
@@ -2528,6 +2535,49 @@ class TestDiskTier(TestKVCacheManagerV2):
                 self.assertEqual(probe.poll_disk_reads(wait=True), DiskIoStatus.OK)
             finally:
                 probe.close()
+        s.take_finish_event()
+
+    def test_keep_copy_after_restore_skips_rewrite_and_tracks_counters(self) -> None:
+        prompt = [self.next_token() for _ in range(64)]
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self._push_prefix_to_disk(stream, prompt)
+            self.assertTrue(self.manager.has_disk_resident_prefix(input_tokens=prompt))
+            reader = self.manager.create_kv_cache(input_tokens=prompt)
+            try:
+                self.assertTrue(reader.prefetch(self.HOST_LEVEL))
+                self.assertEqual(reader.poll_disk_reads(wait=True), DiskIoStatus.OK)
+                self.assertFalse(self.manager.has_disk_resident_prefix(input_tokens=prompt))
+                disk_stats = self.manager.get_storage_statistics(self.DISK_LEVEL)
+                retained = sum(stat.retained_copies for stat in disk_stats)
+                self.assertGreater(retained, 0)
+                self.assertTrue(reader.resume(stream))
+            finally:
+                reader.close()
+            counters = _introspection.disk_copy_counters(self.manager)
+            self.assertEqual(
+                counters["retained"],
+                counters["created"]
+                - counters["reused"]
+                - counters["reclaimed"]
+                - counters["dropped"],
+            )
+            self.assertGreater(counters["retained"], 0)
+            # Evicting the restored prefix back to disk reuses its retained copies.
+            for _ in range(64):
+                probe = self.manager.create_kv_cache(input_tokens=prompt)
+                counts, _ = _introspection.active_page_stats(probe)
+                probe.close()
+                if counts[GPU_LEVEL] == 0 and counts[self.HOST_LEVEL] == 0:
+                    break
+                filler = [self.next_token() for _ in range(1024 * self.TOKENS_PER_BLOCK)]
+                self._commit(stream, filler)
+            after = _introspection.disk_copy_counters(self.manager)
+            self.assertGreater(after["reused"], counters["reused"])
+            self.assertEqual(
+                after["retained"],
+                after["created"] - after["reused"] - after["reclaimed"] - after["dropped"],
+            )
         s.take_finish_event()
 
 
