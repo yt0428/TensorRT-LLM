@@ -32,6 +32,8 @@ class PreparedInputs:
     kwargs: dict[str, Any]
     gather_ids: torch.Tensor | None = None
     runtime_draft_len: int = 0
+    # Number of tokens already written into the CUDA graph's static input buffers (0 when none).
+    static_inputs_staged: int = 0
 
 
 @dataclass(frozen=True)

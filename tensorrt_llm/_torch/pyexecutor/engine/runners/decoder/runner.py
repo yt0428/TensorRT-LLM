@@ -24,6 +24,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
@@ -31,9 +32,16 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -123,6 +131,12 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+    # This engine's skip cache and step-input pack (None: hook is off), active only during forward.
+    _h2d_cache: H2DSkipCache | None = None
+    _step_pack: StepInputPack | None = None
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -172,6 +186,28 @@ class DecoderRunner(ScheduledModelRunner):
         self.kv_cache_manager_key = kv_cache_manager_key
 
         self._config = config
+        self.runtime_hooks = runtime_hooks_of(model)
+        self._h2d_cache = (
+            H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
+            if self.runtime_hooks.skip_unchanged_h2d
+            else None
+        )
+        pack_factory = self.runtime_hooks.step_input_pack_factory
+        if not self.runtime_hooks.pack_step_inputs:
+            self._step_pack = None
+        elif pack_factory is not None:
+            pack_device = torch.device("cuda", torch.cuda.current_device())
+            self._step_pack = pack_factory(pack_device)
+        else:
+            pack_device = torch.device("cuda", torch.cuda.current_device())
+            self._step_pack = StepInputPack(
+                pack_device,
+                parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
+                in_graph=self.runtime_hooks.pack_in_graph,
+                early_copy=self.runtime_hooks.pack_early_copy,
+                step_epoch=self.runtime_hooks.pack_step_epoch,
+                prologue_op=self.runtime_hooks.pack_prologue_op,
+            )
 
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
@@ -189,13 +225,25 @@ class DecoderRunner(ScheduledModelRunner):
         self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
+        if self._config.is_spec_decode and self.runtime_hooks.spec_step_fold is not None:
+            self.runtime_hooks.spec_step_fold.bind_engine_buffers(
+                self._buffers.input_ids_cuda,
+                self._buffers.draft_tokens_cuda,
+                self._buffers.previous_pos_id_offsets_cuda,
+                self._buffers.previous_kv_lens_offsets_cuda,
+                self._config.max_batch_size,
+            )
         self._metadata = DecoderMetadata(
             config=self._config, mapping=mapping, model=model, buffers=self._buffers
         )
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
+        self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
+        self._inputs.attach_cuda_graph_runners(
+            self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
+        )
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -327,7 +375,15 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
+        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+            try:
+                return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
+            except BaseException:
+                # A failed step issues none of its packed copies, so forget shadows recorded for them.
+                step_inputs.discard()
+                if self._h2d_cache is not None:
+                    self._h2d_cache.clear()
+                raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
         """Create the native workspace owner for this runner's lifetime."""
@@ -613,6 +669,17 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
+            # Pack the step's small input copies into one upload and one scatter at the
+            # graph replay. Only a replay of an already captured graph, which always
+            # reaches the flush, may open a pack.
+            if (
+                self.runtime_hooks.pack_step_inputs
+                and can_run_graph
+                and self.cuda_graph_runner is not None
+                and not self.cuda_graph_runner.is_warmup_only
+                and not self.cuda_graph_runner.needs_capture(key)
+            ):
+                step_inputs.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -636,6 +703,9 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
+            if self._step_pack is not None and self._step_pack.issue_after_prepare:
+                # A model's own pack issued right after preparation, before the input-copy event.
+                step_inputs.flush()
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
@@ -672,6 +742,7 @@ class DecoderRunner(ScheduledModelRunner):
                 moe_load_balancer=moe_load_balancer,
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
+                static_inputs_staged=prepared.static_inputs_staged,
                 position_id_offsets=(
                     self._buffers.previous_pos_id_offsets_cuda
                     if enable_spec_decode
@@ -680,6 +751,8 @@ class DecoderRunner(ScheduledModelRunner):
                     else None
                 ),
             )
+            # No-op unless a pack was opened above and the replay did not issue it.
+            step_inputs.flush()
             if captures_model_body:
                 return outputs
 

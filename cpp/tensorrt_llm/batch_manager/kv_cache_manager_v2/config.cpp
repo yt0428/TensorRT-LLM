@@ -36,6 +36,14 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
+    if (numIoThreads < 1)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be >= 1");
+    }
+    if (!(hostReserveFraction >= 0.0 && hostReserveFraction < 1.0))
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: hostReserveFraction must be in [0, 1)");
+    }
 }
 
 void KVCacheManagerConfig::validate() const

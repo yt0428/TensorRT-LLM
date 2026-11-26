@@ -119,14 +119,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_in
     cute_dsl_indexer_q_side_fused,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    DEFAULT_VERIFY_CLUSTERS,
+    cluster_radix_topk_decode,
+    cute_dsl_radix_topk_decode,
+    reachable_cluster_sizes,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    build_split as build_ix_topk_verify,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    cute_dsl_radix_topk_decode,
-    split_radix_topk_decode,
+    build_cluster_variants as build_ix_topk_verify,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
     ds_mla_dequant_gather_tiled,
@@ -208,7 +210,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream,
+    maybe_execute_in_parallel,
+)
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
 from tensorrt_llm._utils import mpi_disabled
@@ -241,6 +246,7 @@ from .ops.dsa.hist_shard_meta import hist_shard_meta
 from .ops.dsa.hist_topk import hist_topk
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
+from .runtime_hooks import make_ml4_runtime_hooks
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -357,16 +363,20 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # exits the process, raising nothing, past 11622 one-row sequences on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
-# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and ten
-# partitions plus a radix merge for DSpark verification from 20480 columns (the narrowest
-# row the native op splits into ten blocks) to 1048584 (the split kernel's widest row).
-# split_radix_topk_decode keeps the native op for a call the op would not split into ten
-# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
+# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and one thread-block
+# cluster per row (`cluster_radix_topk_decode`, 8/16/32 CTAs per row chosen by `(rows, width)`
+# and device cluster support) for DSpark verification from 20480 columns (the narrowest row the
+# native op splits into ten blocks) to 1048584 (the selector's widest row) across graph batches
+# 1..16 (4..64 rows). `cluster_radix_topk_decode` keeps the native op for a call the op would
+# not split into ten blocks, or whose rows are not 32-byte aligned with a width multiple of 8.
 # Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
-_TOPK_VERIFY_ROWS = (4, 8, 16)
+_TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
+_TOPK_VERIFY_CLUSTERS = DEFAULT_VERIFY_CLUSTERS
+
+
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -942,9 +952,16 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         lo, hi = _TOPK_VERIFY_COLUMNS
         if not (_TOPK_DECODE_CUTE_DSL and lo <= self._max_ctx_len <= hi and self.idx_topk == 2048):
             self._ix_topk_verify = None
-        elif self._ix_topk_verify is None:
+        else:
+            sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
+            clusters = reachable_cluster_sizes(
+                _TOPK_VERIFY_ROWS, self._max_ctx_len, sm_count, _TOPK_VERIFY_CLUSTERS
+            )
             self._ix_topk_verify = build_ix_topk_verify(
-                dev, next_n=4, use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+                dev,
+                next_n=4,
+                clusters=clusters,
+                use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0",
             )
         # Both key-pool layouts: a launcher compiled for a contiguous view addresses a strided
         # one as if it were dense.
@@ -1052,6 +1069,40 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         )
         return buffers
 
+    def _select_indexer_topk(
+        self,
+        logits: torch.Tensor,
+        kv_lens: torch.Tensor,
+        indices: torch.Tensor,
+        next_n: int,
+        aux_indices: torch.Tensor,
+        aux_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select generation-row top-k indices for their static shape.
+
+        Centralizes decode top-k dispatch (1-launch cluster radix at next_n=4 with automatic
+        8/16/32-CTA CGA selection, 1-CTA radix at next_n=1, or the native op) so long-context
+        distributed selectors can hook in at one place.
+        """
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if (
+            self._ix_topk_verify is not None
+            and next_n == 4
+            and logits.shape[0] in _TOPK_VERIFY_ROWS
+            and lo <= logits.shape[1] <= hi
+            and logits.dtype == torch.float32
+        ):
+            return cluster_radix_topk_decode(
+                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
+            )
+        if next_n != 1 or self._ix_topk is None:
+            return indexer_topk_decode(
+                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
+            )
+        return cute_dsl_radix_topk_decode(
+            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        )
+
     def _select_indexer_decode(
         self,
         logits: torch.Tensor,
@@ -1062,23 +1113,11 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         aux_logits: torch.Tensor,
     ) -> torch.Tensor:
         """Select generation rows with the compiled selector for their static shape."""
-        lo, hi = _TOPK_VERIFY_COLUMNS
-        if (
-            self._ix_topk_verify is not None
-            and next_n == 4
-            and logits.shape[0] in _TOPK_VERIFY_ROWS
-            and lo <= logits.shape[1] <= hi
-            and logits.dtype == torch.float32
-        ):
-            return split_radix_topk_decode(
-                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
-            )
-        if next_n != 1 or self._ix_topk is None:
-            return indexer_topk_decode(
-                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
-            )
-        return cute_dsl_radix_topk_decode(
-            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        selector = getattr(self, "_select_indexer_topk", None)
+        if selector is not None:
+            return selector(logits, kv_lens, indices, next_n, aux_indices, aux_logits)
+        return MistralLarge4Tp4ModelingV2._select_indexer_topk(
+            self, logits, kv_lens, indices, next_n, aux_indices, aux_logits
         )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
@@ -1744,10 +1783,16 @@ class DecodeTarget:
         self._shared_fork = torch.cuda.Event()
         self._shared_join = torch.cuda.Event()
         # The same for the attention block's query and latent half (`_attention`), beside the
-        # indexer.
+        # indexer. On indexer layers the key half runs ahead of the query half on the side
+        # stream; its events fork it and mark its keys and head weights ready. On layers without
+        # an indexer the owner's latent runs on the main stream instead, and `_latent_ready`
+        # marks it ready for the query half's rope append.
         self._latent_stream = torch.cuda.Stream()
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
+        self._keys_fork = torch.cuda.Event()
+        self._keys_ready = torch.cuda.Event()
+        self._latent_ready = torch.cuda.Event()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1792,28 +1837,57 @@ class DecodeTarget:
         flashinfer_rmsnorm(kv, L.kv_norm, core.eps, out=nope_lat[:, : core.kv_lora])
         return nope_lat
 
-    def _indexer(self, step, x, pos, L, topk_buf, skip_gen: bool, iss=None):
-        """Append this step's keys to the layer's key pool; unless the engine skipped the
-        indexer (every sequence within index_topk), score every sequence's paged keys and
-        select `index_topk` positions per row into `topk_buf`."""
+    def _indexer_keys(self, step, x, pos, L):
+        """The indexer's key half: the wk | weights_proj projection, and this step's keys
+        normalized, roped and appended to the layer's key pool in place off `kw`'s leading
+        columns. Returns the projection, whose trailing columns are the head weights the
+        selection reads."""
+        core = self.core
+        ix = L.indexer
+        table = core._rope.indexer if ix.rope else core._rope.identity
+        kw = cublas_mm(x, ix.wk_wp)
+        k_pool = step["ix_pools"][L.index]
+        # The keys are read in place, the leading columns of `kw`'s rows.
+        cute_dsl_indexer_k_cache_update(
+            kw[:, : core.idx_dim], ix.k_norm_w, ix.k_norm_b, pos,
+            table.view(-1, 2, core.rope_dim // 2), k_pool,
+            step["slot_mapping_fp8"], step["slot_mapping_scale"], x.shape[0],
+            is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
+        )  # fmt: skip
+        return kw
+
+    def _indexer(
+        self,
+        step,
+        x,
+        pos,
+        L,
+        topk_buf,
+        skip_gen: bool = False,
+        iss=None,
+        *,
+        kw=None,
+        keys_ready=None,
+    ):
+        """Score every sequence's paged keys and select `index_topk` positions per row into
+        `topk_buf`: the q side from `x`, the head weights out of `kw` and the keys out of the
+        layer's pool, both `_indexer_keys`'s. `keys_ready`, when the key half ran on the side
+        stream, is the event behind it, waited for once the q side's projection is issued. When
+        `kw` is None, `_indexer_keys` runs inline first."""
+        if kw is None:
+            kw = DecodeTarget._indexer_keys(self, step, x, pos, L)
+        if skip_gen:
+            return
         core = self.core
         ix = L.indexer
         rows = x.shape[0]
         table = core._rope.indexer if ix.rope else core._rope.identity
-        kw = cublas_mm(x, ix.wk_wp)
-        k = kw[:, : core.idx_dim].contiguous()
-        k_pool = step["ix_pools"][L.index]
-        k_pool = cute_dsl_indexer_k_cache_update(
-            k, ix.k_norm_w, ix.k_norm_b, pos, table.view(-1, 2, core.rope_dim // 2), k_pool,
-            step["slot_mapping_fp8"], step["slot_mapping_scale"], rows,
-            is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
-        )  # fmt: skip
-        if skip_gen:
-            return
         qn = layer_norm(x, ix.q_norm_w, ix.q_norm_b, core.idx_eps)
         q = torch.reshape(self._linear_fp8(qn, ix.wq_b, ix.wq_b_s), [rows, core.idx_heads, -1])
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         weights = torch.empty([rows, core.idx_heads], dtype=torch.float32, device=x.device)
+        if keys_ready is not None:
+            keys_ready.wait()
         if core.unfused_glue:
             q = ssmax_scaling(q, pos, ix.ssmax_s, ix.ssmax_b)
             q_fp8, weights = cute_dsl_indexer_q_side_fused(
@@ -1832,7 +1906,7 @@ class DecodeTarget:
         if iss is not None:
             logits = cute_dsl_fp8_paged_mqa_logits(
                 torch.reshape(q_fp8, [1, next_n, core.idx_heads, core.idx_dim]),
-                k_pool,
+                step["ix_pools"][L.index],
                 weights,
                 iss["shard_ctx"],
                 iss["shard_block_table"],
@@ -1851,7 +1925,7 @@ class DecodeTarget:
             return
         logits = cute_dsl_fp8_paged_mqa_logits(
             torch.reshape(q_fp8, [num_gens, next_n, core.idx_heads, core.idx_dim]),
-            k_pool,
+            step["ix_pools"][L.index],
             weights,
             kv_lens,
             step["indexer_k_cache_block_offsets"][:num_gens],
@@ -2005,17 +2079,61 @@ class DecodeTarget:
         its pool slots; the query with SSMax, the absorbed query, the owner's rope and
         fp8_ds_mla append; sparse decode over the pool, and the V up-projection of the latent
         output (FlashMLA's live heads read in place under `gen_attn_flash_mla` with the fused
-        glue). Under CUDA-graph capture the query half runs on the side stream beside the
-        selection: the selection writes the indexer's key pool and `topk_buf`, the query half
-        `s` and the latent pool, neither reads what the other writes, and the decode reads
-        both."""
+        glue).
+
+        Under CUDA-graph capture the indexer's key half and then the query half run on the side
+        stream beside the selection. The key half writes the indexer's key pool and `kw`, which
+        the selection reads only after waiting for it, past its own q_input_norm and wq_b; the
+        selection writes `topk_buf` and, through the native top-k fallback, the engine's radix
+        arena; the query half writes `s.fused_q`, `s.nope_lat` and, on an owner layer, its row
+        of the latent pool. The query half and the selection read nothing the other writes, and
+        the decode reads both after the join. A NoPE sharer appends nothing: its decode reads
+        layer 35's rows, appended on the side stream and joined in layer 35. `kw` stays
+        referenced past the join (recorded on the main stream outside a capture), so the side
+        stream's allocator cannot hand its memory out while the selection reads it. Each later
+        use of the side stream first waits for the main stream past this join, so the uses never
+        overlap.
+
+        On a layer without an indexer the selection is the one slot conversion, so the owner's
+        latent (the kv_a projection and its norm) runs on the main stream ahead of it instead,
+        and the query half waits for it only at the rope append; the latent stays referenced
+        past the join (recorded on the side stream outside a capture), so its memory is not
+        reused while the rope append reads it."""
         core = self.core
         rows = x.shape[0]
         fq = s.fused_q[:, : core.heads]
+        side = self._latent_stream
+        multi = do_multi_stream() and side is not None
+        kw, keys_ready = None, None
+        if L.indexer is not None:
+            if multi:
+                self._keys_fork.record()
+                with torch.cuda.stream(side):
+                    self._keys_fork.wait()
+                    kw = self._indexer_keys(step, x, pos, L)
+                    if not skip_gen:
+                        self._keys_ready.record()
+                if not skip_gen:
+                    keys_ready = self._keys_ready
+                    if not torch.cuda.is_current_stream_capturing():
+                        kw.record_stream(torch.cuda.current_stream())
+            else:
+                kw = self._indexer_keys(step, x, pos, L)
+
+        latent = None
+        latent_on_main = L.owner and L.indexer is None and multi
 
         def select():
-            if L.indexer is not None:
-                self._indexer(step, x, pos, L, topk_buf, skip_gen, iss=iss)
+            nonlocal latent
+            if L.indexer is not None and not skip_gen:
+                self._indexer(
+                    step, x, pos, L, topk_buf, False, iss=iss, kw=kw, keys_ready=keys_ready
+                )
+            if latent_on_main:
+                latent = self._latent(x, L, s.nope_lat)
+                self._latent_ready.record()
+                if not torch.cuda.is_current_stream_capturing():
+                    latent.record_stream(side)
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
@@ -2041,13 +2159,18 @@ class DecodeTarget:
                 torch.transpose(fq[..., : core.kv_lora], 0, 1),
             )  # fmt: skip
             if L.owner:
+                if latent_on_main:
+                    self._latent_ready.wait()
+                    lat = latent
+                else:
+                    lat = self._latent(x, L, s.nope_lat)
                 ds_mla_rope_append(
-                    self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
+                    lat, fq, pos, core._rope.indexer, req_idx,
                     step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
                 )  # fmt: skip
 
         slots, _ = maybe_execute_in_parallel(
-            select, query, self._latent_fork, self._latent_join, self._latent_stream
+            select, query, self._latent_fork, self._latent_join, side
         )
         if core.gen_attn_flash_mla and core.unfused_glue:
             lat = flash_mla_sparse_decode(
@@ -2564,6 +2687,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             vocab_size=cfg.vocab_size,
         )
         self.softcap = float(cfg.softmax_tanh_gating)
+        self.runtime_hooks = make_ml4_runtime_hooks(model_config.mapping)
         self._vision: Optional[VisionTower] = None
         vis = getattr(cfg, "vision_config", None)
         self._image_token_ids = (

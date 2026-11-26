@@ -55,6 +55,15 @@ public:
     Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    // Disk transfer that produced this page's current data -- a read into memory or a write to disk --
+    // until a check finds it complete. When the transfer was fenced on a stream, readyEvent covers it
+    // too and the ticket only reports success. When it was not, nothing on the GPU waits for it: work
+    // that reads the data or reuses the slot must first wait for the ticket on the CPU
+    // (StorageManager::waitForPageIo), and the slot goes back to its pool only once it completes.
+    DiskIoTicket diskIoTicket = kNoDiskIoTicket;
+    // A disk transfer of this page's data failed, so the data is garbage. The page has left the radix
+    // tree and no owner may use it.
+    bool ioFailed = false;
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

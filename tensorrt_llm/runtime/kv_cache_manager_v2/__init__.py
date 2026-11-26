@@ -83,6 +83,8 @@ CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
 CuOOMError = _cpp.CuOOMError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
+DiskIoIterationStats = _cpp.DiskIoIterationStats
+DiskIoStatus = _cpp.DiskIoStatus
 DiskOOMError = _cpp.DiskOOMError
 GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
@@ -228,6 +230,8 @@ __all__ = [
     "DEFAULT_BEAM_INDEX",
     "DataRole",
     "DiskCacheTierConfig",
+    "DiskIoIterationStats",
+    "DiskIoStatus",
     "ExpandedBuffer",
     "GPU_LEVEL",
     "GpuCacheTierConfig",

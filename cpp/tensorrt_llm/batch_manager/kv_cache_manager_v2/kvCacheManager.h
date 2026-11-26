@@ -283,6 +283,11 @@ public:
     void recordDiskPrefetchBlocks(int64_t numBlocks);
     // Return the number of disk-prefetched blocks since the last drain and reset it.
     int64_t getAndResetIterationDiskPrefetchBlocks();
+    // Disk tier upkeep, once per scheduling iteration: settles finished disk transfers and refills the
+    // host reserve (see StorageManager::maintainHostReserve). A no-op without a disk tier.
+    void maintainHostReserve();
+    // Disk I/O counters since the last call; all zero without a disk tier.
+    DiskIoIterationStats getAndResetDiskIoStats();
     // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
     // level, into the current iteration window. Committed alongside the scalar iteration stats so
     // both views cover exactly the same requests.
