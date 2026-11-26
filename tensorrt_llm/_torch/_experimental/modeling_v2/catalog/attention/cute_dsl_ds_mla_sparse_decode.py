@@ -5,6 +5,7 @@ unpadded: a CuTe DSL kernel that computes FlashMLA's sm100f sparse fp8 decode.""
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -22,11 +23,15 @@ TILE = 128
 HEADS = _kernel.SUPPORTED_HEADS
 #: The split-K counts (CTAs per row) a batch can select.
 SPLITS = _kernel.SUPPORTED_SPLITS
-#: Global-workspace variants, separate from the cluster functions in `compiled.fns`.
-GLOBAL_SPLITS = (16,)
-#: The most rows the global variant runs. A CTA holds a whole SM, so a call also needs its
-#: rows x GLOBAL_SPLITS CTAs to fit in one wave; past it the cluster split is faster.
+#: Low-row split-K counts supported on SM107 (`GLOBAL_SPLITS[0]` is 2-launch global16).
+GLOBAL_SPLITS = (16, 32)
+#: The most rows the low-row high-split variants run. A CTA holds a whole SM, so a call also
+#: needs its rows x splits CTAs to fit in one wave; past it the cluster split is faster.
 GLOBAL_MAX_ROWS = 8
+#: Optimal V-block parallelism for fused combine+V-up on SM107.
+VUP_BLOCKS = _kernel.VUP_BLOCKS
+#: Default number of pre-allocated per-stream FP32 partial workspace slots.
+_WS_SLOTS = 8
 
 #: The tp4 / tep4 (16 heads) and tp8 / tep8 (8 heads) targets at their 1M config (max_seq_len
 #: 1048576, chunked prefill, 16 sequences): top-2048 selections over keys up to 1048576 in the
@@ -36,6 +41,50 @@ _1M = dict(topk=2048, kv_len=1048576, page_size=32, owners=63)
 #: rank's boot measured), the far end 107917 (the far cells of the 1M attention entries), and
 #: the 147456-block bound (a 1M tep8 rank held 114326). Every one puts slots past 2**31 bytes.
 _BOOT_BLOCKS, _FAR_BLOCKS, _BOUND_BLOCKS = 74183, 107917, 147456
+
+
+class _WorkspacePool:
+    """Pre-allocated FP32 partial workspace slots keyed by CUDA stream handle.
+
+    Avoids tensor allocation during CUDA-graph capture while keeping concurrent streams isolated.
+    """
+
+    def __init__(
+        self,
+        device_index: int,
+        *,
+        max_rows: int,
+        num_heads: int,
+        num_slots: int = _WS_SLOTS,
+    ) -> None:
+        self._device = torch.device("cuda", device_index)
+        self._partials_len = max_rows * max(GLOBAL_SPLITS) * num_heads * 516
+        self._lock = threading.Lock()
+        self._slots: list[torch.Tensor] = [self._alloc_slot() for _ in range(num_slots)]
+        self._stream_to_slot: dict[int, int] = {}
+        self._next_free = 0
+
+    def _alloc_slot(self) -> torch.Tensor:
+        return torch.empty(self._partials_len, dtype=torch.float32, device=self._device)
+
+    def for_current_stream(self) -> torch.Tensor | None:
+        sid = int(torch.cuda.current_stream(self._device).cuda_stream)
+        with self._lock:
+            idx = self._stream_to_slot.get(sid)
+            if idx is not None:
+                return self._slots[idx]
+            if self._next_free < len(self._slots):
+                idx = self._next_free
+                self._next_free += 1
+                self._stream_to_slot[sid] = idx
+                return self._slots[idx]
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            idx = len(self._slots)
+            self._slots.append(self._alloc_slot())
+            self._next_free = idx + 1
+            self._stream_to_slot[sid] = idx
+            return self._slots[idx]
 
 
 @dataclass(frozen=True)
@@ -48,27 +97,72 @@ class CompiledDsMlaSparseDecode:
     num_sms: int
     fns: Mapping[int, Callable]
     global_fns: tuple[Callable, Callable] | None = None
+    global_direct_fns: Mapping[int, tuple[Callable, Callable]] | None = None
+    combine_vup_fns: Mapping[int, Callable] | None = None
+    direct_fns: Mapping[int, Callable] | None = None
+    workspaces: _WorkspacePool | None = None
 
 
 def build(device_id: int, *, num_heads: int) -> CompiledDsMlaSparseDecode:
-    """Compile the cluster variants and the supported low-row global variant.
+    """Compile the cluster variants, direct req-index variants, and SM107 low-row
+    direct/combine+V-up variants.
 
-    The compiled object owns code only; invocation scratch belongs to PyTorch's
-    allocator and CUDA graph pools.
+    The compiled object owns code and pre-allocated FP32 partial workspace slots; caller outputs
+    belong to PyTorch's allocator and CUDA graph pools.
     """
     with torch.cuda.device(device_id):
         fns = {ns: _kernel.compile_variant(num_heads, ns, device_id) for ns in SPLITS}
+        direct_fns = {ns: _kernel.compile_direct_variant(num_heads, ns, device_id) for ns in SPLITS}
         num_sms = torch.cuda.get_device_properties(device_id).multi_processor_count
         global_fns = None
+        global_direct_fns: dict[int, tuple[Callable, Callable]] | None = None
+        combine_vup_fns: dict[int, Callable] | None = None
+        workspaces: _WorkspacePool | None = None
         if torch.cuda.get_device_capability(device_id) == (10, 7):
             global_fns = _kernel._compile_global_variant(num_heads, GLOBAL_SPLITS[0], device_id)
+            global_direct_fns = {
+                ns: _kernel.compile_global_direct_variant(num_heads, ns, device_id)
+                for ns in GLOBAL_SPLITS
+            }
+            combine_vup_fns = {
+                ns: _kernel.compile_combine_vup_variant(num_heads, ns, VUP_BLOCKS, device_id)
+                for ns in GLOBAL_SPLITS
+            }
+            workspaces = _WorkspacePool(device_id, max_rows=GLOBAL_MAX_ROWS, num_heads=num_heads)
     return CompiledDsMlaSparseDecode(
-        device_index=device_id, num_heads=num_heads, num_sms=num_sms, fns=fns, global_fns=global_fns
+        device_index=device_id,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        fns=fns,
+        global_fns=global_fns,
+        global_direct_fns=global_direct_fns,
+        combine_vup_fns=combine_vup_fns,
+        direct_fns=direct_fns,
+        workspaces=workspaces,
     )
 
 
+def supports_fused_vup(rows: int, compiled: CompiledDsMlaSparseDecode) -> bool:
+    """Whether fused combine+V-up serves `rows` on this compiled SparseMLA bundle."""
+    return (
+        getattr(compiled, "combine_vup_fns", None) is not None
+        and 1 <= rows <= GLOBAL_MAX_ROWS
+        and rows * 16 <= compiled.num_sms
+    )
+
+
+def _pick_low_row_direct_splits(rows: int, compiled: CompiledDsMlaSparseDecode) -> int | None:
+    """Choose split-K count (32 when `rows * 32 <= num_sms`, else 16) for SM107 low-row decode."""
+    if not (1 <= rows <= GLOBAL_MAX_ROWS) or not compiled.global_direct_fns:
+        return None
+    for ns in (32, 16):
+        if ns in compiled.global_direct_fns and rows * ns <= compiled.num_sms:
+            return ns
+    return None
+
+
 def _runs_global(rows: int, compiled: CompiledDsMlaSparseDecode) -> bool:
-    """Whether a call with `rows` rows runs the global variant."""
+    """Whether a call with `rows` rows runs the SM107 2-launch global-index variant."""
     return (
         compiled.global_fns is not None
         and 1 <= rows <= GLOBAL_MAX_ROWS
@@ -635,17 +729,152 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
         out: torch.Tensor,
         *,
         compiled: CompiledDsMlaSparseDecode,
+        req_id: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
+        block_size: int = 0,
+        stride_factor: int = 0,
+        layer_id: int = 0,
+        v_b_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if _runs_global(q.shape[0], compiled):
-            workspace = torch.empty(
-                (q.shape[0], GLOBAL_SPLITS[0], compiled.num_heads, 516),
-                dtype=torch.float32,
-                device=q.device,
+        direct = req_id is not None and block_table is not None
+        rows = q.shape[0]
+        if v_b_t is not None:
+            if not supports_fused_vup(rows, compiled):
+                raise ValueError(
+                    f"fused combine+V-up unsupported for rows={rows}, heads={compiled.num_heads}"
+                )
+            v_b = v_b_t.transpose(1, 2)
+            if not v_b.is_contiguous():
+                v_b = v_b.contiguous()
+            v_b_2d = v_b.view(compiled.num_heads * 128, D_NOPE)
+            ns = (
+                _pick_low_row_direct_splits(rows, compiled) or GLOBAL_SPLITS[0]
+                if direct
+                else GLOBAL_SPLITS[0]
             )
+            combine_vup_fn = compiled.combine_vup_fns[ns]
+            ws = (
+                compiled.workspaces.for_current_stream()
+                if compiled.workspaces is not None
+                else None
+            )
+            need = rows * ns * compiled.num_heads * 516
+            if ws is not None and ws.numel() >= need:
+                workspace = ws[:need].view(rows, ns, compiled.num_heads, 516)
+            else:
+                workspace = torch.empty(
+                    (rows, ns, compiled.num_heads, 516), dtype=torch.float32, device=q.device
+                )
+            if (
+                direct
+                and compiled.global_direct_fns is not None
+                and ns in compiled.global_direct_fns
+            ):
+                return _kernel.launch_global_direct_vup(
+                    compiled.global_direct_fns[ns][0],
+                    combine_vup_fn,
+                    q,
+                    kv_cache,
+                    indices,
+                    v_b_2d,
+                    out,
+                    softmax_scale,
+                    workspace,
+                    req_id=req_id,
+                    block_table=block_table,
+                    block_size=block_size,
+                    stride_factor=stride_factor,
+                    layer_id=layer_id,
+                )
+            return _kernel.launch_global_vup(
+                compiled.global_fns[0],
+                combine_vup_fn,
+                q,
+                kv_cache,
+                indices,
+                v_b_2d,
+                out,
+                softmax_scale,
+                workspace,
+            )
+        if direct:
+            low_ns = _pick_low_row_direct_splits(rows, compiled)
+            if (
+                low_ns is not None
+                and compiled.global_direct_fns is not None
+                and low_ns in compiled.global_direct_fns
+            ):
+                ws = (
+                    compiled.workspaces.for_current_stream()
+                    if compiled.workspaces is not None
+                    else None
+                )
+                need = rows * low_ns * compiled.num_heads * 516
+                if ws is not None and ws.numel() >= need:
+                    workspace = ws[:need].view(rows, low_ns, compiled.num_heads, 516)
+                else:
+                    workspace = torch.empty(
+                        (rows, low_ns, compiled.num_heads, 516),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                return _kernel.launch_global_direct(
+                    compiled.global_direct_fns[low_ns],
+                    q,
+                    kv_cache,
+                    indices,
+                    out,
+                    softmax_scale,
+                    workspace,
+                    req_id=req_id,
+                    block_table=block_table,
+                    block_size=block_size,
+                    stride_factor=stride_factor,
+                    layer_id=layer_id,
+                )
+            ns = _kernel.pick_splits(rows, compiled.num_sms)
+            if compiled.direct_fns is not None and ns in compiled.direct_fns:
+                return _kernel.launch_direct(
+                    compiled.direct_fns[ns],
+                    q,
+                    kv_cache,
+                    indices,
+                    out,
+                    softmax_scale,
+                    req_id=req_id,
+                    block_table=block_table,
+                    block_size=block_size,
+                    stride_factor=stride_factor,
+                    layer_id=layer_id,
+                )
+            indices = torch.ops.trtllm.convert_req_index_to_global(
+                req_id,
+                block_table,
+                indices,
+                block_size,
+                TOPK,
+                stride_factor,
+                layer_id,
+            )
+        if _runs_global(rows, compiled):
+            ws = (
+                compiled.workspaces.for_current_stream()
+                if compiled.workspaces is not None
+                else None
+            )
+            need = rows * GLOBAL_SPLITS[0] * compiled.num_heads * 516
+            if ws is not None and ws.numel() >= need:
+                workspace = ws[:need].view(rows, GLOBAL_SPLITS[0], compiled.num_heads, 516)
+            else:
+                workspace = torch.empty(
+                    (rows, GLOBAL_SPLITS[0], compiled.num_heads, 516),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
             return _kernel._launch_global(
                 compiled.global_fns, q, kv_cache, indices, out, softmax_scale, workspace
             )
-        fn = compiled.fns[_kernel.pick_splits(q.shape[0], compiled.num_sms)]
+        fn = compiled.fns[_kernel.pick_splits(rows, compiled.num_sms)]
         return _kernel.launch(fn, q, kv_cache, indices, out, softmax_scale)
 
     def reference(
@@ -655,12 +884,34 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
         indices: torch.Tensor,
         softmax_scale: float,
         out: torch.Tensor,
+        *,
+        req_id: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
+        block_size: int = 0,
+        stride_factor: int = 0,
+        layer_id: int = 0,
+        v_b_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """fp32, exact dequantization, softmax over the valid slots; a new tensor shaped
-        like `out`, rounded to bf16 once."""
-        h_out = out.shape[1]
+        like `out`, rounded to bf16 once (and optionally projected through `v_b_t`)."""
+        if req_id is not None and block_table is not None:
+            tok = indices.long()
+            max_blocks = block_table.shape[1]
+            block = torch.div(tok, block_size, rounding_mode="floor")
+            in_block = tok - block * block_size + layer_id * block_size
+            valid = (tok >= 0) & (block < max_blocks)
+            rows_idx = req_id.long().unsqueeze(1).expand_as(tok)
+            if max_blocks > 0:
+                base = block_table.long()[rows_idx, block.clamp(0, max_blocks - 1)]
+                valid &= base >= 0
+                indices = torch.where(
+                    valid, base * stride_factor + in_block, torch.full_like(tok, -1)
+                ).to(torch.int32)
+            else:
+                indices = torch.full_like(indices, -1)
+        h_out = v_b_t.shape[0] if v_b_t is not None else out.shape[1]
         flat = kv_cache.view(torch.uint8).reshape(-1, ROW_BYTES)
-        res = torch.zeros(out.shape, dtype=torch.float32, device=q.device)
+        res = torch.zeros((q.shape[0], h_out, D_NOPE), dtype=torch.float32, device=q.device)
         with true_fp32_matmul():
             for r in range(q.shape[0]):
                 idx = indices[r]
@@ -675,6 +926,10 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
                 k = torch.cat([nope, rope], 1)
                 s = (q[r, :h_out].float() @ k.T) * softmax_scale
                 res[r] = torch.softmax(s, -1) @ nope
+            if v_b_t is not None:
+                lat_bf16 = res.to(torch.bfloat16).float()
+                vup = torch.einsum("mhk,hkv->mhv", lat_bf16, v_b_t.float())
+                return vup.to(out.dtype).reshape(out.shape)
         return res.to(out.dtype)
 
     def is_valid(
@@ -686,6 +941,12 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
         out: torch.Tensor,
         *,
         compiled: CompiledDsMlaSparseDecode,
+        req_id: torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
+        block_size: int = 0,
+        stride_factor: int = 0,
+        layer_id: int = 0,
+        v_b_t: torch.Tensor | None = None,
     ) -> None:
         heads = out.shape[1]
         if heads not in HEADS or heads != compiled.num_heads:
@@ -693,8 +954,22 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
                              f"{compiled.num_heads}")  # fmt: skip
         if q.dim() != 3 or q.shape[1] < heads or q.shape[2] != D_QK:
             raise ValueError(f"q must be [rows, h_q >= {heads}, {D_QK}]")
-        if out.shape[0] != q.shape[0] or out.shape[2] != D_NOPE:
-            raise ValueError(f"out must be [rows, heads, {D_NOPE}]")
+        expected_out_dim = v_b_t.shape[2] if v_b_t is not None else D_NOPE
+        if out.shape[0] != q.shape[0] or out.shape[2] != expected_out_dim:
+            raise ValueError(f"out must be [rows, heads, {expected_out_dim}]")
+        if v_b_t is not None:
+            if (
+                v_b_t.dim() != 3
+                or v_b_t.shape != (heads, D_NOPE, 128)
+                or v_b_t.dtype != torch.bfloat16
+            ):
+                raise ValueError(f"v_b_t must be bf16 [{heads}, {D_NOPE}, 128]")
+            if not (v_b_t.is_contiguous() or v_b_t.transpose(1, 2).is_contiguous()):
+                raise ValueError("v_b_t (or v_b_t.transpose(1, 2)) must be contiguous")
+            if v_b_t.data_ptr() % 16:
+                raise ValueError("v_b_t must be 16-byte aligned")
+            if v_b_t.device.index != compiled.device_index:
+                raise ValueError("v_b_t is not on the compiled device")
         if indices.shape != (q.shape[0], TOPK) or indices.dtype != torch.int32:
             raise ValueError(f"indices must be int32 [rows, {TOPK}] slots")
         if kv_cache.shape[-1] != ROW_BYTES or kv_cache.dim() != 4 or kv_cache.shape[2] != 1:
@@ -706,6 +981,30 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
                 raise ValueError(f"{name} must be contiguous and 16-byte aligned")
             if t.device.index != compiled.device_index:
                 raise ValueError(f"{name} is not on the compiled device")
+        if (req_id is None) != (block_table is None):
+            raise ValueError("req_id and block_table must be passed together")
+        if req_id is not None and block_table is not None:
+            if (
+                req_id.shape != (q.shape[0],)
+                or req_id.dtype != torch.int32
+                or not req_id.is_contiguous()
+            ):
+                raise ValueError(f"req_id must be contiguous int32 [{q.shape[0]}]")
+            if (
+                block_table.dim() != 2
+                or block_table.dtype != torch.int32
+                or block_table.stride(1) != 1
+            ):
+                raise ValueError("block_table must be 2D int32 with unit last-dim stride")
+            if block_size <= 0 or stride_factor <= 0 or layer_id < 0:
+                raise ValueError("block_size, stride_factor must be > 0 and layer_id >= 0")
+            if (layer_id + 1) * block_size > stride_factor:
+                raise ValueError("layer_id exceeds page stride_factor")
+            if (
+                req_id.device.index != compiled.device_index
+                or block_table.device.index != compiled.device_index
+            ):
+                raise ValueError("req_id and block_table must be on the compiled device")
 
 
 cute_dsl_ds_mla_sparse_decode = CuteDslDsMlaSparseDecode()

@@ -91,6 +91,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ds_mla_sparse_decode import (
     cute_dsl_ds_mla_sparse_decode,
+    supports_fused_vup,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_fp8_mqa_logits import (
     build as build_ix_logits,
@@ -1571,18 +1572,32 @@ class PrefillTarget:
         idx = torch.where(sel >= 0, sel + ctx.ws_off[req_idx[:tc]][:, None], sel)
         flash_mla_sparse_prefill(fused_q, ws, idx.to(torch.int32), core.softmax_scale, lat_out)
 
-    def _attn_gen(self, step, L, fused_q, lat_out, slots, sched):
+    def _attn_gen(self, step, L, fused_q, lat_out, indices, sched, *, req_id=None):
         """Sparse MLA over the generation rows behind the context rows into `lat_out`, over the
         pool: this rank's heads read off the 64-head scratch the prefill kernel shares (or, under
         `gen_attn_flash_mla`, FlashMLA's decode over all 64, one scheduler for the step)."""
         core = self.core
         if core.gen_attn_flash_mla:
             flash_mla_sparse_decode(
-                fused_q, step["latent_kv"], slots, sched, core.softmax_scale, lat_out
+                fused_q, step["latent_kv"], indices, sched, core.softmax_scale, lat_out
+            )
+        elif req_id is not None:
+            cute_dsl_ds_mla_sparse_decode(
+                fused_q,
+                step["latent_kv"],
+                indices,
+                core.softmax_scale,
+                lat_out,
+                compiled=core._mla_decode,
+                req_id=req_id,
+                block_table=step["block_table"],
+                block_size=step["tokens_per_block"],
+                stride_factor=core._stride_factor,
+                layer_id=core._pool_row[L.kv_source],
             )
         else:
             cute_dsl_ds_mla_sparse_decode(
-                fused_q, step["latent_kv"], slots, core.softmax_scale, lat_out,
+                fused_q, step["latent_kv"], indices, core.softmax_scale, lat_out,
                 compiled=core._mla_decode,
             )  # fmt: skip
 
@@ -1795,11 +1810,17 @@ class PrefillTarget:
         if tc:
             self._attn_ctx(step, L, s.fused_q[:tc], s.lat_out[:tc], req_idx, topk_buf, ctx)
         if rows > tc:
-            slots = convert_req_index_to_global(
-                req_idx[tc:], step["block_table"], topk_buf[tc:], step["tokens_per_block"],
-                core.idx_topk, core._stride_factor, core._pool_row[L.kv_source],
-            )  # fmt: skip
-            self._attn_gen(step, L, s.fused_q[tc:], s.lat_out[tc:], slots, s.sched)
+            if core.gen_attn_flash_mla:
+                slots = convert_req_index_to_global(
+                    req_idx[tc:], step["block_table"], topk_buf[tc:], step["tokens_per_block"],
+                    core.idx_topk, core._stride_factor, core._pool_row[L.kv_source],
+                )  # fmt: skip
+                self._attn_gen(step, L, s.fused_q[tc:], s.lat_out[tc:], slots, s.sched)
+            else:
+                self._attn_gen(
+                    step, L, s.fused_q[tc:], s.lat_out[tc:], topk_buf[tc:], s.sched,
+                    req_id=req_idx[tc:],
+                )  # fmt: skip
         bmm_out(
             torch.transpose(s.lat_out, 0, 1),
             L.v_b_t,
@@ -2312,6 +2333,8 @@ class DecodeTarget:
                 self._latent_ready.record()
                 if not torch.cuda.is_current_stream_capturing():
                     latent.record_stream(side)
+            if not core.gen_attn_flash_mla:
+                return None
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
@@ -2358,12 +2381,38 @@ class DecodeTarget:
             lat = flash_mla_sparse_decode(
                 s.fused_q, step["latent_kv"], slots, s.sched, core.softmax_scale, None
             )[:, : core.heads]
-        else:
-            # The rank's heads, unpadded, into the latent output.
+        elif supports_fused_vup(rows, core._mla_decode):
+            # Fused direct req_idx decode + combine+V-up directly into s.attn_out.
             cute_dsl_ds_mla_sparse_decode(
-                s.fused_q, step["latent_kv"], slots, core.softmax_scale, s.lat_out,
+                s.fused_q,
+                step["latent_kv"],
+                topk_buf,
+                core.softmax_scale,
+                torch.reshape(s.attn_out, [rows, core.heads, core.v_dim]),
                 compiled=core._mla_decode,
-            )  # fmt: skip
+                req_id=req_idx,
+                block_table=step["block_table"],
+                block_size=step["tokens_per_block"],
+                stride_factor=core._stride_factor,
+                layer_id=core._pool_row[L.kv_source],
+                v_b_t=L.v_b_t,
+            )
+            return s.attn_out
+        else:
+            # The rank's heads, unpadded, with inline request-index-to-pool-slot resolution.
+            cute_dsl_ds_mla_sparse_decode(
+                s.fused_q,
+                step["latent_kv"],
+                topk_buf,
+                core.softmax_scale,
+                s.lat_out,
+                compiled=core._mla_decode,
+                req_id=req_idx,
+                block_table=step["block_table"],
+                block_size=step["tokens_per_block"],
+                stride_factor=core._stride_factor,
+                layer_id=core._pool_row[L.kv_source],
+            )
             lat = s.lat_out
         bmm_out(
             torch.transpose(lat, 0, 1),

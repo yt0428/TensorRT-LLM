@@ -189,6 +189,7 @@ def _setup_attention_harness(
     convert_calls: list[dict] = []
     rope_append_calls: list[dict] = []
     ssmax_fq_calls: list[dict] = []
+    mla_calls: list[dict] = []
 
     def _cublas_mm(x, weight):
         if weight == "wk_wp":
@@ -266,6 +267,7 @@ def _setup_attention_harness(
 
     def _sparse_decode(*args, **kwargs):
         trace.append(("op", cur_stream[0], "sparse_mla_decode"))
+        mla_calls.append(dict(args=args, kwargs=kwargs))
 
     monkeypatch.setattr(tp4_modeling, "cublas_mm", _cublas_mm)
     monkeypatch.setattr(tp4_modeling, "cute_dsl_indexer_k_cache_update", _k_cache_update)
@@ -337,6 +339,7 @@ def _setup_attention_harness(
         convert_calls=convert_calls,
         rope_append_calls=rope_append_calls,
         ssmax_fq_calls=ssmax_fq_calls,
+        mla_calls=mla_calls,
         rope_idx=rope_idx,
         rope_id=rope_id,
     )
@@ -409,9 +412,9 @@ def test_indexer_layer_skip_gen_still_appends_keys_without_orphan_event(monkeypa
 
 @pytest.mark.parametrize("capturing", [True, False])
 def test_non_indexer_layer_latent_runs_on_main_stream(monkeypatch, capturing):
-    """On non-indexer owner layers, wkv_a + kv_a_norm run on main stream ahead of slot
-    conversion and signal `_latent_ready`; side stream runs wq + ssmax + k_b before waiting on
-    `_latent_ready` at ds_mla_rope_append."""
+    """On non-indexer owner layers, wkv_a + kv_a_norm run on main stream and signal
+    `_latent_ready`; side stream runs wq + ssmax + k_b before waiting on `_latent_ready` at
+    ds_mla_rope_append, and SparseMLA resolves req indices inline without convert_req_index_to_global."""
     h = _setup_attention_harness(monkeypatch, multi_stream=True, capturing=capturing)
     # Layer 17 is a non-indexer RoPE owner (17 % 4 == 1).
     layer = _make_fake_layer(17, has_indexer=False, owner=True, rope=True, kv_source=17)
@@ -419,24 +422,28 @@ def test_non_indexer_layer_latent_runs_on_main_stream(monkeypatch, capturing):
 
     t = h.trace
     assert len(h.k_update_calls) == 0
+    assert len(h.convert_calls) == 0
     idx_wkva = t.index(("op", "main", "wkv_a"))
     idx_kvnorm = t.index(("op", "main", "kv_a_norm"))
     idx_lr_rec = t.index(("event.record", "main", "latent_ready"))
-    idx_conv = t.index(("op", "main", "convert_req_index_to_global"))
     idx_wq = t.index(("op", "side", "linear_fp8:wq"))
     idx_kb = t.index(("op", "side", "bmm_out:k_b"))
     idx_lr_wait = t.index(("event.wait", "side", "latent_ready"))
     idx_app = t.index(("op", "side", "ds_mla_rope_append"))
     idx_lj_wait = t.index(("event.wait", "main", "latent_join"))
+    idx_mla = t.index(("op", "main", "sparse_mla_decode"))
 
-    assert idx_wkva < idx_kvnorm < idx_lr_rec < idx_conv
-    assert idx_wq < idx_kb < idx_lr_wait < idx_app < idx_lj_wait
+    assert idx_wkva < idx_kvnorm < idx_lr_rec < idx_mla
+    assert idx_wq < idx_kb < idx_lr_wait < idx_app < idx_lj_wait < idx_mla
+    assert h.mla_calls[-1]["kwargs"]["layer_id"] == 17
+    assert h.mla_calls[-1]["kwargs"]["req_id"] is h.req_idx
+    assert h.mla_calls[-1]["kwargs"]["block_table"] == "block_table"
     assert (("record_stream", "latent", "side") in t) == (not capturing)
 
 
 def test_layer35_nope_owner_and_layer39_kv_sharer_contract(monkeypatch):
     """Verify Layer 35 (NoPE owner) appends to pool row 35 and Layer 39 (NoPE KV sharer) skips
-    latent/append while routing slots to pool row 35."""
+    latent/append while routing inline req-index lookup to pool row 35."""
     h = _setup_attention_harness(monkeypatch, multi_stream=True, capturing=True)
     layer35 = _make_fake_layer(35, has_indexer=True, owner=True, rope=False, kv_source=35)
     h.target._attention(
@@ -445,7 +452,8 @@ def test_layer35_nope_owner_and_layer39_kv_sharer_contract(monkeypatch):
     assert len(h.rope_append_calls) == 1
     assert h.rope_append_calls[0]["pool_row"] == 35
     assert h.rope_append_calls[0]["is_rope"] is False
-    assert h.convert_calls[-1]["pool_row"] == 35
+    assert len(h.convert_calls) == 0
+    assert h.mla_calls[-1]["kwargs"]["layer_id"] == 35
     assert h.ssmax_fq_calls[-1]["rope"] is False
 
     h.trace.clear()
@@ -457,8 +465,40 @@ def test_layer35_nope_owner_and_layer39_kv_sharer_contract(monkeypatch):
     assert len(h.rope_append_calls) == 0
     assert ("op", "side", "wkv_a") not in h.trace
     assert ("op", "main", "wkv_a") not in h.trace
-    assert h.convert_calls[-1]["pool_row"] == 35
+    assert len(h.convert_calls) == 0
+    assert h.mla_calls[-1]["kwargs"]["layer_id"] == 35
     assert h.ssmax_fq_calls[-1]["rope"] is False
+
+
+def test_fused_combine_vup_skips_convert_and_bmm_vup(monkeypatch):
+    """When compiled supports fused combine+V-up for low rows, DecodeTarget._attention skips both
+    convert_req_index_to_global and bmm_out(v_b_t) and writes directly into s.attn_out."""
+    h = _setup_attention_harness(monkeypatch, multi_stream=True, capturing=True, rows=4)
+    h.core._mla_decode = SimpleNamespace(combine_vup_fns={16: object(), 32: object()}, num_sms=212)
+    layer = _make_fake_layer(0, has_indexer=True, owner=True, rope=True, kv_source=0)
+    out = h.target._attention(
+        h.step, layer, h.x, h.pos, h.req_idx, h.topk_buf, h.scratch, skip_gen=False
+    )
+    assert out is h.scratch.attn_out
+    assert len(h.convert_calls) == 0
+    assert ("op", "main", "bmm_out:v_b_t") not in h.trace
+    assert len(h.mla_calls) == 1
+    assert h.mla_calls[0]["kwargs"]["v_b_t"] == "v_b_t"
+    assert h.mla_calls[0]["kwargs"]["req_id"] is h.req_idx
+    assert tuple(h.mla_calls[0]["args"][4].shape) == (4, 8, 128)
+
+    # Past GLOBAL_MAX_ROWS, combine+V-up falls back to bmm_out(v_b_t) while keeping inline req_idx.
+    h16 = _setup_attention_harness(monkeypatch, multi_stream=True, capturing=True, rows=16)
+    h16.core._mla_decode = SimpleNamespace(
+        combine_vup_fns={16: object(), 32: object()}, num_sms=212
+    )
+    h16.target._attention(
+        h16.step, layer, h16.x, h16.pos, h16.req_idx, h16.topk_buf, h16.scratch, skip_gen=False
+    )
+    assert len(h16.convert_calls) == 0
+    assert ("op", "main", "bmm_out:v_b_t") in h16.trace
+    assert "v_b_t" not in h16.mla_calls[0]["kwargs"]
+    assert h16.mla_calls[0]["kwargs"]["req_id"] is h16.req_idx
 
 
 def test_single_stream_mode_runs_all_ops_inline_on_main(monkeypatch):
