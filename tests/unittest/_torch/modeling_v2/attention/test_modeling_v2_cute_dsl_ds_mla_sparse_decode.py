@@ -91,7 +91,7 @@ def _build(spec, seed):
 def _gate(out, ref):
     o, r = out.float(), ref.float()
     per = (o - r).norm(dim=-1) / r.norm(dim=-1).clamp_min(1e-30)
-    whole = float((o - r).norm() / r.norm())
+    whole = float((o - r).norm() / r.norm().clamp_min(1e-30))
     assert float(per.max()) < 1e-2 and whole < 4e-3, (float(per.max()), whole)
 
 
@@ -638,3 +638,263 @@ def test_low_row_wrapper_padded_query_and_graph(heads: int, rows: int) -> None:
             SCALE,
         )
         assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("heads", [4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 4, 6, 8, 16, 32])
+@pytest.mark.parametrize("nope", [False, True])
+def test_direct_req_idx_exact_parity_and_graph(heads: int, rows: int, nope: bool) -> None:
+    """Inline req-index-to-page-table lookup matches convert_req_index_to_global and replays
+    identically across CUDA Graph replays."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 direct req-index low-row variants require SM107")
+    gen = torch.Generator(device="cuda").manual_seed(9001 + heads * 37 + rows * 13 + int(nope))
+    blocks, owners, page = 67, 63, 32
+    stride_factor = owners * page
+    layer_id = 35 if nope else 62
+    pool = torch.full((blocks, owners, page, 656), 255, dtype=torch.uint8, device="cuda")
+    legal_slots = (
+        (torch.arange(blocks, device="cuda")[:, None] * owners + layer_id) * page
+        + torch.arange(page, device="cuda")[None]
+    ).flatten()
+    pool.view(-1, 656)[legal_slots] = _draw_rows(legal_slots.numel(), gen, nope)
+    kv = pool.view(-1, page, 1, 656)
+
+    num_reqs = max(rows, 4)
+    max_blocks = blocks
+    bt_raw = torch.full((num_reqs, max_blocks + 3), -1, dtype=torch.int32, device="cuda")
+    for r in range(num_reqs):
+        bt_raw[r, :max_blocks] = torch.randperm(blocks, generator=gen, device="cuda").int()
+    # Non-contiguous strided block_table view to test bt_stride handling.
+    block_table = bt_raw[:, :max_blocks]
+    req_id = (torch.arange(rows, device="cuda", dtype=torch.int32) + 1) % num_reqs
+
+    max_pos = blocks * page
+    counts = (0, 1, 31, 32, 33, 63, 64, 65, 2047, 2048)
+    req_topk = torch.full((rows, 2048), -1, dtype=torch.int32, device="cuda")
+    for r in range(rows):
+        cnt = counts[r % len(counts)]
+        cols = torch.randperm(2048, generator=gen, device="cuda")[:cnt]
+        pos = torch.randperm(max_pos, generator=gen, device="cuda")[:cnt].int()
+        req_topk[r, cols] = pos
+    # Also inject an out-of-range token >= max_blocks * page to verify bounds masking.
+    if rows >= 2:
+        req_topk[1, 0] = max_pos + 7
+
+    global_slots = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, req_topk, page, 2048, stride_factor, layer_id
+    )
+    q = torch.randn((rows, heads, 576), generator=gen, device="cuda", dtype=torch.bfloat16)
+    if nope:
+        q[..., 512:] = 0
+
+    compiled = _compiled(heads)
+    out_global = torch.full((rows, heads, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+    out_direct = torch.full((rows, heads, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+    op(q, kv, global_slots, SCALE, out_global, compiled=compiled)
+    op(
+        q,
+        kv,
+        req_topk,
+        SCALE,
+        out_direct,
+        compiled=compiled,
+        req_id=req_id,
+        block_table=block_table,
+        block_size=page,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+    )
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(out_direct).all())
+    ref = op.reference(
+        q,
+        kv,
+        req_topk,
+        SCALE,
+        out_direct,
+        req_id=req_id,
+        block_table=block_table,
+        block_size=page,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+    )
+    _gate(out_direct, ref)
+    _gate(out_direct, out_global)
+    # When both paths use the same split-K count, inline lookup is bitwise identical.
+    if rows * 32 > compiled.num_sms or rows > 8:
+        assert torch.equal(out_direct.view(torch.int16), out_global.view(torch.int16))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(3):
+            op(
+                q,
+                kv,
+                req_topk,
+                SCALE,
+                out_direct,
+                compiled=compiled,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=page,
+                stride_factor=stride_factor,
+                layer_id=layer_id,
+            )
+    for _ in range(10):
+        q.copy_(torch.randn(q.shape, generator=gen, device="cuda", dtype=q.dtype))
+        if nope:
+            q[..., 512:] = 0
+        req_topk.copy_(req_topk.roll(3, dims=-1))
+        out_direct.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = op(
+            q,
+            kv,
+            req_topk,
+            SCALE,
+            torch.empty_like(out_direct),
+            compiled=compiled,
+            req_id=req_id,
+            block_table=block_table,
+            block_size=page,
+            stride_factor=stride_factor,
+            layer_id=layer_id,
+        )
+        assert torch.equal(out_direct.view(torch.int16), eager.view(torch.int16))
+
+
+@pytest.mark.parametrize("heads", [4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 4, 6, 8])
+@pytest.mark.parametrize("nope", [False, True])
+def test_fused_combine_vup_exact_parity_and_graph(heads: int, rows: int, nope: bool) -> None:
+    """Fused SparseMLA direct req-index + combine+V-up epilogue matches reference within
+    cosine > 0.9999 and replays identically in CUDA Graphs."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 combine+V-up requires SM107")
+    gen = torch.Generator(device="cuda").manual_seed(9501 + heads * 41 + rows * 17 + int(nope))
+    blocks, owners, page = 67, 63, 32
+    stride_factor = owners * page
+    layer_id = 35 if nope else 62
+    pool = torch.full((blocks, owners, page, 656), 255, dtype=torch.uint8, device="cuda")
+    legal_slots = (
+        (torch.arange(blocks, device="cuda")[:, None] * owners + layer_id) * page
+        + torch.arange(page, device="cuda")[None]
+    ).flatten()
+    pool.view(-1, 656)[legal_slots] = _draw_rows(legal_slots.numel(), gen, nope)
+    kv = pool.view(-1, page, 1, 656)
+
+    num_reqs = max(rows, 4)
+    max_blocks = blocks
+    bt_raw = torch.full((num_reqs, max_blocks + 3), -1, dtype=torch.int32, device="cuda")
+    for r in range(num_reqs):
+        bt_raw[r, :max_blocks] = torch.randperm(blocks, generator=gen, device="cuda").int()
+    block_table = bt_raw[:, :max_blocks]
+    req_id = (torch.arange(rows, device="cuda", dtype=torch.int32) + 1) % num_reqs
+
+    max_pos = blocks * page
+    counts = (0, 1, 31, 32, 33, 64, 128, 2047, 2048)
+    req_topk = torch.full((rows, 2048), -1, dtype=torch.int32, device="cuda")
+    for r in range(rows):
+        cnt = counts[(r + 1) % len(counts)] if rows == 1 else counts[r % len(counts)]
+        cols = torch.randperm(2048, generator=gen, device="cuda")[:cnt]
+        pos = torch.randperm(max_pos, generator=gen, device="cuda")[:cnt].int()
+        req_topk[r, cols] = pos
+    q = torch.randn((rows, heads, 576), generator=gen, device="cuda", dtype=torch.bfloat16)
+    if nope:
+        q[..., 512:] = 0
+    v_b = (torch.randn((heads, 128, 512), generator=gen, device="cuda") * 0.05).to(torch.bfloat16)
+    v_b_t = v_b.transpose(1, 2)
+
+    compiled = _compiled(heads)
+    ref = op.reference(
+        q,
+        kv,
+        req_topk,
+        SCALE,
+        torch.empty((rows, heads, 128), device="cuda", dtype=torch.bfloat16),
+        req_id=req_id,
+        block_table=block_table,
+        block_size=page,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+        v_b_t=v_b_t,
+    )
+
+    out_vup = torch.full((rows, heads, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
+    op.is_valid(
+        q,
+        kv,
+        req_topk,
+        SCALE,
+        out_vup,
+        compiled=compiled,
+        req_id=req_id,
+        block_table=block_table,
+        block_size=page,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+        v_b_t=v_b_t,
+    )
+    op(
+        q,
+        kv,
+        req_topk,
+        SCALE,
+        out_vup,
+        compiled=compiled,
+        req_id=req_id,
+        block_table=block_table,
+        block_size=page,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+        v_b_t=v_b_t,
+    )
+    _gate(out_vup, ref)
+    cos = torch.nn.functional.cosine_similarity(
+        out_vup.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.9999, f"cos={cos}"
+
+    if rows == 4:
+        g_out = torch.empty((rows, heads, 128), device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(
+                q,
+                kv,
+                req_topk,
+                SCALE,
+                g_out,
+                compiled=compiled,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=page,
+                stride_factor=stride_factor,
+                layer_id=layer_id,
+                v_b_t=v_b_t,
+            )
+        for _ in range(5):
+            q.copy_(torch.randn(q.shape, generator=gen, device="cuda", dtype=q.dtype))
+            if nope:
+                q[..., 512:] = 0
+            req_topk.copy_(req_topk.roll(5, dims=-1))
+            g_out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = op(
+                q,
+                kv,
+                req_topk,
+                SCALE,
+                torch.empty_like(g_out),
+                compiled=compiled,
+                req_id=req_id,
+                block_table=block_table,
+                block_size=page,
+                stride_factor=stride_factor,
+                layer_id=layer_id,
+                v_b_t=v_b_t,
+            )
+            assert torch.equal(g_out.view(torch.int16), eager.view(torch.int16))

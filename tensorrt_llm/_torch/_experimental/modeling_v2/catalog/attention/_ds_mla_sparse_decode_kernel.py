@@ -63,6 +63,8 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives.descriptors as _d
 import torch
+from cutlass._mlir.dialects import llvm as _llvm
+from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
@@ -152,10 +154,38 @@ def _smem_desc(start_address, leading_byte_offset=0, stride_byte_offset=0, *, lo
     )
 
 
-def _ptx1(code, *args):
+@dsl_user_op
+def _ptx1_asm(code, a0=None, a1=None, a2=None, *, loc=None, ip=None):
+    ir_args = []
+    cons = ["=f"]
+    for a in (a0, a1, a2):
+        if a is not None:
+            if isinstance(a, cutlass.Int32):
+                ir_args.append(a.ir_value(loc=loc, ip=ip))
+                cons.append("r")
+            else:
+                ir_args.append(cutlass.Float32(a).ir_value(loc=loc, ip=ip))
+                cons.append("f")
+    ptx = code.replace("{$w0}", "$0")
+    for idx in range(len(ir_args)):
+        ptx = ptx.replace(f"{{$r{idx}}}", f"${idx + 1}")
     return cutlass.Float32(
-        prims.inline_ptx_hl(code, write_only_types=[cutlass.Float32], read_only_args=list(args))
+        _llvm.inline_asm(
+            _T.f32(),
+            ir_args,
+            ptx,
+            ",".join(cons),
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
+
+
+def _ptx1(code, *args):
+    return _ptx1_asm(code, *args)
 
 
 def _ex2(x):  # exp2f under --use_fast_math
@@ -259,19 +289,30 @@ F32_ZERO = "0f00000000"
 F32_SIX = "0f40C00000"
 
 
-def _cmp_i32(op, a, lit) -> cutlass.Int32:
-    """1 if (a <op> lit) for an fp32 PTX literal, else 0."""
+@dsl_user_op
+def _cmp_i32_asm(op, a, lit, *, loc=None, ip=None) -> cutlass.Int32:
     return cutlass.Int32(
-        prims.inline_ptx_hl(
+        _llvm.inline_asm(
+            _T.i32(),
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
             "{\n\t.reg .pred p;\n\tsetp."
             + op
-            + ".f32 p, {$r0}, "
+            + ".f32 p, $1, "
             + lit
-            + ";\n\tselp.s32 {$w0}, 1, 0, p;\n\t}",
-            write_only_types=[cutlass.Int32],
-            read_only_args=[a],
+            + ";\n\tselp.s32 $0, 1, 0, p;\n\t}",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
+
+
+def _cmp_i32(op, a, lit) -> cutlass.Int32:
+    """1 if (a <op> lit) for an fp32 PTX literal, else 0."""
+    return _cmp_i32_asm(op, a, lit)
 
 
 def _sel_lit(flag, a, lit):
@@ -282,6 +323,32 @@ def _sel_lit(flag, a, lit):
         flag,
         a,
     )
+
+
+@dsl_user_op
+def _cp_async_bulk_1d(smem_addr, gmem_addr, nbytes, mbar_addr, *, loc=None, ip=None):
+    """1D TMA bulk copy global -> shared::cta with mbarrier tx-count completion."""
+    _llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(mbar_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def _smem_addr_u32(ptr) -> cutlass.Int32:
+    """Return the 32-bit CTA shared-memory byte offset of an address-space-3 pointer."""
+    return cutlass.Int32(ptr.toint())
 
 
 def _shfl_bfly(v, offset):
@@ -327,7 +394,16 @@ def _butterfly_sum(terms):
 
 @cute.jit
 def _issue_tile_raw(
-    kt, st, parity: cutlass.Constexpr[int], lane, sIdx, raw_full, raw_empty, sRaw, tma_raw
+    kt,
+    st,
+    parity: cutlass.Constexpr[int],
+    lane,
+    sIdx,
+    raw_full,
+    raw_empty,
+    sRaw,
+    tma_raw,
+    num_raw: cutlass.Constexpr[int] = NUM_RAW,
 ) -> None:
     """Gather the raw slots q = parity, parity + 2 of tile kt (16 whole 656-byte rows each)
     into the shared ring; lanes 0..3 issue one gather4 each."""
@@ -341,8 +417,8 @@ def _issue_tile_raw(
             + rl * cutlass.Int32(4)
         ).load(count=4, alignment=16)
         g = kt * cutlass.Int32(RAW_PER_TILE) + cutlass.Int32(q)
-        slot = g % cutlass.Int32(NUM_RAW)
-        gph = (g // cutlass.Int32(NUM_RAW)) % cutlass.Int32(2)
+        slot = g % cutlass.Int32(num_raw)
+        gph = (g // cutlass.Int32(num_raw)) % cutlass.Int32(2)
         _wait(raw_empty.data_ptr() + slot, gph ^ cutlass.Int32(1))
         if prims.elect_sync():
             prims.mbarrier_arrive_expect_tx(raw_full.data_ptr() + slot, RAW_SLOT_BYTES)
@@ -399,35 +475,50 @@ def _dsmla_decode_kernel(
     indices: cute.Tensor,
     out: cute.Tensor,
     scale_log2: cutlass.Float32,
+    req_id: cute.Tensor,
+    block_table: cute.Tensor,
+    block_size: cutlass.Int32,
+    block_shift: cutlass.Int32,
+    stride_factor: cutlass.Int32,
+    layer_id: cutlass.Int32,
+    max_blocks: cutlass.Int32,
+    bt_stride: cutlass.Int32,
     num_heads: cutlass.Constexpr[int],
     num_splits: cutlass.Constexpr[int],
     global_partials: cutlass.Constexpr[bool] = False,
+    resolve_req_idx: cutlass.Constexpr[bool] = False,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     warp = cute.arch.warp_idx()
     lane = tidx % cutlass.Int32(32)
+    eff_cluster: cutlass.Constexpr[int] = 1 if global_partials else num_splits
     split_x, _, row = cute.arch.block_idx()
-    split = split_x
-    if cutlass.const_expr(num_splits > 1 and not global_partials):
-        split = cute.arch.block_idx_in_cluster()
+    split = cute.arch.block_idx_in_cluster() if cutlass.const_expr(eff_cluster > 1) else split_x
     tokens_per_cta: cutlass.Constexpr[int] = TOPK // num_splits
     num_kt: cutlass.Constexpr[int] = tokens_per_cta // BT
+    num_bufs: cutlass.Constexpr[int] = 1 if num_kt == 1 else NUM_BUFS
+    kv_words: cutlass.Constexpr[int] = num_bufs * BUF_WORDS
+    num_raw: cutlass.Constexpr[int] = 4 if num_kt == 1 else NUM_RAW
+    st_s: cutlass.Constexpr[int] = 1 if num_kt == 1 else ST_S
+    st_p: cutlass.Constexpr[int] = 1 if num_kt == 1 else ST_P
+    st_i: cutlass.Constexpr[int] = 1 if num_kt == 1 else ST_I
+    tmem_o: cutlass.Constexpr[int] = st_s * S_COLS
     tok_base = row * cutlass.Int32(TOPK) + split * cutlass.Int32(tokens_per_cta)
 
     # ---- shared memory ------------------------------------------------------------------
     # The KV tile is typed fp32 so that it doubles as the fp32 split-K partial afterwards;
     # dequantized bf16 pairs are stored as bit-cast 32-bit words.
-    sKV = cutlass.Array(cutlass.Float32, KV_WORDS, space=cutlass.AddressSpace.smem, alignment=1024)
+    sKV = cutlass.Array(cutlass.Float32, kv_words, space=cutlass.AddressSpace.smem, alignment=1024)
     sRaw = cutlass.Array(
-        cutlass.Int32, NUM_RAW * RAW_SLOT_WORDS, space=cutlass.AddressSpace.smem, alignment=1024
+        cutlass.Int32, num_raw * RAW_SLOT_WORDS, space=cutlass.AddressSpace.smem, alignment=1024
     )
     sQ = cutlass.Array(
         cutlass.Int32, 9 * Q_CHUNK_BYTES // 4, space=cutlass.AddressSpace.smem, alignment=1024
     )
     sP = cutlass.Array(
-        cutlass.Int16, ST_P * N_MMA * 64, space=cutlass.AddressSpace.smem, alignment=1024
+        cutlass.Int16, st_p * N_MMA * 64, space=cutlass.AddressSpace.smem, alignment=1024
     )
-    sIdx = cutlass.Array(cutlass.Int32, ST_I * BT, space=cutlass.AddressSpace.smem, alignment=16)
+    sIdx = cutlass.Array(cutlass.Int32, st_i * BT, space=cutlass.AddressSpace.smem, alignment=16)
     sMax = cutlass.Array(
         cutlass.Float32, 2 * 4 * N_MMA, space=cutlass.AddressSpace.smem, alignment=16
     )
@@ -443,16 +534,16 @@ def _dsmla_decode_kernel(
     )
     sLi = cutlass.Array(cutlass.Float32, 2 * N_MMA, space=cutlass.AddressSpace.smem, alignment=16)
     q_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
-    idx_full = cutlass.Array(cutlass.Int64, ST_I, space=cutlass.AddressSpace.smem)
-    idx_empty = cutlass.Array(cutlass.Int64, ST_I, space=cutlass.AddressSpace.smem)
-    raw_full = cutlass.Array(cutlass.Int64, NUM_RAW, space=cutlass.AddressSpace.smem)
-    raw_empty = cutlass.Array(cutlass.Int64, NUM_RAW, space=cutlass.AddressSpace.smem)
-    kv_full = cutlass.Array(cutlass.Int64, NUM_BUFS, space=cutlass.AddressSpace.smem)
-    kv_empty = cutlass.Array(cutlass.Int64, NUM_BUFS, space=cutlass.AddressSpace.smem)
-    s_full = cutlass.Array(cutlass.Int64, ST_S, space=cutlass.AddressSpace.smem)
-    s_empty = cutlass.Array(cutlass.Int64, ST_S, space=cutlass.AddressSpace.smem)
-    p_full = cutlass.Array(cutlass.Int64, ST_P, space=cutlass.AddressSpace.smem)
-    p_empty = cutlass.Array(cutlass.Int64, ST_P, space=cutlass.AddressSpace.smem)
+    idx_full = cutlass.Array(cutlass.Int64, st_i, space=cutlass.AddressSpace.smem)
+    idx_empty = cutlass.Array(cutlass.Int64, st_i, space=cutlass.AddressSpace.smem)
+    raw_full = cutlass.Array(cutlass.Int64, num_raw, space=cutlass.AddressSpace.smem)
+    raw_empty = cutlass.Array(cutlass.Int64, num_raw, space=cutlass.AddressSpace.smem)
+    kv_full = cutlass.Array(cutlass.Int64, num_bufs, space=cutlass.AddressSpace.smem)
+    kv_empty = cutlass.Array(cutlass.Int64, num_bufs, space=cutlass.AddressSpace.smem)
+    s_full = cutlass.Array(cutlass.Int64, st_s, space=cutlass.AddressSpace.smem)
+    s_empty = cutlass.Array(cutlass.Int64, st_s, space=cutlass.AddressSpace.smem)
+    p_full = cutlass.Array(cutlass.Int64, st_p, space=cutlass.AddressSpace.smem)
+    p_empty = cutlass.Array(cutlass.Int64, st_p, space=cutlass.AddressSpace.smem)
     c_full = cutlass.Array(cutlass.Int64, ST_C, space=cutlass.AddressSpace.smem)
     c_empty = cutlass.Array(cutlass.Int64, ST_C, space=cutlass.AddressSpace.smem)
     o_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
@@ -460,22 +551,23 @@ def _dsmla_decode_kernel(
     fin_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     tmem_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
 
+    fast_idx: cutlass.Constexpr[bool] = resolve_req_idx and num_kt <= 2
     if warp == 0:
         if prims.elect_sync():
             prims.mbarrier_init(q_full, 1)
-            for i in cutlass.range_constexpr(ST_I):
-                prims.mbarrier_init(idx_full.data_ptr() + i, 1)
+            for i in cutlass.range_constexpr(st_i):
+                prims.mbarrier_init(idx_full.data_ptr() + i, 2 if fast_idx else 1)
                 prims.mbarrier_init(idx_empty.data_ptr() + i, 6)
-            for i in cutlass.range_constexpr(NUM_RAW):
+            for i in cutlass.range_constexpr(num_raw):
                 prims.mbarrier_init(raw_full.data_ptr() + i, 1)
                 prims.mbarrier_init(raw_empty.data_ptr() + i, 4)
-            for b in cutlass.range_constexpr(NUM_BUFS):
+            for b in cutlass.range_constexpr(num_bufs):
                 prims.mbarrier_init(kv_full.data_ptr() + b, 4 * RAW_PER_TILE)
                 prims.mbarrier_init(kv_empty.data_ptr() + b, 1)
-            for i in cutlass.range_constexpr(ST_S):
+            for i in cutlass.range_constexpr(st_s):
                 prims.mbarrier_init(s_full.data_ptr() + i, 1)
                 prims.mbarrier_init(s_empty.data_ptr() + i, 4)
-            for i in cutlass.range_constexpr(ST_P):
+            for i in cutlass.range_constexpr(st_p):
                 prims.mbarrier_init(p_full.data_ptr() + i, 4)
                 prims.mbarrier_init(p_empty.data_ptr() + i, 1)
             for i in cutlass.range_constexpr(ST_C):
@@ -485,18 +577,58 @@ def _dsmla_decode_kernel(
             prims.mbarrier_init(o_empty, 4)
             prims.mbarrier_init(fin_full, 1)
     prims.fence_mbarrier_init()
-    if cutlass.const_expr(num_splits > 1 and not global_partials):
+    if cutlass.const_expr(eff_cluster > 1):
         prims.barrier_cluster_arrive_relaxed()
     if warp == W_PV:
         prims.tcgen05_alloc(tmem_i32, TMEM_COLS, group="cta_1")
-    if cutlass.const_expr(num_splits > 1 and not global_partials):
+    if cutlass.const_expr(eff_cluster > 1):
         prims.barrier_cluster_wait()
     prims.barrier_cta_sync(0)
     tmem_raw = tmem_i32.load()
     if warp == W_PV:
         prims.tcgen05_relinquish_alloc_permit(group="cta_1")
+
+    # Pre-load constant req_id / block_table base BEFORE PDL WAIT so multi-warp sIdx resolution
+    # hides req_id latency and executes in parallel with W9's sQ zeroing + tma_q.
+    fast_bt_base = cutlass.Int64(0)
+    fast_layer_off = cutlass.Int32(0)
+    fast_block_mask = cutlass.Int32(0)
+    if cutlass.const_expr(fast_idx):
+        if (warp >= cutlass.Int32(10)) & (warp < cutlass.Int32(10 + 2 * num_kt)):
+            req_val_f = req_id.iterator.raw_ptr()[row]
+            fast_bt_base = cutlass.Int64(req_val_f) * cutlass.Int64(bt_stride)
+            fast_layer_off = layer_id * block_size
+            fast_block_mask = block_size - cutlass.Int32(1)
+
     # Everything below reads what the preceding kernels wrote (query, indices, pool rows).
     prims.griddepcontrol(prims.GridDepAction.WAIT)
+
+    if cutlass.const_expr(fast_idx):
+        # Cooperative 2*num_kt-warp (64 or 128 threads, 1 token/thread) inline req_idx -> page_table
+        # lookup overlapped with W9's sQ zeroing & Q TMA. W10+W11 fill sIdx[0..63] (kt=0) and
+        # W12+W13 fill sIdx[64..127] (kt=1) simultaneously.
+        if (warp >= cutlass.Int32(10)) & (warp < cutlass.Int32(10 + 2 * num_kt)):
+            idx_ptr_f = indices.iterator.raw_ptr()
+            bt_ptr_f = block_table.iterator.raw_ptr()
+            kt_f = (warp - cutlass.Int32(10)) >> cutlass.Int32(1)
+            half_f = (warp - cutlass.Int32(10)) & cutlass.Int32(1)
+            col_f = half_f * cutlass.Int32(32) + lane
+            tok_f = idx_ptr_f[tok_base + kt_f * cutlass.Int32(BT) + col_f]
+            slot_f = cutlass.Int32(-1)
+            if tok_f >= cutlass.Int32(0):
+                block_f = tok_f >> block_shift
+                rem_f = tok_f & fast_block_mask
+                if block_shift < cutlass.Int32(0):
+                    block_f = tok_f // block_size
+                    rem_f = tok_f - block_f * block_size
+                if block_f < max_blocks:
+                    base_f = bt_ptr_f[fast_bt_base + cutlass.Int64(block_f)]
+                    if base_f >= cutlass.Int32(0):
+                        slot_f = base_f * stride_factor + rem_f + fast_layer_off
+            sIdx[kt_f * cutlass.Int32(BT) + col_f] = slot_f
+            prims.bar_warp_sync(0xFFFFFFFF)
+            if prims.elect_sync():
+                prims.mbarrier_arrive(idx_full.data_ptr() + kt_f)
 
     # =====================================================================================
     # W9: query TMA (9 chunks of 64 bf16 x heads, SW128) and the per-tile index ring.
@@ -522,42 +654,74 @@ def _dsmla_decode_kernel(
                     [c * 64, 0, row],
                     q_full,
                 )
-        idx_ptr = indices.iterator.raw_ptr()
-        for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            st = kt % cutlass.Int32(ST_I)
-            ph = (kt // cutlass.Int32(ST_I)) % cutlass.Int32(2)
-            _wait(idx_empty.data_ptr() + st, ph ^ cutlass.Int32(1))
-            if lane < cutlass.Int32(BT // 4):
-                vals = (idx_ptr + tok_base + kt * cutlass.Int32(BT) + lane * cutlass.Int32(4)).load(
-                    count=4, alignment=16
-                )
-                (sIdx.data_ptr() + st * cutlass.Int32(BT) + lane * cutlass.Int32(4)).store(
-                    vals, alignment=16
-                )
-            prims.bar_warp_sync(0xFFFFFFFF)
-            if prims.elect_sync():
-                prims.mbarrier_arrive(idx_full.data_ptr() + st)
-            # W9 also issues the odd raw slots of this tile (W10 the even ones): the TMA unit
-            # serves one warp's requests one after another, two warps' in parallel.
-            _issue_tile_raw(kt, st, 1, lane, sIdx, raw_full, raw_empty, sRaw, tma_raw)
-            prims.bar_warp_sync(0xFFFFFFFF)
-            if prims.elect_sync():
-                prims.mbarrier_arrive(idx_empty.data_ptr() + st)
+        if cutlass.const_expr(fast_idx):
+            for kt in cutlass.range(0, num_kt, 1, unroll=1):
+                _wait(idx_full.data_ptr() + kt, cutlass.Int32(0))
+                _issue_tile_raw(kt, kt, 1, lane, sIdx, raw_full, raw_empty, sRaw, tma_raw, num_raw)
+        else:
+            idx_ptr = indices.iterator.raw_ptr()
+            bt_ptr = block_table.iterator.raw_ptr()
+            bt_row_base = cutlass.Int64(0)
+            layer_off = cutlass.Int32(0)
+            block_mask = cutlass.Int32(0)
+            if cutlass.const_expr(resolve_req_idx):
+                req_val = req_id.iterator.raw_ptr()[row]
+                bt_row_base = cutlass.Int64(req_val) * cutlass.Int64(bt_stride)
+                layer_off = layer_id * block_size
+                block_mask = block_size - cutlass.Int32(1)
+            for kt in cutlass.range(0, num_kt, 1, unroll=1):
+                st = kt % cutlass.Int32(st_i)
+                ph = (kt // cutlass.Int32(st_i)) % cutlass.Int32(2)
+                _wait(idx_empty.data_ptr() + st, ph ^ cutlass.Int32(1))
+                if cutlass.const_expr(resolve_req_idx):
+                    for rep in cutlass.range_constexpr(2):
+                        col_i = lane + cutlass.Int32(rep * 32)
+                        tok = idx_ptr[tok_base + kt * cutlass.Int32(BT) + col_i]
+                        slot = cutlass.Int32(-1)
+                        if tok >= cutlass.Int32(0):
+                            block = tok >> block_shift
+                            rem = tok & block_mask
+                            if block_shift < cutlass.Int32(0):
+                                block = tok // block_size
+                                rem = tok - block * block_size
+                            if block < max_blocks:
+                                base = bt_ptr[bt_row_base + cutlass.Int64(block)]
+                                if base >= cutlass.Int32(0):
+                                    slot = base * stride_factor + rem + layer_off
+                        sIdx[st * cutlass.Int32(BT) + col_i] = slot
+                else:
+                    if lane < cutlass.Int32(BT // 4):
+                        vals = (
+                            idx_ptr + tok_base + kt * cutlass.Int32(BT) + lane * cutlass.Int32(4)
+                        ).load(count=4, alignment=16)
+                        (sIdx.data_ptr() + st * cutlass.Int32(BT) + lane * cutlass.Int32(4)).store(
+                            vals, alignment=16
+                        )
+                prims.bar_warp_sync(0xFFFFFFFF)
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(idx_full.data_ptr() + st)
+                # W9 also issues the odd raw slots of this tile (W10 the even ones): the TMA unit
+                # serves one warp's requests one after another, two warps' in parallel.
+                _issue_tile_raw(kt, st, 1, lane, sIdx, raw_full, raw_empty, sRaw, tma_raw, num_raw)
+                prims.bar_warp_sync(0xFFFFFFFF)
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(idx_empty.data_ptr() + st)
 
     # =====================================================================================
-    # W10: TMA gathers of the even raw slots (16 whole 656-byte rows each) into the 5-slot raw
+    # W10: TMA gathers of the even raw slots (16 whole 656-byte rows each) into the raw
     # ring. A -1 index is an out-of-bounds row: TMA zero-fills it, codes and scales (FlashMLA
     # sets `tma_coords = -1` and the scale bytes 0; the token is masked to -inf either way).
     # =====================================================================================
     if warp == W_TMA:
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            st = kt % cutlass.Int32(ST_I)
-            ph = (kt // cutlass.Int32(ST_I)) % cutlass.Int32(2)
+            st = kt % cutlass.Int32(st_i)
+            ph = (kt // cutlass.Int32(st_i)) % cutlass.Int32(2)
             _wait(idx_full.data_ptr() + st, ph)
-            _issue_tile_raw(kt, st, 0, lane, sIdx, raw_full, raw_empty, sRaw, tma_raw)
-            prims.bar_warp_sync(0xFFFFFFFF)
-            if prims.elect_sync():
-                prims.mbarrier_arrive(idx_empty.data_ptr() + st)
+            _issue_tile_raw(kt, st, 0, lane, sIdx, raw_full, raw_empty, sRaw, tma_raw, num_raw)
+            if cutlass.const_expr(not fast_idx):
+                prims.bar_warp_sync(0xFFFFFFFF)
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(idx_empty.data_ptr() + st)
 
     # =====================================================================================
     # W12-15: dequantization, eight threads per token row. bf16(e4m3) * bf16(scale) with the
@@ -570,13 +734,13 @@ def _dsmla_decode_kernel(
         t = dq >> cutlass.Int32(3)  # token within a 16-token raw slot
         part = dq & cutlass.Int32(7)  # 16-byte pieces part, part+8, part+16, part+24 of the codes
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            b = kt % cutlass.Int32(NUM_BUFS)
-            u = kt // cutlass.Int32(NUM_BUFS)
+            b = kt % cutlass.Int32(num_bufs)
+            u = kt // cutlass.Int32(num_bufs)
             kvb = b * cutlass.Int32(BUF_WORDS)
             for q in cutlass.range_constexpr(RAW_PER_TILE):
                 g = kt * cutlass.Int32(RAW_PER_TILE) + cutlass.Int32(q)
-                slot = g % cutlass.Int32(NUM_RAW)
-                gph = (g // cutlass.Int32(NUM_RAW)) % cutlass.Int32(2)
+                slot = g % cutlass.Int32(num_raw)
+                gph = (g // cutlass.Int32(num_raw)) % cutlass.Int32(2)
                 _wait(raw_full.data_ptr() + slot, gph)
                 if cutlass.const_expr(q == 0):
                     _wait(kv_empty.data_ptr() + b, (u % cutlass.Int32(2)) ^ cutlass.Int32(1))
@@ -654,15 +818,15 @@ def _dsmla_decode_kernel(
         _wait(q_full, 0)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            sst = kt % cutlass.Int32(ST_S)
-            sph = (kt // cutlass.Int32(ST_S)) % cutlass.Int32(2)
+            sst = kt % cutlass.Int32(st_s)
+            sph = (kt // cutlass.Int32(st_s)) % cutlass.Int32(2)
             _wait(s_empty.data_ptr() + sst, sph ^ cutlass.Int32(1))
             # FlashMLA's dual GEMM (V32 layout): half 0 = rope dims 0-31, then NoPE chunks
             # 0, 2, 4, 6; half 1 = rope dims 32-63, then chunks 1, 3, 5, 7. Each half is its own
             # fp32 accumulator, K = 16 per MMA in that order; the softmax adds the two.
             s_tm0 = tmem_raw + sst * cutlass.Int32(S_COLS)
-            b = kt % cutlass.Int32(NUM_BUFS)
-            u = kt // cutlass.Int32(NUM_BUFS)
+            b = kt % cutlass.Int32(num_bufs)
+            u = kt // cutlass.Int32(num_bufs)
             kvb = sKV.data_ptr() + b * cutlass.Int32(BUF_WORDS)
             _wait(kv_full.data_ptr() + b, u % cutlass.Int32(2))
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -717,16 +881,17 @@ def _dsmla_decode_kernel(
             b_major=0,
         )
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            pst = kt % cutlass.Int32(ST_P)
-            pph = (kt // cutlass.Int32(ST_P)) % cutlass.Int32(2)
+            pst = kt % cutlass.Int32(st_p)
+            pph = (kt // cutlass.Int32(st_p)) % cutlass.Int32(2)
             _wait(p_full.data_ptr() + pst, pph)
-            _wait(o_empty, kt % cutlass.Int32(2))
+            if cutlass.const_expr(num_kt > 1):
+                _wait(o_empty, kt % cutlass.Int32(2))
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            b = kt % cutlass.Int32(NUM_BUFS)
+            b = kt % cutlass.Int32(num_bufs)
             kvb = sKV.data_ptr() + b * cutlass.Int32(BUF_WORDS)
             dp = _smem_desc(sP.data_ptr() + pst * cutlass.Int32(N_MMA * 64), 16, 1024)
             for s in cutlass.range_constexpr(NUM_STRIPES):
-                o_tmem = cutlass.inttoptr(tmem_raw + TMEM_O + s * N_MMA, 6, cutlass.Float32)
+                o_tmem = cutlass.inttoptr(tmem_raw + tmem_o + s * N_MMA, 6, cutlass.Float32)
                 dv = _smem_desc(kvb + 2 * s * CHUNK_WORDS, CHUNK_BYTES, 1024)
                 for kk in cutlass.range_constexpr(BT // 16):
                     if prims.elect_sync():
@@ -764,10 +929,10 @@ def _dsmla_decode_kernel(
         )
         p_byte = t * cutlass.Int32(2)
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            sst = kt % cutlass.Int32(ST_S)
-            sph = (kt // cutlass.Int32(ST_S)) % cutlass.Int32(2)
-            idx_st = kt % cutlass.Int32(ST_I)
-            idx_ph = (kt // cutlass.Int32(ST_I)) % cutlass.Int32(2)
+            sst = kt % cutlass.Int32(st_s)
+            sph = (kt // cutlass.Int32(st_s)) % cutlass.Int32(2)
+            idx_st = kt % cutlass.Int32(st_i)
+            idx_ph = (kt // cutlass.Int32(st_i)) % cutlass.Int32(2)
             _wait(idx_full.data_ptr() + idx_st, idx_ph)
             valid = live
             if sIdx[idx_st * cutlass.Int32(BT) + t] == cutlass.Int32(-1):
@@ -818,8 +983,8 @@ def _dsmla_decode_kernel(
             mi = cutlass.Vector.from_elements(tuple(new_max), dtype=cutlass.Float32)
             pv = [_ex2(_fma_rn(sv[h], scale_log2, -new_max[h])) for h in range(N_MMA)]
             # P^T [h][tok] bf16, K-major SW128 (one 64-token atom per head row).
-            pst = kt % cutlass.Int32(ST_P)
-            pph = (kt // cutlass.Int32(ST_P)) % cutlass.Int32(2)
+            pst = kt % cutlass.Int32(st_p)
+            pph = (kt // cutlass.Int32(st_p)) % cutlass.Int32(2)
             _wait(p_empty.data_ptr() + pst, pph ^ cutlass.Int32(1))
             p_katom = pst * cutlass.Int32(N_MMA * 64)
             for h2 in cutlass.range_constexpr(N_MMA // 2):
@@ -896,24 +1061,25 @@ def _dsmla_decode_kernel(
             prims.bar_warp_sync(0xFFFFFFFF)
             if prims.elect_sync():
                 prims.mbarrier_arrive(c_empty.data_ptr() + cst)
-            if kt > cutlass.Int32(0):
-                _wait(o_full, (kt - cutlass.Int32(1)) % cutlass.Int32(2))
-                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                if flag != cutlass.Int32(0):
-                    for s in cutlass.range_constexpr(NUM_STRIPES):
-                        tp = cutlass.inttoptr(my_addr + TMEM_O + s * N_MMA, 6, cutlass.Float32)
-                        ov = prims.tcgen05_ld("32x32b", tp, num=N_MMA)
-                        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                        nv = cutlass.Vector.from_elements(
-                            tuple(_mul_rn(ov[h], corr[h]) for h in range(N_MMA)),
-                            dtype=cutlass.Float32,
-                        )
-                        prims.tcgen05_st("32x32b", tp, nv)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            prims.bar_warp_sync(0xFFFFFFFF)
-            if prims.elect_sync():
-                prims.mbarrier_arrive(o_empty)
+            if cutlass.const_expr(num_kt > 1):
+                if kt > cutlass.Int32(0):
+                    _wait(o_full, (kt - cutlass.Int32(1)) % cutlass.Int32(2))
+                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                    if flag != cutlass.Int32(0):
+                        for s in cutlass.range_constexpr(NUM_STRIPES):
+                            tp = cutlass.inttoptr(my_addr + tmem_o + s * N_MMA, 6, cutlass.Float32)
+                            ov = prims.tcgen05_ld("32x32b", tp, num=N_MMA)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                            nv = cutlass.Vector.from_elements(
+                                tuple(_mul_rn(ov[h], corr[h]) for h in range(N_MMA)),
+                                dtype=cutlass.Float32,
+                            )
+                            prims.tcgen05_st("32x32b", tp, nv)
+                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                prims.bar_warp_sync(0xFFFFFFFF)
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(o_empty)
         _wait(o_full, (cutlass.Int32(num_kt) - cutlass.Int32(1)) % cutlass.Int32(2))
         _wait(fin_full, 0)
         if cw < cutlass.Int32(2):
@@ -937,7 +1103,7 @@ def _dsmla_decode_kernel(
             optr = out.iterator.raw_ptr()
             obase = row * cutlass.Int32(num_heads * D_NOPE)
             for s in cutlass.range_constexpr(NUM_STRIPES):
-                tp = cutlass.inttoptr(my_addr + TMEM_O + s * N_MMA, 6, cutlass.Float32)
+                tp = cutlass.inttoptr(my_addr + tmem_o + s * N_MMA, 6, cutlass.Float32)
                 ov = prims.tcgen05_ld("32x32b", tp, num=N_MMA)
                 prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                 for h2 in cutlass.range_constexpr(num_heads // 2):
@@ -950,10 +1116,11 @@ def _dsmla_decode_kernel(
                             (pk >> cutlass.Int32(16 * e)) & cutlass.Int32(0xFFFF)
                         )
         else:
-            # fp32 partial O / l into the (now idle) KV tile, lse = lg2(l) + max (FlashMLA).
+            # fp32 partial O / l into the (now idle) KV tile or global workspace,
+            # lse = lg2(l) + max (FlashMLA).
             part = sKV
             for s in cutlass.range_constexpr(NUM_STRIPES):
-                tp = cutlass.inttoptr(my_addr + TMEM_O + s * N_MMA, 6, cutlass.Float32)
+                tp = cutlass.inttoptr(my_addr + tmem_o + s * N_MMA, 6, cutlass.Float32)
                 ov = prims.tcgen05_ld("32x32b", tp, num=N_MMA)
                 prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                 for h in cutlass.range_constexpr(num_heads):
@@ -1014,13 +1181,13 @@ def _dsmla_decode_kernel(
                 for p in cutlass.range_constexpr(1, num_splits):
                     max_lse = _fmax(max_lse, lses[p])
                 max_lse = _sel_lit(_cmp_i32("ne", max_lse, F32_NEG_INF), max_lse, F32_ZERO)
-                # combine.cu sums over lanes with a xor butterfly (offsets 16 .. 1; lanes past
-                # the splits hold 0): the same adds as halving the list pairwise.
                 sum_lse = _butterfly_sum(
                     [_ex2(_sub_ftz(lses[p], max_lse)) for p in range(num_splits)]
                 )
                 global_lse = _sel_lit(
-                    _cmp_i32("ne", sum_lse, F32_ZERO), _add_ftz(_lg2(sum_lse), max_lse), F32_POS_INF
+                    _cmp_i32("ne", sum_lse, F32_ZERO),
+                    _add_ftz(_lg2(sum_lse), max_lse),
+                    F32_POS_INF,
                 )
                 acc = []
                 for p in cutlass.range_constexpr(num_splits):
@@ -1028,7 +1195,6 @@ def _dsmla_decode_kernel(
                     peer_o = prims.mapa(part_local, cutlass.Int32(p))
                     o4 = (peer_o + h * cutlass.Int32(D_NOPE) + d0).load(count=4, alignment=16)
                     if cutlass.const_expr(p == 0):
-                        # FlashMLA: result = 0; result += w * o (an fma onto 0 is the product).
                         acc = [_mul_into_zero(w, o4[e]) for e in range(4)]
                     else:
                         acc = [_fma_ftz(w, o4[e], acc[e]) for e in range(4)]
@@ -1086,8 +1252,25 @@ def _launch(
         swizzle=cuda.TensorMapSwizzle.none,
     )
     cluster_splits: cutlass.Constexpr[int] = 1 if global_partials else num_splits
+    zero_i32 = cutlass.Int32(0)
     _dsmla_decode_kernel(
-        tma_q, tma_raw, indices, out, scale_log2, num_heads, num_splits, global_partials
+        tma_q,
+        tma_raw,
+        indices,
+        out,
+        scale_log2,
+        indices,
+        indices,
+        zero_i32,
+        zero_i32,
+        zero_i32,
+        zero_i32,
+        zero_i32,
+        zero_i32,
+        num_heads,
+        num_splits,
+        global_partials,
+        False,
     ).launch(
         grid=(num_splits, 1, rows),
         block=(THREADS, 1, 1),
@@ -1098,7 +1281,144 @@ def _launch(
     )
 
 
+@cute.jit
+def _launch_direct(
+    q: cute.Tensor,
+    pool: cute.Tensor,
+    indices: cute.Tensor,
+    out: cute.Tensor,
+    scale_log2: cutlass.Float32,
+    req_id: cute.Tensor,
+    block_table: cute.Tensor,
+    block_size: cutlass.Int32,
+    block_shift: cutlass.Int32,
+    stride_factor: cutlass.Int32,
+    layer_id: cutlass.Int32,
+    stream: cuda_driver.CUstream,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+) -> None:
+    rows = indices.shape[0]
+    h_q = q.shape[1]
+    tma_q = cuda.create_tensor_map_tiled(
+        global_address=q.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=[D_QK, h_q, rows],
+        global_strides=[D_QK * 2 // 16, h_q * (D_QK * 2 // 16)],
+        box_dims=[64, num_heads, 1],
+        swizzle=cuda.TensorMapSwizzle.s128b,
+    )
+    tma_raw = cuda.create_tensor_map_tiled(
+        global_address=pool.iterator.toint(),
+        dtype=cutlass.Int64,
+        global_dims=[ROW_BYTES // 8, pool.shape[0]],
+        global_strides=[ROW_BYTES // 16],
+        box_dims=[ROW_BYTES // 8, 1],
+        swizzle=cuda.TensorMapSwizzle.none,
+    )
+    max_blocks = cutlass.Int32(block_table.shape[1])
+    bt_stride = cutlass.Int32(block_table.stride[0])
+    _dsmla_decode_kernel(
+        tma_q,
+        tma_raw,
+        indices,
+        out,
+        scale_log2,
+        req_id,
+        block_table,
+        block_size,
+        block_shift,
+        stride_factor,
+        layer_id,
+        max_blocks,
+        bt_stride,
+        num_heads,
+        num_splits,
+        False,
+        True,
+    ).launch(
+        grid=(num_splits, 1, rows),
+        block=(THREADS, 1, 1),
+        cluster=(num_splits, 1, 1),
+        stream=stream,
+        min_blocks_per_mp=1,
+        use_pdl=True,
+    )
+
+
 _COMPILED: dict[tuple[int, int, int], Callable] = {}
+_DIRECT_COMPILED: dict[tuple[int, int, int], Callable] = {}
+
+
+def compile_direct_variant(num_heads: int, num_splits: int, device_index: int) -> Callable:
+    """Compile a cluster-combine decode variant with inline request-index-to-page-table lookup."""
+    if num_heads not in SUPPORTED_HEADS or num_splits not in SUPPORTED_SPLITS:
+        raise ValueError(f"no direct variant for {num_heads} heads and {num_splits} splits")
+    key = (device_index, num_heads, num_splits)
+    if key not in _DIRECT_COMPILED:
+        make = cute.runtime.make_fake_compact_tensor
+        make_strided = cute.runtime.make_fake_tensor
+        rows, h_q, n_rows = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+        req_rows = cute.sym_int64()
+        bt_rows, bt_cols, bt_st0 = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+        cutlass.cuda.initialize_cuda_context(device_index)
+        _DIRECT_COMPILED[key] = cute.compile(
+            _launch_direct,
+            make(cutlass.BFloat16, (rows, h_q, D_QK), stride_order=(2, 1, 0), assumed_align=16),
+            make(cutlass.Uint8, (n_rows, ROW_BYTES), stride_order=(1, 0), assumed_align=16),
+            make(cutlass.Int32, (rows, TOPK), stride_order=(1, 0), assumed_align=16),
+            make(
+                cutlass.Int16, (rows, num_heads, D_NOPE), stride_order=(2, 1, 0), assumed_align=16
+            ),
+            cutlass.Float32(0.0),
+            make(cutlass.Int32, (req_rows,), assumed_align=4),
+            make_strided(cutlass.Int32, (bt_rows, bt_cols), stride=(bt_st0, 1), assumed_align=4),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            num_heads,
+            num_splits,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+    return _DIRECT_COMPILED[key]
+
+
+def launch_direct(
+    fn: Callable,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    *,
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    stride_factor: int,
+    layer_id: int,
+) -> torch.Tensor:
+    """Run a compiled cluster-combine direct-index variant on the current stream."""
+    pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    bs = int(block_size)
+    block_shift = (bs.bit_length() - 1) if (bs > 0 and (bs & (bs - 1)) == 0) else -1
+    fn(
+        q,
+        pool,
+        indices,
+        out.view(torch.int16),
+        scale_log2_of(softmax_scale),
+        req_id,
+        block_table,
+        bs,
+        block_shift,
+        int(stride_factor),
+        int(layer_id),
+        stream,
+    )
+    return out
 
 
 def compile_variant(num_heads: int, num_splits: int, device_index: int) -> Callable:
@@ -1229,13 +1549,173 @@ def _launch_global_combine(
 
 
 _GLOBAL_COMPILED: dict[tuple[int, int, int], tuple[Callable, Callable]] = {}
+_GLOBAL_DIRECT_COMPILED: dict[tuple[int, int, int], tuple[Callable, Callable]] = {}
+
+
+@cute.jit
+def _launch_global_direct_partial(
+    q: cute.Tensor,
+    pool: cute.Tensor,
+    indices: cute.Tensor,
+    workspace: cute.Tensor,
+    scale_log2: cutlass.Float32,
+    req_id: cute.Tensor,
+    block_table: cute.Tensor,
+    block_size: cutlass.Int32,
+    block_shift: cutlass.Int32,
+    stride_factor: cutlass.Int32,
+    layer_id: cutlass.Int32,
+    stream: cuda_driver.CUstream,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+) -> None:
+    rows = indices.shape[0]
+    h_q = q.shape[1]
+    tma_q = cuda.create_tensor_map_tiled(
+        global_address=q.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=[D_QK, h_q, rows],
+        global_strides=[D_QK * 2 // 16, h_q * (D_QK * 2 // 16)],
+        box_dims=[64, num_heads, 1],
+        swizzle=cuda.TensorMapSwizzle.s128b,
+    )
+    tma_raw = cuda.create_tensor_map_tiled(
+        global_address=pool.iterator.toint(),
+        dtype=cutlass.Int64,
+        global_dims=[ROW_BYTES // 8, pool.shape[0]],
+        global_strides=[ROW_BYTES // 16],
+        box_dims=[ROW_BYTES // 8, 1],
+        swizzle=cuda.TensorMapSwizzle.none,
+    )
+    max_blocks = cutlass.Int32(block_table.shape[1])
+    bt_stride = cutlass.Int32(block_table.stride[0])
+    _dsmla_decode_kernel(
+        tma_q,
+        tma_raw,
+        indices,
+        workspace,
+        scale_log2,
+        req_id,
+        block_table,
+        block_size,
+        block_shift,
+        stride_factor,
+        layer_id,
+        max_blocks,
+        bt_stride,
+        num_heads,
+        num_splits,
+        True,
+        True,
+    ).launch(
+        grid=(num_splits, 1, rows),
+        block=(THREADS, 1, 1),
+        cluster=(1, 1, 1),
+        stream=stream,
+        min_blocks_per_mp=1,
+        use_pdl=True,
+    )
+
+
+def compile_global_direct_variant(
+    num_heads: int, num_splits: int, device_index: int
+) -> tuple[Callable, Callable]:
+    """Compile cluster-free, zero-atomic split-K decode with inline req-index lookup + combine."""
+    if num_heads not in SUPPORTED_HEADS or num_splits not in (8, 16, 32):
+        raise ValueError(f"no global-direct variant for {num_heads} heads and {num_splits} splits")
+    key = (device_index, num_heads, num_splits)
+    if key not in _GLOBAL_DIRECT_COMPILED:
+        make = cute.runtime.make_fake_compact_tensor
+        make_strided = cute.runtime.make_fake_tensor
+        rows, h_q, n_rows = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+        req_rows = cute.sym_int64()
+        bt_rows, bt_cols, bt_st0 = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
+        cutlass.cuda.initialize_cuda_context(device_index)
+        workspace = make(
+            cutlass.Float32,
+            (rows, num_splits, num_heads, 516),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+        output = make(
+            cutlass.Int16, (rows, num_heads, D_NOPE), stride_order=(2, 1, 0), assumed_align=16
+        )
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False)
+        partial = cute.compile(
+            _launch_global_direct_partial,
+            make(cutlass.BFloat16, (rows, h_q, D_QK), stride_order=(2, 1, 0), assumed_align=16),
+            make(cutlass.Uint8, (n_rows, ROW_BYTES), stride_order=(1, 0), assumed_align=16),
+            make(cutlass.Int32, (rows, TOPK), stride_order=(1, 0), assumed_align=16),
+            workspace,
+            cutlass.Float32(0.0),
+            make(cutlass.Int32, (req_rows,), assumed_align=4),
+            make_strided(cutlass.Int32, (bt_rows, bt_cols), stride=(bt_st0, 1), assumed_align=4),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            stream,
+            num_heads,
+            num_splits,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+        combine = cute.compile(
+            _launch_global_combine,
+            workspace,
+            output,
+            stream,
+            num_heads,
+            num_splits,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+        _GLOBAL_DIRECT_COMPILED[key] = (partial, combine)
+    return _GLOBAL_DIRECT_COMPILED[key]
+
+
+def launch_global_direct(
+    fns: tuple[Callable, Callable],
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    workspace: torch.Tensor,
+    *,
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    stride_factor: int,
+    layer_id: int,
+) -> torch.Tensor:
+    """Run cluster-free zero-atomic split-K direct-index decode + 32-CTA combine."""
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
+    bs = int(block_size)
+    block_shift = (bs.bit_length() - 1) if (bs > 0 and (bs & (bs - 1)) == 0) else -1
+    partial, combine = fns
+    partial(
+        q,
+        pool,
+        indices,
+        workspace,
+        scale_log2_of(softmax_scale),
+        req_id,
+        block_table,
+        bs,
+        block_shift,
+        int(stride_factor),
+        int(layer_id),
+        stream,
+    )
+    combine(workspace, out.view(torch.int16), stream)
+    return out
 
 
 def _compile_global_variant(
     num_heads: int, num_splits: int, device_index: int
 ) -> tuple[Callable, Callable]:
     """Compile independent split CTAs and a separate FP32 combine launch."""
-    if num_heads not in SUPPORTED_HEADS or num_splits not in (8, 16):
+    if num_heads not in SUPPORTED_HEADS or num_splits not in (8, 16, 32):
         raise ValueError(f"no global variant for {num_heads} heads and {num_splits} splits")
     key = (device_index, num_heads, num_splits)
     if key not in _GLOBAL_COMPILED:
@@ -1297,4 +1777,283 @@ def _launch_global(
     partial, combine = fns
     partial(q, pool, indices, workspace, scale_log2_of(softmax_scale), stream)
     combine(workspace, out.view(torch.int16), stream)
+    return out
+
+
+VUP_BLOCKS = 8
+VUP_BLOCKS_SUPPORTED = (2, 4, 8, 16)
+_COMBINE_VUP_COMPILED: dict[tuple[int, int, int, int], Callable] = {}
+
+
+@cute.kernel
+def _global_combine_vup_kernel(
+    partials: cute.Tensor,
+    v_b: cute.Tensor,
+    out_i32: cute.Tensor,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+    v_blocks: cutlass.Constexpr[int],
+) -> None:
+    """Fused 1-row-per-CTA SparseMLA split-K combine + V-up (out_vup = combine(partials) @ v_b^T).
+
+    Grid = (rows, num_heads, v_blocks), block = (128, 1, 1):
+      - Pre-loads contiguous v_b[head, vb_idx*v_tile : +v_tile, 0:512] via ONE 1D cp.async.bulk
+        BEFORE PDL WAIT (overlapped with _dsmla_decode_kernel tail; zero host TensorMap overhead).
+      - Combines ONE single row of partials[row, 0..num_splits-1, head, 0..511] into 1 KB sLat
+        (rounded once to bf16, matching exact FlashMLA combine parity, zero register spilling).
+      - Computes vectorized zero-bank-conflict bf16x2 dot products with warp-shuffle reduction
+        and writes coalesced bf16x2 [rows, num_heads, 128] straight into ml4_mx_gemv(wo).
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    row, head, vb_idx = cute.arch.block_idx()
+    warp = tidx // cutlass.Int32(32)
+    lane = tidx % cutlass.Int32(32)
+
+    v_tile: cutlass.Constexpr[int] = 128 // v_blocks
+    t_per_v: cutlass.Constexpr[int] = 128 // v_tile  # 2 (vb2), 4 (vb4), 8 (vb8)
+    iters_v4: cutlass.Constexpr[int] = (256 // t_per_v) // 4  # 32, 16, 8
+    v_bytes: cutlass.Constexpr[int] = v_tile * D_NOPE * 2
+
+    sVb = cutlass.Array(
+        cutlass.Int32, v_tile * (D_NOPE // 2), space=cutlass.AddressSpace.smem, alignment=1024
+    )
+    sLat = cutlass.Array(cutlass.Int32, D_NOPE // 2, space=cutlass.AddressSpace.smem, alignment=16)
+    sW = cutlass.Array(cutlass.Float32, 32, space=cutlass.AddressSpace.smem, alignment=16)
+    vb_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+
+    # Pre-issue 1D TMA bulk copy of constant v_b slice BEFORE PDL WAIT to hide HBM4 latency.
+    if warp == cutlass.Int32(0):
+        if prims.elect_sync():
+            prims.mbarrier_init(vb_full, 1)
+            prims.fence_mbarrier_init()
+            prims.mbarrier_arrive_expect_tx(vb_full, v_bytes)
+            src_addr = cutlass.Int64(v_b.iterator.toint()) + (
+                (
+                    cutlass.Int64(head) * cutlass.Int64(128)
+                    + cutlass.Int64(vb_idx * cutlass.Int32(v_tile))
+                )
+                * cutlass.Int64(D_NOPE * 2)
+            )
+            _cp_async_bulk_1d(
+                _smem_addr_u32(sVb.data_ptr(0)),
+                src_addr,
+                cutlass.Int32(v_bytes),
+                _smem_addr_u32(vb_full.data_ptr()),
+            )
+
+    prims.griddepcontrol(prims.GridDepAction.WAIT)
+
+    ptr = partials.iterator.raw_ptr()
+    row_base = (
+        cutlass.Int64(row) * cutlass.Int64(num_splits * num_heads) + cutlass.Int64(head)
+    ) * cutlass.Int64(516)
+
+    # Step 1: Warp 0 computes FlashMLA butterfly softmax weights once for this (row, head).
+    if warp == cutlass.Int32(0):
+        lse_val = cutlass.Float32(-float("inf"))
+        if lane < cutlass.Int32(num_splits):
+            lse_off = (
+                row_base + cutlass.Int64(lane) * cutlass.Int64(num_heads * 516) + cutlass.Int64(512)
+            )
+            lse_val = cutlass.Float32(ptr[lse_off])
+        max_lse = lse_val
+        for off in cutlass.range_constexpr(5):
+            max_lse = _fmax(max_lse, _shfl_bfly(max_lse, 16 >> off))
+        max_lse = _sel_lit(_cmp_i32("ne", max_lse, F32_NEG_INF), max_lse, F32_ZERO)
+        e_val = cutlass.Float32(0.0)
+        if lane < cutlass.Int32(num_splits):
+            e_val = _ex2(_sub_ftz(lse_val, max_lse))
+        sum_lse = e_val
+        for off in cutlass.range_constexpr(5):
+            sum_lse = _add_ftz(sum_lse, _shfl_bfly(sum_lse, 16 >> off))
+        global_lse = _sel_lit(
+            _cmp_i32("ne", sum_lse, F32_ZERO),
+            _add_ftz(_lg2(sum_lse), max_lse),
+            F32_POS_INF,
+        )
+        if lane < cutlass.Int32(num_splits):
+            sW[lane] = _ex2(_sub_ftz(lse_val, global_lse))
+    prims.barrier_cta_sync(0)
+
+    # Step 2: All 128 threads combine ONE row of partials into 1 KB sLat (16 float4 loads for g16).
+    acc = []
+    for p in cutlass.range_constexpr(num_splits):
+        w = sW[cutlass.Int32(p)]
+        o4 = (
+            ptr
+            + row_base
+            + cutlass.Int64(p * num_heads * 516)
+            + cutlass.Int64(tidx * cutlass.Int32(4))
+        ).load(count=4, alignment=16)
+        if cutlass.const_expr(p == 0):
+            acc = [_mul_into_zero(w, o4[e]) for e in range(4)]
+        else:
+            acc = [_fma_ftz(w, o4[e], acc[e]) for e in range(4)]
+    sLat[tidx * cutlass.Int32(2)] = _bf16x2(acc[0], acc[1])
+    sLat[tidx * cutlass.Int32(2) + cutlass.Int32(1)] = _bf16x2(acc[2], acc[3])
+    prims.barrier_cta_sync(0)
+
+    # Step 3: Wait on pre-fetched v_b slice and compute bank-conflict-free bf16x2 dot products.
+    _wait(vb_full.data_ptr(), cutlass.Int32(0))
+    v_local = tidx // cutlass.Int32(t_per_v)
+    tv = tidx % cutlass.Int32(t_per_v)
+    sw_mask = (v_local * cutlass.Int32(t_per_v)) & cutlass.Int32(7)
+    vb_row_base = v_local * cutlass.Int32(D_NOPE // 2)
+    dot0 = cutlass.Float32(0.0)
+    dot1 = cutlass.Float32(0.0)
+    for c in cutlass.range_constexpr(iters_v4):
+        eff_chunk = (cutlass.Int32(c * t_per_v) + tv) ^ sw_mask
+        w_idx = eff_chunk * cutlass.Int32(4)
+        a4 = sVb.load(idx=vb_row_base + w_idx, vector_size=4, alignment=16)
+        b4 = sLat.load(idx=w_idx, vector_size=4, alignment=16)
+        for j in cutlass.range_constexpr(4):
+            aw = cutlass.Int32(a4[j])
+            bw = cutlass.Int32(b4[j])
+            a_lo = (aw << cutlass.Int32(16)).bitcast(cutlass.Float32)
+            a_hi = (aw & cutlass.Int32(-65536)).bitcast(cutlass.Float32)
+            b_lo = (bw << cutlass.Int32(16)).bitcast(cutlass.Float32)
+            b_hi = (bw & cutlass.Int32(-65536)).bitcast(cutlass.Float32)
+            dot0 = _fma_ftz(a_lo, b_lo, dot0)
+            dot1 = _fma_ftz(a_hi, b_hi, dot1)
+    dot = dot0 + dot1
+    if cutlass.const_expr(t_per_v >= 16):
+        dot = dot + _shfl_bfly(dot, 8)
+    if cutlass.const_expr(t_per_v >= 8):
+        dot = dot + _shfl_bfly(dot, 4)
+    if cutlass.const_expr(t_per_v >= 4):
+        dot = dot + _shfl_bfly(dot, 2)
+    if cutlass.const_expr(t_per_v >= 2):
+        dot = dot + _shfl_bfly(dot, 1)
+
+    # Pack adjacent (even, odd) V-rows via single warp shuffle and write coalesced bf16x2.
+    other = _shfl_bfly(dot, t_per_v)
+    if (tv == cutlass.Int32(0)) & ((v_local & cutlass.Int32(1)) == cutlass.Int32(0)):
+        out_off = (
+            cutlass.Int64(row) * cutlass.Int64(num_heads) + cutlass.Int64(head)
+        ) * cutlass.Int64(64) + cutlass.Int64(
+            vb_idx * cutlass.Int32(v_tile // 2) + (v_local >> cutlass.Int32(1))
+        )
+        out_i32.iterator.raw_ptr()[out_off] = _bf16x2(dot, other)
+    prims.barrier_cta_sync(0)
+    prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
+
+
+@cute.jit
+def _launch_global_combine_vup(
+    partials: cute.Tensor,
+    v_b: cute.Tensor,
+    out_i32: cute.Tensor,
+    stream: cuda_driver.CUstream,
+    num_heads: cutlass.Constexpr[int],
+    num_splits: cutlass.Constexpr[int],
+    v_blocks: cutlass.Constexpr[int],
+) -> None:
+    _global_combine_vup_kernel(partials, v_b, out_i32, num_heads, num_splits, v_blocks).launch(
+        grid=(out_i32.shape[0], num_heads, v_blocks),
+        block=(128, 1, 1),
+        stream=stream,
+        use_pdl=True,
+    )
+
+
+def compile_combine_vup_variant(
+    num_heads: int, num_splits: int, v_blocks: int, device_index: int
+) -> Callable:
+    """Compile fused split-K combine + V-up kernel for low-row (rows <= 8) decode."""
+    if (
+        num_heads not in SUPPORTED_HEADS
+        or num_splits not in (8, 16, 32)
+        or v_blocks not in VUP_BLOCKS_SUPPORTED
+    ):
+        raise ValueError(
+            f"no combine_vup variant for heads={num_heads}, splits={num_splits}, v_blocks={v_blocks}"
+        )
+    key = (device_index, num_heads, num_splits, v_blocks)
+    if key not in _COMBINE_VUP_COMPILED:
+        make = cute.runtime.make_fake_compact_tensor
+        rows = cute.sym_int64()
+        cutlass.cuda.initialize_cuda_context(device_index)
+        workspace = make(
+            cutlass.Float32,
+            (rows, num_splits, num_heads, 516),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+        v_b = make(
+            cutlass.BFloat16, (num_heads * 128, D_NOPE), stride_order=(1, 0), assumed_align=16
+        )
+        out_i32 = make(
+            cutlass.Int32, (rows, num_heads, 64), stride_order=(2, 1, 0), assumed_align=16
+        )
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False)
+        _COMBINE_VUP_COMPILED[key] = cute.compile(
+            _launch_global_combine_vup,
+            workspace,
+            v_b,
+            out_i32,
+            stream,
+            num_heads,
+            num_splits,
+            v_blocks,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+    return _COMBINE_VUP_COMPILED[key]
+
+
+def launch_global_direct_vup(
+    partial_fn: Callable,
+    combine_vup_fn: Callable,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    v_b_2d: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    workspace: torch.Tensor,
+    *,
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    stride_factor: int,
+    layer_id: int,
+) -> torch.Tensor:
+    """Run direct-index split-K decode + fused combine+V-up on the current stream."""
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
+    bs = int(block_size)
+    block_shift = (bs.bit_length() - 1) if (bs > 0 and (bs & (bs - 1)) == 0) else -1
+    partial_fn(
+        q,
+        pool,
+        indices,
+        workspace,
+        scale_log2_of(softmax_scale),
+        req_id,
+        block_table,
+        bs,
+        block_shift,
+        int(stride_factor),
+        int(layer_id),
+        stream,
+    )
+    combine_vup_fn(workspace, v_b_2d, out.view(torch.int32).view(q.shape[0], -1, 64), stream)
+    return out
+
+
+def launch_global_vup(
+    partial_fn: Callable,
+    combine_vup_fn: Callable,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    v_b_2d: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Run global-index split-K decode + fused combine+V-up on the current stream."""
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+    pool = kv_cache.view(torch.uint8).view(-1, ROW_BYTES)
+    partial_fn(q, pool, indices, workspace, scale_log2_of(softmax_scale), stream)
+    combine_vup_fn(workspace, v_b_2d, out.view(torch.int32).view(q.shape[0], -1, 64), stream)
     return out
