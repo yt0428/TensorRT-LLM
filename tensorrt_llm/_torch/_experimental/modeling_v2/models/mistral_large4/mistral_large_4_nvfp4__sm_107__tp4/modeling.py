@@ -383,13 +383,13 @@ _CTX_DECODE_ROWS = 8192
 # cluster per row (`cluster_radix_topk_decode`, 8/16/32 CTAs per row chosen by `(rows, width)`
 # and device cluster support) for DSpark verification from 20480 columns (the narrowest row the
 # native op splits into ten blocks) to 1048584 (the selector's widest row) across graph batches
-# 1..16 (4..64 rows). `cluster_radix_topk_decode` keeps the native op for a call the op would
+# 1..32 (4..128 rows). `cluster_radix_topk_decode` keeps the native op for a call the op would
 # not split into ten blocks, or whose rows are not 32-byte aligned with a width multiple of 8.
 # Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
-_TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
+_TOPK_VERIFY_ROWS = tuple(range(4, 129, 4))
 _TOPK_VERIFY_CLUSTERS = DEFAULT_VERIFY_CLUSTERS
 
 

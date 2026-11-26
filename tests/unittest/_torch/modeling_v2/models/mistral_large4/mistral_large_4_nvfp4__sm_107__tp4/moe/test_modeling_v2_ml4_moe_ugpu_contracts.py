@@ -139,9 +139,17 @@ class TestLocalityMapContracts(unittest.TestCase):
         self.assertEqual(phb_s2, 10 * 1024 * 1024)
         self.assertFalse(exact_s2)
 
-        # Recommend mode selects n_split for I >= 512 (TP4/TP8) and none for narrow I < 512 (TP16).
-        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(1536), "n_split")
+        # Recommend mode selects n_split for 512 <= I <= 1024 (128-aligned half-width, e.g. TP8
+        # I=768) and none for narrow I < 512 (TP16 I=384) or wide I > 1024 (TP4 I=1536).
+        self.assertEqual(_LOCALITY.DEFAULT_UGPU_MOE_MIN_INTER, 512)
+        self.assertEqual(_LOCALITY.DEFAULT_UGPU_MOE_MAX_INTER, 1024)
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(1536), "none")
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(1025), "none")
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(1024), "n_split")
         self.assertEqual(_LOCALITY.recommend_moe_locality_mode(768), "n_split")
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(640), "none")
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(512), "n_split")
+        self.assertEqual(_LOCALITY.recommend_moe_locality_mode(511), "none")
         self.assertEqual(_LOCALITY.recommend_moe_locality_mode(384), "none")
 
     def test_harvested_sm_fallback_to_none(self) -> None:
@@ -203,9 +211,10 @@ class TestLocalityMapContracts(unittest.TestCase):
             _LOCALITY.build_logical_map_host(harvested_doms, harvested_rem, 212, 94, 24)
 
     def test_ugpu_high_batch_and_non_graph_guard(self) -> None:
-        # Low-concurrency ULL (c=1 mbs=2 or mbs=8, c=4 mbs=8, CUDA graphs on) keeps n_split.
+        # Low-concurrency ULL (c=1 mbs=2 or mbs=8, c=4 mbs=8, CUDA graphs on) keeps n_split
+        # for eligible widths (512 <= I <= 1024 with 128-aligned half-width, e.g. TP8 I=768).
         self.assertEqual(_LOCALITY.DEFAULT_UGPU_MOE_MAX_BATCH_SIZE, 8)
-        for inter in (768, 1536):
+        for inter in (512, 768, 1024):
             for mbs in (None, 1, 2, 4, 8):
                 self.assertEqual(
                     _LOCALITY.recommend_moe_locality_mode(
@@ -220,8 +229,8 @@ class TestLocalityMapContracts(unittest.TestCase):
                     ("n_split", None),
                 )
 
-            # High-batch serving (e.g. Disagg TP8/TP4 GEN mbs=16/24/32) skips 70-140 GiB uGPU
-            # weight duplication so HBM4 capacity remains available for KV cache.
+            # High-batch serving (e.g. Disagg TP8 GEN mbs=16/24/32) skips uGPU weight
+            # duplication so HBM4 capacity remains available for KV cache.
             for mbs in (9, 16, 24, 32, 128):
                 self.assertEqual(
                     _LOCALITY.recommend_moe_locality_mode(
@@ -260,13 +269,46 @@ class TestLocalityMapContracts(unittest.TestCase):
                 ("n_split", None),
             )
 
-        # TP16 (I=384) auto -> 'none' emits no high-batch/graph skip reason.
-        self.assertEqual(
-            _LOCALITY.resolve_moe_locality_mode(
-                "auto", 384, max_batch_size=32, use_cuda_graph=False
-            ),
-            ("none", None),
-        )
+        # Out-of-band widths (I < 512 or I > 1024, incl. TP16 I=384, boundary 511/1025, and
+        # TP4 I=1536) resolve 'auto' cleanly to ('none', None) across all batch/CG settings,
+        # while explicit 'n_split'/'expert_half' still work on full-SM GPUs and fall back on
+        # harvested-SM GPUs.
+        for inter in (384, 511, 1025, 1536):
+            for mbs in (None, 1, 8, 32):
+                for use_cg in (True, False):
+                    self.assertEqual(
+                        _LOCALITY.recommend_moe_locality_mode(
+                            inter, max_batch_size=mbs, use_cuda_graph=use_cg
+                        ),
+                        "none",
+                    )
+                    self.assertEqual(
+                        _LOCALITY.resolve_moe_locality_mode(
+                            "auto", inter, max_batch_size=mbs, use_cuda_graph=use_cg
+                        ),
+                        ("none", None),
+                    )
+            self.assertEqual(
+                _LOCALITY.resolve_moe_locality_mode(
+                    "n_split", inter, sms_per_domain=100, max_batch_size=32, use_cuda_graph=False
+                ),
+                ("n_split", None),
+            )
+            self.assertEqual(
+                _LOCALITY.resolve_moe_locality_mode(
+                    "expert_half",
+                    inter,
+                    sms_per_domain=100,
+                    max_batch_size=32,
+                    use_cuda_graph=False,
+                ),
+                ("expert_half", None),
+            )
+            mode, reason = _LOCALITY.resolve_moe_locality_mode(
+                "n_split", inter, sms_per_domain=80, required_per_domain=94
+            )
+            self.assertEqual(mode, "none")
+            self.assertIsNotNone(reason)
 
         # Source wiring contract: model_loader publishes max_batch_size and tp4 DecodeTarget
         # forwards max_batch_size + use_cuda_graph without temporary A/B env switches.

@@ -14,6 +14,8 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     CompiledClusterRadixTopkDecode,
+    blocks_per_row,
+    reachable_cluster_sizes,
     select_cluster_size,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp4 import (
@@ -515,9 +517,10 @@ def test_single_stream_mode_runs_all_ops_inline_on_main(monkeypatch):
 
 
 def test_select_indexer_topk_routing_and_override_hook(monkeypatch):
-    """Verify `_select_indexer_topk` routes next_n=4 rows in {4,8,16,32,64} at 20480..1048584 to
+    """Verify `_select_indexer_topk` routes next_n=4 rows in 4..128 (step 4) at 20480..1048584 to
     `cluster_radix_topk_decode` with 8/16/32 cluster resolution, falls back cleanly on out-of-range
     shapes, and exposes `_select_indexer_topk` as a single override point."""
+    assert tp4_modeling._TOPK_VERIFY_ROWS == tuple(range(4, 129, 4))
 
     def _handle(c: int) -> CompiledClusterRadixTopkDecode:
         return CompiledClusterRadixTopkDecode(
@@ -550,15 +553,22 @@ def test_select_indexer_topk_routing_and_override_hook(monkeypatch):
     monkeypatch.setattr(tp4_modeling, "indexer_topk_decode", native_mock)
 
     for rows, width, exp_cluster in (
-        (4, 780000, 32),
+        (4, 785000, 32),
         (4, 262144, 32),
         (4, 131072, 16),
         (4, 65536, 8),
         (4, 32768, 8),
-        (8, 780000, 16),
-        (16, 780000, 8),
+        (8, 785000, 16),
+        (12, 785000, 16),
+        (16, 785000, 8),
         (32, 1048584, 8),
         (64, 1048584, 8),
+        (80, 785000, 8),
+        (80, 1048576, 8),
+        (96, 785000, 8),
+        (96, 1048584, 8),
+        (128, 785000, 8),
+        (128, 1048584, 8),
     ):
         cluster_mock.reset_mock()
         logits = torch.empty(rows, width, dtype=torch.float32)
@@ -570,14 +580,21 @@ def test_select_indexer_topk_routing_and_override_hook(monkeypatch):
         assert cluster_mock.call_args.kwargs["compiled"] is variants
         assert select_cluster_size(rows, width, 212, tuple(variants.keys())) == exp_cluster
 
-    # Out-of-range rows (96) or width (16384) fall back to native op.
-    for rows, width in ((96, 1048584), (4, 16384)):
+    # Out-of-range rows (>128 or non-multiple of 4), narrow width (<20480), or next_n!=4 fall back.
+    for rows, width, next_n in (
+        (132, 1048584, 4),
+        (6, 1048584, 4),
+        (4, 16384, 4),
+        (80, 1048584, 2),
+    ):
         native_mock.reset_mock()
+        cluster_mock.reset_mock()
         logits = torch.empty(rows, width, dtype=torch.float32)
-        kv_lens = torch.full((rows // 4,), width, dtype=torch.int32)
+        kv_lens = torch.full((max(1, rows // next_n),), width, dtype=torch.int32)
         indices = torch.empty(rows, 2048, dtype=torch.int32)
-        core._select_indexer_decode(logits, kv_lens, indices, 4, "aux_i", "aux_l")
+        core._select_indexer_decode(logits, kv_lens, indices, next_n, "aux_i", "aux_l")
         native_mock.assert_called_once()
+        cluster_mock.assert_not_called()
 
     # next_n=1 hits 1-CTA radix selector.
     radix_mock.reset_mock()
@@ -606,6 +623,122 @@ def test_select_indexer_topk_routing_and_override_hook(monkeypatch):
         == "custom_out"
     )
     custom_hook.assert_called_once()
+
+
+def test_topk_verify_rows_boundaries_and_tp4_tp8_tp16_contracts(monkeypatch):
+    """Verify cluster-variant reachability, short-width native fallback at rows=128, and
+    TP4/TP8/TP16 DecodeTarget._indexer routing for rows=80/96/128."""
+    # Reachable cluster ladder preserves wide CGA for small batches and C=8 fallback for 80/96/128.
+    assert reachable_cluster_sizes(
+        tp4_modeling._TOPK_VERIFY_ROWS, 32768, 212, tp4_modeling._TOPK_VERIFY_CLUSTERS
+    ) == (8,)
+    assert reachable_cluster_sizes(
+        tp4_modeling._TOPK_VERIFY_ROWS, 131072, 212, tp4_modeling._TOPK_VERIFY_CLUSTERS
+    ) == (8, 16)
+    for width in (785000, 1048576):
+        assert reachable_cluster_sizes(
+            tp4_modeling._TOPK_VERIFY_ROWS, width, 212, tp4_modeling._TOPK_VERIFY_CLUSTERS
+        ) == (8, 16, 32)
+        for rows in (80, 96, 128):
+            assert blocks_per_row(rows, width, 212) == 10
+            assert select_cluster_size(rows, width, 212, (8, 16, 32)) == 8
+
+    # At short widths (<200K) and rows >= sm_count // 2 (128 >= 106), native op uses <10 partitions,
+    # so cluster_radix_topk_decode cleanly falls back to native indexer_topk_decode.
+    assert blocks_per_row(128, 65536, 212) < 10
+
+    # Verify TP4 (16 heads), TP8 (8 heads), and TP16 (4 heads) DecodeTarget._indexer dispatch
+    # rows=80/96/128 (bs=20/24/32 at DSpark next_n=4) directly to cluster_radix_topk_decode.
+    cluster_calls: list[tuple[int, int, int]] = []
+
+    def _fake_cluster(logits, kv_lens, indices, aux_i, aux_l, *, compiled):
+        cluster_calls.append((logits.shape[0], logits.shape[1], len(kv_lens)))
+        return indices
+
+    monkeypatch.setattr(tp4_modeling, "cluster_radix_topk_decode", _fake_cluster)
+    monkeypatch.setattr(
+        tp4_modeling,
+        "cute_dsl_fp8_paged_mqa_logits",
+        lambda q_fp8, *_a, **_kw: torch.empty(
+            q_fp8.shape[0] * q_fp8.shape[1], _a[-1], dtype=torch.float32
+        ),
+    )
+    monkeypatch.setattr(tp4_modeling, "layer_norm", lambda x, *_a: x)
+    monkeypatch.setattr(
+        tp4_modeling,
+        "ssmax_indexer_q_side_fused",
+        lambda q, *a: (a[-2], a[-1]),
+    )
+    monkeypatch.setattr(tp4_modeling, "ml4_ix_q_fused_serves", lambda rows: False)
+
+    for tp_size, max_ctx in ((4, 1048576), (8, 785000), (16, 1048576)):
+        heads = 64 // tp_size
+        variants = {
+            8: CompiledClusterRadixTopkDecode(
+                launch=object(),
+                device_id=0,
+                next_n=4,
+                cluster=8,
+                threads=512,
+                unroll=2,
+                pipe=True,
+                min_blocks=0,
+                use_pdl=True,
+                sm_count=212,
+            )
+        }
+        core = SimpleNamespace(
+            tp_size=tp_size,
+            heads=heads,
+            idx_heads=32,
+            idx_dim=128,
+            idx_topk=2048,
+            idx_eps=1e-6,
+            idx_weight_scale=1.0,
+            unfused_glue=False,
+            _max_ctx_len=max_ctx,
+            _rope=SimpleNamespace(indexer="rope", identity="id"),
+            _ix_topk=None,
+            _ix_topk_verify=variants,
+        )
+        core._select_indexer_topk = MethodType(
+            tp4_modeling.MistralLarge4Tp4ModelingV2._select_indexer_topk, core
+        )
+        core._select_indexer_decode = MethodType(
+            tp4_modeling.MistralLarge4Tp4ModelingV2._select_indexer_decode, core
+        )
+        target = SimpleNamespace(
+            core=core,
+            _linear_fp8=lambda x, *_a, **_kw: torch.empty(
+                x.shape[0], 32 * 128, dtype=torch.bfloat16
+            ),
+        )
+        layer = _make_fake_layer(0, has_indexer=True, owner=True, rope=True, kv_source=0)
+        for rows in (80, 96, 128):
+            num_gens = rows // 4
+            step = {
+                "num_seqs": num_gens,
+                "kv_lens_cuda": torch.full((num_gens,), 32768, dtype=torch.int32),
+                "ix_pools": {0: "pool0"},
+                "indexer_k_cache_block_offsets": torch.zeros((num_gens, 1), dtype=torch.int32),
+                "scheduler_metadata_buffer": "sched",
+                "radix_aux_indices": "aux_i",
+                "radix_aux_logits": "aux_l",
+            }
+            cluster_calls.clear()
+            tp4_modeling.DecodeTarget._indexer(
+                target,
+                step,
+                torch.empty(rows, 64, dtype=torch.bfloat16),
+                torch.arange(rows, dtype=torch.int32),
+                layer,
+                torch.empty(rows, 2048, dtype=torch.int32),
+                False,
+                None,
+                kw=torch.empty(rows, 160, dtype=torch.bfloat16),
+                keys_ready=None,
+            )
+            assert cluster_calls == [(rows, max_ctx, num_gens)]
 
 
 def test_decode_indexer_positional_compat(monkeypatch):

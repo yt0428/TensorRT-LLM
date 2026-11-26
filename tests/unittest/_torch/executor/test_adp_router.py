@@ -1876,3 +1876,105 @@ class TestDefaultADPRouterGraphBucketGuard:
         # instead of spilling rank 0 to 17 (bucket 24).
         assert len(assign[0]) == 1
         assert len(assign[1]) == 2
+
+    def test_factory_forwards_cuda_graph_batch_sizes_to_default_router(self):
+        """ADPRouter.create activates bucket guarding on DefaultADPRouter when given CG buckets."""
+        states = [
+            RankState(rank=0, num_active_requests=16, num_active_tokens=640_000),
+            RankState(rank=1, num_active_requests=11, num_active_tokens=2_200_000),
+            RankState(rank=2, num_active_requests=12, num_active_tokens=1_800_000),
+            RankState(rank=3, num_active_requests=13, num_active_tokens=1_500_000),
+            RankState(rank=4, num_active_requests=17, num_active_tokens=1_900_000),
+        ]
+        req = _make_request_item(req_id=301, num_tokens=50_000)
+
+        # Backward-compatible default (omitted / None / empty): bucket guard stays inactive.
+        for cg_sizes in (None, ()):
+            router_off = ADPRouter.create(
+                dist=_mock_dist(tp_size=5),
+                has_seq_slot_headroom=True,
+                kv_cache_manager=None,
+                attention_dp_config=AttentionDpConfig(),
+                cuda_graph_batch_sizes=cg_sizes,
+            )
+            assert isinstance(router_off, DefaultADPRouter)
+            assert router_off._cuda_graph_batch_sizes == ()
+            assign_off, _ = router_off.route_requests(states, [req], max_num_active_requests=32)
+            assert len(assign_off[0]) == 1
+
+        router_omitted = ADPRouter.create(
+            dist=_mock_dist(tp_size=5),
+            has_seq_slot_headroom=True,
+        )
+        assert isinstance(router_omitted, DefaultADPRouter)
+        assert router_omitted._cuda_graph_batch_sizes == ()
+
+        # With active CG buckets, factory-built DefaultADPRouter guards bucket 16 ceiling.
+        router_on = ADPRouter.create(
+            dist=_mock_dist(tp_size=5),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=AttentionDpConfig(),
+            cuda_graph_batch_sizes=[32, 16, 1, 2, 4, 8, 24],
+        )
+        assert isinstance(router_on, DefaultADPRouter)
+        assert router_on._cuda_graph_batch_sizes == (1, 2, 4, 8, 16, 24, 32)
+        assign_on, _ = router_on.route_requests(states, [req], max_num_active_requests=32)
+        assert len(assign_on[0]) == 0
+        assert len(assign_on[3]) == 1
+
+    def test_factory_preserves_non_default_routers_when_cg_sizes_passed(self):
+        """ConversationAwareADPRouter and KVCacheAwareADPRouter keep their exact semantics."""
+        conv_cfg = AttentionDpConfig(kv_cache_routing_conversation_affinity=True)
+        conv_router = ADPRouter.create(
+            dist=_mock_dist(tp_size=4),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=conv_cfg,
+            cuda_graph_batch_sizes=(1, 2, 4, 8, 16, 24, 32),
+        )
+        assert isinstance(conv_router, ConversationAwareADPRouter)
+
+        kv_mgr = MagicMock()
+        kv_mgr.enable_block_reuse = True
+        kv_cfg = AttentionDpConfig(enable_kv_cache_aware_routing=True)
+        kv_router = ADPRouter.create(
+            dist=_mock_dist(tp_size=4),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=kv_mgr,
+            attention_dp_config=kv_cfg,
+            cuda_graph_batch_sizes=(1, 2, 4, 8, 16, 24, 32),
+        )
+        assert isinstance(kv_router, KVCacheAwareADPRouter)
+
+    def test_py_executor_resolves_cuda_graph_batch_sizes_only_when_cg_enabled(self):
+        """Verify _resolve_adp_cuda_graph_batch_sizes gates strictly on active CG config."""
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _resolve_adp_cuda_graph_batch_sizes
+
+        cg_cfg = object()
+        # Active CG with concrete positive buckets -> sorted deduplicated tuple.
+        eng = SimpleNamespace(
+            cuda_graph_config=cg_cfg,
+            _cuda_graph_batch_sizes=[32, 16, 8, 16, 0, -4, 4, 2, 1, True],
+        )
+        llm_args_on = SimpleNamespace(cuda_graph_config=cg_cfg)
+        assert _resolve_adp_cuda_graph_batch_sizes(eng, llm_args_on) == (1, 2, 4, 8, 16, 32)
+
+        # llm_args.cuda_graph_config=None (e.g. CTX worker): returns None even if engine populated
+        # default _cuda_graph_batch_sizes.
+        llm_args_off = SimpleNamespace(cuda_graph_config=None)
+        assert _resolve_adp_cuda_graph_batch_sizes(eng, llm_args_off) is None
+
+        # model_engine.cuda_graph_config=None (disabled at engine init): returns None.
+        eng_off = SimpleNamespace(
+            cuda_graph_config=None,
+            _cuda_graph_batch_sizes=[1, 2, 4, 8, 16, 24, 32],
+        )
+        assert _resolve_adp_cuda_graph_batch_sizes(eng_off, llm_args_on) is None
+
+        # Empty list or MagicMock engine attribute -> safely returns None.
+        eng_empty = SimpleNamespace(cuda_graph_config=cg_cfg, _cuda_graph_batch_sizes=[])
+        assert _resolve_adp_cuda_graph_batch_sizes(eng_empty, llm_args_on) is None
+        assert _resolve_adp_cuda_graph_batch_sizes(MagicMock(), llm_args_on) is None
