@@ -1793,6 +1793,11 @@ class DecodeTarget:
         self._keys_fork = torch.cuda.Event()
         self._keys_ready = torch.cuda.Event()
         self._latent_ready = torch.cuda.Event()
+        self._megakernel = None
+        if os.environ.get("TRTLLM_ML4_MEGAKERNEL", "0") == "1":
+            from ._megakernel import Ml4Megakernel
+
+            self._megakernel = Ml4Megakernel.create(self)
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -2019,7 +2024,15 @@ class DecodeTarget:
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         residual = h
         spec_metadata = kwargs.get("spec_metadata")
+        megakernel = self._megakernel
+        if megakernel is not None and not megakernel.begin(x, attn_metadata, step):
+            megakernel = None
         for layer_idx, L in enumerate(self._layers):
+            if megakernel is not None and layer_idx in megakernel.layers:
+                x, residual = megakernel.layers[layer_idx].forward(
+                    x, residual, pos, step, attn_metadata, topk_buf, spec_metadata
+                )
+                continue
             attn_out = self._attention(
                 step, L, x, pos, req_idx, topk_buf, scratch, skip_gen, iss=iss
             )
