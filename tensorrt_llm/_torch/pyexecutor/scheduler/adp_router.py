@@ -112,6 +112,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        cuda_graph_batch_sizes: Optional[Sequence[int]] = None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -124,11 +125,14 @@ class ADPRouter(ABC):
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
                 KVCacheAwareADPRouter to account for KV-transfer-in-progress
                 requests in per-rank load.  Ignored by DefaultADPRouter.
+            cuda_graph_batch_sizes: Active decoder CUDA graph batch sizes, passed
+                through to DefaultADPRouter to guard against avoidable CUDA graph
+                bucket crossings.  None when CUDA graphs are disabled; ignored by
+                ConversationAwareADPRouter and KVCacheAwareADPRouter.
 
         Returns:
-            A KVCacheAwareADPRouter if config requests it and the
-            kv_cache_manager has block reuse enabled; DefaultADPRouter
-            otherwise.
+            A ConversationAwareADPRouter or KVCacheAwareADPRouter when requested
+            by config; DefaultADPRouter otherwise.
         """
         if (
             attention_dp_config is not None
@@ -164,7 +168,11 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        return DefaultADPRouter(
+            dist=dist,
+            has_seq_slot_headroom=has_seq_slot_headroom,
+            cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+        )
 
     @abstractmethod
     def create_rank_state(

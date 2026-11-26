@@ -431,6 +431,33 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+def _resolve_adp_cuda_graph_batch_sizes(
+    model_engine: object,
+    llm_args: object = None,
+) -> Optional[Tuple[int, ...]]:
+    """Return active decoder CUDA graph batch sizes for DefaultADPRouter, or None.
+
+    ModelEngine populates ``_cuda_graph_batch_sizes`` from schema defaults even
+    when ``cuda_graph_config`` is None, so gate strictly on an active decoder
+    CUDA graph configuration and a concrete sequence of positive integers.
+    """
+    if (llm_args is not None
+            and getattr(llm_args, "cuda_graph_config", None) is None):
+        return None
+    if getattr(model_engine, "cuda_graph_config", None) is None:
+        return None
+    raw = getattr(model_engine, "_cuda_graph_batch_sizes", None)
+    if not isinstance(raw, (list, tuple)):
+        return None
+    valid = tuple(
+        sorted({
+            int(b)
+            for b in raw
+            if isinstance(b, int) and not isinstance(b, bool) and b > 0
+        }))
+    return valid or None
+
+
 class PyExecutor:
     # True while the overlap loop runs with the execution stream current
     # (_overlap_loop_stream_scope).
@@ -864,6 +891,8 @@ class PyExecutor:
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
+            cuda_graph_batch_sizes=_resolve_adp_cuda_graph_batch_sizes(
+                model_engine, self.llm_args),
         )
 
         self.previous_batch: Optional[BatchState] = None

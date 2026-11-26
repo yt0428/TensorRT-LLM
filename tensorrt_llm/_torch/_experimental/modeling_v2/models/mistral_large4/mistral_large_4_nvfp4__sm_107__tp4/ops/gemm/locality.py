@@ -36,6 +36,8 @@ except ImportError:  # pragma: no cover - allows CPU contract helpers without to
 
 __all__ = [
     "DEFAULT_UGPU_MOE_MAX_BATCH_SIZE",
+    "DEFAULT_UGPU_MOE_MAX_INTER",
+    "DEFAULT_UGPU_MOE_MIN_INTER",
     "DEFAULT_VMM_GRANULARITY",
     "DomainSlabAllocator",
     "LocalityMap",
@@ -57,6 +59,11 @@ DEFAULT_VMM_GRANULARITY = 2 * 1024 * 1024  # 2 MiB on Rubin VR200
 # (~140 GiB at TP4) of HBM4 that high-concurrency disaggregated GEN/CTX workers need
 # for KV cache capacity.
 DEFAULT_UGPU_MOE_MAX_BATCH_SIZE = 8
+# Per-rank MoE intermediate width bounds for automatic Paradigm-B ``n_split`` placement.
+# Below 512 (e.g. TP16 I=384) half-width is not 128-aligned; above 1024 (e.g. TP4 I=1536)
+# duplicating 71 routed MoE layers into dual-domain VMM exceeds static HBM4 headroom on VR200.
+DEFAULT_UGPU_MOE_MIN_INTER = 512
+DEFAULT_UGPU_MOE_MAX_INTER = 1024
 _SLAB_ALIGN = 256  # TMA base-pointer alignment
 
 _PROBE_SRC = r"""
@@ -263,14 +270,15 @@ def recommend_moe_locality_mode(
 ) -> Literal["n_split", "none"]:
     """Choose the default Paradigm-B MoE locality mode for a per-rank intermediate width.
 
-    * For ``moe_inter >= 512`` with 128-aligned half-width (TP4 ``I=1536``, TP8 ``I=768``),
+    * For ``512 <= moe_inter <= 1024`` with 128-aligned half-width (e.g. TP8 ``I=768``),
       ``n_split`` places FC1 and FC2 halves in die-local HBM4 with deterministic 50/50 balance,
       provided the GPU has at least ``required_per_domain`` SMs per locality domain, CUDA graphs
       are enabled, and ``max_batch_size`` does not exceed :data:`DEFAULT_UGPU_MOE_MAX_BATCH_SIZE`.
-    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``), harvested-SM GPUs with
-      ``sms_per_domain < required_per_domain``, eager non-CUDA-graph workers (e.g. disaggregated
-      context prefill), or high-batch serving (``max_batch_size > DEFAULT_UGPU_MOE_MAX_BATCH_SIZE``)
-      where KV-cache HBM4 capacity dominates, falls back to ``none``.
+    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``), wide widths ``moe_inter > 1024``
+      (TP4 ``I=1536``, where duplicating routed MoE weights would exceed the static HBM4 budget),
+      harvested-SM GPUs with ``sms_per_domain < required_per_domain``, eager non-CUDA-graph
+      workers (e.g. disaggregated context prefill), or high-batch serving
+      (``max_batch_size > DEFAULT_UGPU_MOE_MAX_BATCH_SIZE``), falls back to ``none``.
     """
     del num_experts
     if not use_cuda_graph:
@@ -279,7 +287,10 @@ def recommend_moe_locality_mode(
         return "none"
     if sms_per_domain is not None and sms_per_domain < required_per_domain:
         return "none"
-    if moe_inter >= 512 and (moe_inter // 2) % 128 == 0:
+    if (
+        DEFAULT_UGPU_MOE_MIN_INTER <= moe_inter <= DEFAULT_UGPU_MOE_MAX_INTER
+        and (moe_inter // 2) % 128 == 0
+    ):
         return "n_split"
     return "none"
 

@@ -103,16 +103,21 @@ def make_ml4_dep_runtime_hooks(
         mapping: Parallelism mapping providing ``local_rank`` and ``enable_attention_dp``.
         use_cuda_graph: Whether the worker replays CUDA graphs. When False (e.g. eager
             disaggregated context prefill workers), step-input packing, H2D skip shadow
-            caches, steady speculative preparation, and cyclic-GC suppression stay off
-            while NUMA thread pinning, fused spec-offset correction, single-stream loop
-            ordering, and side-stream timing remain active.
+            caches, incremental block-offset patching, steady speculative preparation,
+            and cyclic-GC suppression stay off while NUMA thread pinning, fused
+            spec-offset correction, single-stream loop ordering, and side-stream timing
+            remain active.
         enable_attention_dp: Explicit override for attention-DP mode; defaults to
-            ``bool(getattr(mapping, "enable_attention_dp", True))``.
+            ``bool(getattr(mapping, "enable_attention_dp", True))``. Steady speculative
+            fast paths (``steady_spec_prepare``, ``steady_dsa_prepare``, and
+            ``pack_spec_rng_uploads``) are armed only for non-ADP CUDA-graph workers
+            (TEP4 decode), because ``SteadyMtpPrepare`` disables itself under ADP.
     """
     local_rank = getattr(mapping, "local_rank", None)
     if enable_attention_dp is None:
         enable_attention_dp = bool(getattr(mapping, "enable_attention_dp", True))
     graph_worker = bool(use_cuda_graph)
+    steady_non_adp = graph_worker and (not enable_attention_dp)
     events = Ml4DepExecutorEvents(
         local_rank=local_rank if isinstance(local_rank, int) else None,
         disable_gc=graph_worker,
@@ -125,10 +130,13 @@ def make_ml4_dep_runtime_hooks(
         executor_events=events,
         skip_unchanged_h2d=graph_worker,
         h2d_changed_span=graph_worker,
+        incremental_block_offsets=graph_worker,
+        steady_dsa_prepare=steady_non_adp,
         kv_lens_update_once=True,
         spec_offsets_op=fused_spec_offsets_op,
         loop_on_execution_stream=True,
-        steady_spec_prepare=graph_worker and (not enable_attention_dp),
+        steady_spec_prepare=steady_non_adp,
+        pack_spec_rng_uploads=steady_non_adp,
         iteration_timing_one_event=True,
         perf_metrics_timing_side_stream=True,
     )
