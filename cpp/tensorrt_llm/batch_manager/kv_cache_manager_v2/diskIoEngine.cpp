@@ -156,7 +156,7 @@ DiskIoEngine::~DiskIoEngine()
     }
 }
 
-DiskIoTicket DiskIoEngine::submit(DiskIoKind kind, std::vector<DiskIoOp> ops, bool activate)
+DiskIoTicket DiskIoEngine::submit(DiskIoKind kind, std::vector<DiskIoOp> ops, bool activate, DiskIoPriority priority)
 {
     uint64_t bytes = 0;
     for (auto const& op : ops)
@@ -177,6 +177,7 @@ DiskIoTicket DiskIoEngine::submit(DiskIoKind kind, std::vector<DiskIoOp> ops, bo
     Batch& batch = entry(ticket);
     batch.ticket = ticket;
     batch.kind = kind;
+    batch.priority = priority;
     batch.ops = std::move(ops);
     batch.nextOp = 0;
     batch.remainingOps = batch.ops.size();
@@ -230,7 +231,8 @@ void DiskIoEngine::enqueueLocked(Batch& batch)
     }
     else
     {
-        mWriteQueue.push_back(batch.ticket);
+        auto& writeQueue = batch.priority == DiskIoPriority::kRequired ? mRequiredWriteQueue : mBackgroundWriteQueue;
+        writeQueue.push_back(batch.ticket);
         mStats.queuedWriteOps += batch.ops.size();
         mStats.peakQueuedWriteOps = std::max(mStats.peakQueuedWriteOps, mStats.queuedWriteOps);
     }
@@ -375,6 +377,42 @@ int DiskIoEngine::runOp(DiskIoKind kind, DiskIoOp const& op, std::vector<std::by
     return EINVAL;
 }
 
+std::deque<DiskIoTicket>& DiskIoEngine::selectQueueLocked(bool preferWrites)
+{
+    if (preferWrites)
+    {
+        if (!mRequiredWriteQueue.empty())
+        {
+            return mRequiredWriteQueue;
+        }
+        if (!mBackgroundWriteQueue.empty())
+        {
+            return mBackgroundWriteQueue;
+        }
+        return mReadQueue;
+    }
+    if (!mReadQueue.empty())
+    {
+        if (!mRequiredWriteQueue.empty() && !mServedAgedWriteLast)
+        {
+            int64_t const waitNs = steadyClockNanos() - entry(mRequiredWriteQueue.front()).activateNs;
+            if (waitNs >= kRequiredWriteMaxWaitNs)
+            {
+                mServedAgedWriteLast = true;
+                return mRequiredWriteQueue;
+            }
+        }
+        mServedAgedWriteLast = false;
+        return mReadQueue;
+    }
+    mServedAgedWriteLast = false;
+    if (!mRequiredWriteQueue.empty())
+    {
+        return mRequiredWriteQueue;
+    }
+    return mBackgroundWriteQueue;
+}
+
 void DiskIoEngine::workerLoop(bool preferWrites)
 {
     std::vector<std::byte> bounce;
@@ -382,14 +420,12 @@ void DiskIoEngine::workerLoop(bool preferWrites)
     std::unique_lock<std::mutex> lock(mMutex);
     while (true)
     {
-        mWorkCv.wait(lock, [this]() { return mStop || (!mPaused && (!mReadQueue.empty() || !mWriteQueue.empty())); });
-        if (mPaused || (mReadQueue.empty() && mWriteQueue.empty()))
+        mWorkCv.wait(lock, [this]() { return mStop || (!mPaused && hasWorkLocked()); });
+        if (mPaused || !hasWorkLocked())
         {
             return; // mStop, and nothing this worker may start.
         }
-        auto& primary = preferWrites ? mWriteQueue : mReadQueue;
-        auto& secondary = preferWrites ? mReadQueue : mWriteQueue;
-        auto& queue = primary.empty() ? secondary : primary;
+        auto& queue = selectQueueLocked(preferWrites);
         Batch& batch = entry(queue.front());
         size_t const opIndex = batch.nextOp++;
         if (batch.nextOp == batch.ops.size())
@@ -397,6 +433,7 @@ void DiskIoEngine::workerLoop(bool preferWrites)
             queue.pop_front();
         }
         DiskIoKind const kind = batch.kind;
+        DiskIoPriority const priority = batch.priority;
         DiskIoOp const op = batch.ops[opIndex];
         bool const isRead = kind == DiskIoKind::kRead;
         --(isRead ? mStats.queuedReadOps : mStats.queuedWriteOps);
@@ -427,6 +464,10 @@ void DiskIoEngine::workerLoop(bool preferWrites)
             ++mStats.writeOps;
             mStats.writeBusyNs += busyNs;
             mStats.writeBytes += err == 0 ? op.size : 0;
+            if (err == 0 && priority == DiskIoPriority::kRequired)
+            {
+                mStats.requiredWriteBytes += op.size;
+            }
             mStats.writeErrors += err == 0 ? 0 : 1;
         }
         if (err != 0 && batch.error == 0)

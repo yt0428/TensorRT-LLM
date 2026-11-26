@@ -4220,17 +4220,28 @@ class PyExecutor:
         budget = (kv_cache_manager.disk_prefetch_num_reqs -
                   kv_cache_manager.num_context_onboards)
         for req in self.active_requests:
-            if budget <= 0:
-                break
             if (not req.is_first_context_chunk or req.is_dummy
                     or req.is_disagg_generation_init_state
                     or req.py_request_id in kv_cache_manager.kv_cache_map
                     or req.py_request_id in self._prefetched_request_ids):
                 continue
-            self._prefetched_request_ids.add(req.py_request_id)
-            if kv_cache_manager.start_context_onboard(req):
-                budget -= 1
-                req.py_kv_onboard_pending = gate
+            if budget > 0:
+                self._prefetched_request_ids.add(req.py_request_id)
+                if kv_cache_manager.start_context_onboard(req):
+                    budget -= 1
+                    req.py_kv_onboard_pending = gate
+                else:
+                    req.py_kv_onboard_pending = False
+            elif gate:
+                if req.py_kv_onboard_pending:
+                    continue
+                if kv_cache_manager.has_disk_prefix_to_onboard(req):
+                    req.py_kv_onboard_pending = True
+                else:
+                    self._prefetched_request_ids.add(req.py_request_id)
+                    req.py_kv_onboard_pending = False
+            else:
+                break
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
