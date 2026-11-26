@@ -227,6 +227,7 @@ from .ops.comm.symm_logits_gather import build_workspace as build_logits_gather
 from .ops.comm.symm_logits_gather import symm_logits_gather_softcap
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
+from .runtime_hooks import make_ml4_runtime_hooks
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -2397,6 +2398,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             vocab_size=cfg.vocab_size,
         )
         self.softcap = float(cfg.softmax_tanh_gating)
+        self.runtime_hooks = make_ml4_runtime_hooks(model_config.mapping)
         self._vision: Optional[VisionTower] = None
         vis = getattr(cfg, "vision_config", None)
         self._image_token_ids = (
