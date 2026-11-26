@@ -188,7 +188,13 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 # How a disk tier counter combines over a window of drains: these keep their latest value, these their
 # maximum, and every other counter is summed.
 _DISK_IO_GAUGE_KEYS = frozenset(
-    {"queuedReadOps", "queuedWriteOps", "pendingWriteBytes", "onboardsInFlight"}
+    {
+        "queuedReadOps",
+        "queuedWriteOps",
+        "pendingWriteBytes",
+        "retainedCopiesCurrent",
+        "onboardsInFlight",
+    }
 )
 _DISK_IO_PEAK_KEYS = frozenset(
     {"readBatchLatencyMsMax", "peakQueuedReadOps", "peakQueuedWriteOps", "peakPendingWriteBytes"}
@@ -1080,12 +1086,13 @@ def _update_kv_cache_draft_token_location(
 ):
     run_kv_cache_relocation = False
     for request in scheduled_batch.generation_requests:
-        if request.state != LlmRequestState.GENERATION_COMPLETE:
-            if (
-                request.py_num_accepted_draft_tokens > 0
-                and len(request.py_num_accepted_draft_tokens_indices) > 0
-            ):
-                run_kv_cache_relocation = True
+        # Test accepted-draft count before the costlier native state read.
+        if (
+            request.py_num_accepted_draft_tokens > 0
+            and request.state != LlmRequestState.GENERATION_COMPLETE
+            and len(request.py_num_accepted_draft_tokens_indices) > 0
+        ):
+            run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
         return
     requests = scheduled_batch.all_requests()
@@ -5492,6 +5499,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sample = {
             "readBytes": io.read_bytes,
             "writeBytes": io.write_bytes,
+            "requiredWriteBytes": io.required_write_bytes,
             "readOps": io.read_ops,
             "writeOps": io.write_ops,
             "readBusyMs": io.read_busy_ns / 1e6,
@@ -5511,6 +5519,11 @@ class KVCacheManagerV2(BaseResourceManager):
             "reserveDeferredPages": io.reserve_deferred_pages,
             "lastLevelDroppedPages": io.last_level_dropped_pages,
             "failedPages": io.failed_pages,
+            "retainedCopiesCurrent": io.retained_copies_current,
+            "retainedCopiesCreated": io.retained_copies_created,
+            "retainedCopiesReused": io.retained_copies_reused,
+            "retainedCopiesReclaimed": io.retained_copies_reclaimed,
+            "retainedCopiesDropped": io.retained_copies_dropped,
             "onboardedRequests": self._iter_onboarded_requests,
             "onboardFailures": self._iter_onboard_failures,
             "onboardWaitMsSum": self._iter_onboard_wait_s * 1e3,
@@ -5541,7 +5554,12 @@ class KVCacheManagerV2(BaseResourceManager):
             f"peak {window['peakPendingWriteBytes'] / gib:.2f} GiB; "
             f"dropped from the last tier {window['lastLevelDroppedPages']} pages; "
             f"failed {window['failedPages']} pages; "
-            f"onboarded {window['onboardedRequests']} requests, {window['onboardFailures']} failed"
+            f"onboarded {window['onboardedRequests']} requests, "
+            f"{window['onboardFailures']} failed; "
+            f"required writes {window['requiredWriteBytes'] / gib:.2f} GiB; "
+            f"retained copies {window['retainedCopiesCurrent']} ("
+            f"reused {window['retainedCopiesReused']}, "
+            f"reclaimed {window['retainedCopiesReclaimed']})"
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -6830,6 +6848,20 @@ class KVCacheManagerV2(BaseResourceManager):
     @property
     def num_context_onboards(self) -> int:
         return len(self._context_onboards)
+
+    def has_disk_prefix_to_onboard(self, req: LlmRequest) -> bool:
+        """Read-only check whether ``req``'s matched prefix currently needs disk reads."""
+        if (
+            not self._disk_tier_enabled
+            or not self.enable_block_reuse
+            or req.py_request_id in self._context_onboards
+        ):
+            return False
+        tokens = self._context_reuse_tokens(req)
+        salt_int = self._derive_reuse_salt(req.cache_salt)
+        return self.impl.has_disk_resident_prefix(
+            ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+        )
 
     def start_context_onboard(self, req: LlmRequest) -> bool:
         """Start reading the disk-resident blocks of ``req``'s reusable prefix into host memory.

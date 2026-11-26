@@ -117,6 +117,16 @@ struct DiskCacheTierConfig
     //! call rather than being dropped, which bounds how long a write inside a step queues behind them.
     size_t maxPendingWriteBytes = size_t{8} << 30;
 
+    //! Keep a committed full-block page's disk copy after a restore, so its next eviction to disk
+    //! reclaims the slot without writing it again.
+    bool keepCopyAfterRestore = true;
+
+    //! Share of this tier's slots, 0 to 1, that retained copies may hold ahead of pages whose only copy
+    //! is on disk. When the tier runs short, copies beyond the share are reclaimed before any disk-only
+    //! page is evicted; copies within the share are reclaimed only for what evicting disk-only pages
+    //! cannot cover.
+    float protectedCopyFraction = 1.0F;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

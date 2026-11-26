@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -23,10 +24,12 @@ from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -37,6 +40,14 @@ from .dflash_attention import (
     validate_dflash_trtllm_gen_runtime,
 )
 from .interface import SpecMetadata, SpecWorkerBase
+from .spec_tail_kernels import (
+    compute_gen_ctx_positions,
+    decode_draft_block_table,
+    dflash_paged_latent_prepare,
+    scatter_context_latents,
+    store_context_latents,
+)
+from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
@@ -680,6 +691,31 @@ class DFlashSpecMetadata(SpecMetadata):
         ]
 
 
+# Greedy draft tokens from ``[num_gens, K, shard]`` shard block logits:
+# ``(draft_model, local_block, inputs, draft_hidden_states) -> [num_gens, K]`` int32.
+VocabParallelDraftTokens = Callable[
+    [nn.Module, torch.Tensor, dict, Optional[torch.Tensor]], torch.Tensor
+]
+
+
+@dataclass
+class VocabParallelSelection:
+    """The tokens a DFlash worker selects from this rank's vocab shard of the
+    target LM head instead of from the gathered logits.
+
+    It exists when the target LM head is an evenly vocab-sharded, gathered TP
+    head (:meth:`VocabParallelHead.supports`) and the deployment has neither
+    occurrence penalties nor a guided decoder, which both edit the full target
+    logits. The target tokens of greedy batches, and of temperature-only
+    batches when :attr:`samples`, then come from the shard, and so do greedy
+    draft tokens when :attr:`draft_tokens` is set.
+    """
+
+    head: VocabParallelHead
+    samples: bool
+    draft_tokens: Optional[VocabParallelDraftTokens] = None
+
+
 class DFlashWorker(SpecWorkerBase):
     """
     Worker for DFlash speculative decoding.
@@ -740,6 +776,13 @@ class DFlashWorker(SpecWorkerBase):
         # [L, pages, K/V, nkv, page, hd] when privately allocated, or the draft
         # KV cache manager's per-layer pool views when bound to it.
         self._ctx_kv_buf = None
+        # [L] int64 base addresses of the single-latent per-layer pool views.
+        self._ctx_kv_ptrs = None
+        # Whether a generation step's drafter inputs can use the fused Triton
+        # single-latent prologue; decided with the pool binding.
+        self._paged_latent_prepare = False
+        # Pre-allocated [0..max_batch-1] index tensor for ctx_cache_batch_idx.
+        self._ctx_batch_arange = None
         # The manager _ctx_kv_buf is borrowed from, so a swap can be detected.
         self._ctx_kv_manager = None
         # Static per-slot page table for the private arena. When bound to the
@@ -763,6 +806,15 @@ class DFlashWorker(SpecWorkerBase):
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
+        # Set by bind_target_lm_head / set_target_model / set_draft_model.
+        self._vocab_parallel: Optional[VocabParallelSelection] = None
+        self._target_model_ref: Optional[weakref.ref] = None
+        self._draft_model_ref: Optional[weakref.ref] = None
+        # Overlapped context-projection state (pure-gen steps).
+        self._pending_ctx_projection: Optional[dict] = None
+        self._ctx_projection_stream: Optional[torch.cuda.Stream] = None
+        self._ctx_proj_fork_event: Optional[torch.cuda.Event] = None
+        self._ctx_proj_join_event: Optional[torch.cuda.Event] = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -826,6 +878,8 @@ class DFlashWorker(SpecWorkerBase):
     def set_draft_model(self, draft_model) -> None:
         super().set_draft_model(draft_model)
         self._validate_draft_attention_backend(draft_model)
+        # Non-owning: the draft model is a sibling module of this worker.
+        self._draft_model_ref = weakref.ref(draft_model)
         # The DFlash 2 selector indexes full-vocab codebooks by draft-token
         # id, so a d2t-remapped draft vocab would score the wrong tokens.
         if self._d2t is not None and getattr(draft_model, "is_dflash2", False):
@@ -847,6 +901,115 @@ class DFlashWorker(SpecWorkerBase):
                 raise ValueError(
                     "LiLiCorr requires nonempty target_layer_ids to capture target hidden states."
                 )
+
+    def set_target_model(self, target_model: nn.Module) -> None:
+        # Non-owning: the target model owns this worker.
+        self._target_model_ref = weakref.ref(target_model)
+
+    def bind_target_lm_head(
+        self,
+        lm_head: nn.Module,
+        logits_processor: nn.Module,
+        *,
+        softcap: Optional[float] = None,
+        gather_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> None:
+        """Decide the :class:`VocabParallelSelection` over the target LM head."""
+        if (
+            self.guided_decoder is not None
+            or self.spec_config.enable_penalty
+            or type(logits_processor) is not LogitsProcessor
+            or not VocabParallelHead.supports(lm_head)
+        ):
+            self._vocab_parallel = None
+            return
+        if (
+            self._vocab_parallel is not None
+            and self._vocab_parallel.head.lm_head is lm_head
+            and self._vocab_parallel.head.softcap == (float(softcap) if softcap else None)
+        ):
+            return
+        self._vocab_parallel = VocabParallelSelection(
+            head=VocabParallelHead(lm_head, softcap=softcap, gather_fn=gather_fn),
+            samples=(
+                not self.spec_config.use_rejection_sampling
+                and self.spec_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK_NO_TOPP
+            ),
+        )
+
+    def bind_draft_lm_head(self, draft_model) -> None:
+        """Decide the draft side of the :class:`VocabParallelSelection`."""
+        if self._vocab_parallel is not None:
+            self._vocab_parallel.draft_tokens = self._vocab_parallel_draft_tokens(draft_model)
+
+    def setup_aliases(self) -> None:
+        """Post-load hook: decide the vocab-parallel selection, target then draft."""
+        target_model = None if self._target_model_ref is None else self._target_model_ref()
+        if target_model is not None:
+            self.bind_target_lm_head(
+                target_model.lm_head,
+                target_model.logits_processor,
+                softcap=getattr(target_model, "softcap", None),
+                gather_fn=getattr(target_model, "_gather_capped_local_logits", None),
+            )
+        draft_model = None if self._draft_model_ref is None else self._draft_model_ref()
+        if draft_model is not None:
+            self.bind_draft_lm_head(draft_model)
+
+    def post_load_weights(self) -> None:
+        self.setup_aliases()
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        # The guided decoder masks the full target logits.
+        self._vocab_parallel = None
+        return super().set_guided_decoder(guided_decoder)
+
+    @property
+    def target_vocab_parallel_head(self) -> Optional[VocabParallelHead]:
+        return None if self._vocab_parallel is None else self._vocab_parallel.head
+
+    def target_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head,
+        logits_processor,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """This rank's vocab shard (``VocabShardedLogits``) once the target
+        head is bound for vocab-parallel selection, the gathered logits
+        otherwise."""
+        head = self.target_vocab_parallel_head
+        if head is not None:
+            return head.shard_logits(hidden_states)
+        return super().target_logits(
+            hidden_states, lm_head, logits_processor, attn_metadata, spec_metadata, draft_model
+        )
+
+    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """How greedy draft tokens come from the vocab shard, or None."""
+        if (
+            draft_model.lm_head is not self._vocab_parallel.head.lm_head
+            or self._d2t is not None
+            or getattr(draft_model, "lilicorr", None) is not None
+            or getattr(draft_model, "has_candidate_selector", False)
+        ):
+            return None
+        return self._argmax_block_tokens
+
+    def _argmax_block_tokens(
+        self,
+        draft_model,
+        local_block: torch.Tensor,
+        inputs: dict,
+        draft_hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del draft_model, inputs, draft_hidden_states
+        num_gens, block_len, shard = local_block.shape
+        return self._vocab_parallel.head.argmax(
+            local_block.reshape(-1, shard), out_dtype=torch.int32
+        ).view(num_gens, block_len)
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -1021,9 +1184,22 @@ class DFlashWorker(SpecWorkerBase):
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
         # pool, and the drafter addresses blocks, not planes.
+        view = src[self._ctx_pool_idx, :num_seqs, 0]
+        if (
+            view.shape[-1] == self._ctx_block_tables.shape[1]
+            and self._ctx_block_tables.stride(1) == 1
+            and (view.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
+        ):
+            decode_draft_block_table(
+                view,
+                self._ctx_block_divisor,
+                self._ctx_block_tables,
+                self._ctx_block_counts,
+            )
+            return True
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
+        encoded = view.to(torch.int64).clone()
         # Before the clamp erases the placeholders. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
         self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
@@ -1060,6 +1236,8 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
+        self._ctx_kv_ptrs = None
+        self._paged_latent_prepare = False
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -1115,6 +1293,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._ctx_batch_arange = torch.arange(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -1222,11 +1401,29 @@ class DFlashWorker(SpecWorkerBase):
                     dtype=torch.int32,
                     device="cuda",
                 )
+                if kv_factor == 1:
+                    self._ctx_kv_ptrs = torch.tensor(
+                        [self._ctx_kv_buf[layer_idx].data_ptr() for layer_idx in range(L)],
+                        dtype=torch.int64,
+                        device="cuda",
+                    )
+                    self._paged_latent_prepare = getattr(
+                        draft_model, "lilicorr", None
+                    ) is None and not getattr(draft_model, "_uses_lilicorr", False)
             else:
                 # Nothing reserved: pages come from the manager's per-request
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
+                if kv_factor == 1:
+                    self._ctx_kv_ptrs = torch.tensor(
+                        [layer.data_ptr() for layer in pool],
+                        dtype=torch.int64,
+                        device="cuda",
+                    )
+                    self._paged_latent_prepare = getattr(
+                        draft_model, "lilicorr", None
+                    ) is None and not getattr(draft_model, "_uses_lilicorr", False)
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
@@ -1335,6 +1532,25 @@ class DFlashWorker(SpecWorkerBase):
                 else self._ctx_page_table
             )
             page_size = self._ctx_page_size
+            if (
+                self._ctx_kv_ptrs is not None
+                and k.dim() == 4
+                and k.size(2) == 1
+                and k.size(1) == len(self._ctx_kv_buf)
+                and k.stride(-1) == 1
+                and table.stride(-1) == 1
+                and (k.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
+            ):
+                scatter_context_latents(
+                    k[:, :, 0],
+                    self._ctx_kv_buf,
+                    self._ctx_kv_ptrs,
+                    rows.long().contiguous(),
+                    positions.long().contiguous(),
+                    table,
+                    page_size,
+                )
+                return
             pages = table[rows.long(), positions.long() // page_size].long()
             offsets = positions.long() % page_size
             for layer_idx in range(k.size(1)):
@@ -1584,6 +1800,12 @@ class DFlashWorker(SpecWorkerBase):
         self._write_ctx_len(ctx_len_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        # Drain any overlapped context-projection aux-stream event if a prior
+        # forward raised before joining in prepare_1st_drafter_inputs.
+        pending = getattr(self, "_pending_ctx_projection", None)
+        if pending is not None:
+            torch.cuda.current_stream().wait_event(pending["ev"])
+            self._pending_ctx_projection = None
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
         # wholesale), then apply any pending rewind for the other modes so a
         # failed draft forward does not leave kv_lens_cuda incremented.
@@ -1621,7 +1843,20 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
+        logits_vocab_shard = False
         K = spec_metadata.runtime_draft_len
+        if isinstance(logits, VocabShardedLogits):
+            can_sample_sharded = (
+                self._vocab_parallel is not None
+                and self._vocab_parallel.samples
+                and spec_metadata.seeds is not None
+                and spec_metadata.offsets is not None
+            )
+            if K > 0 and (spec_metadata.is_all_greedy_sample or can_sample_sharded):
+                raw_logits = logits.local
+                logits_vocab_shard = True
+            else:
+                logits = raw_logits = logits.gather()
 
         if K == 0:
             return self.skip_drafting(
@@ -1659,6 +1894,12 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_len_host = list(self._ctx_len_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
+
+        self._pending_ctx_projection = None
+        if num_contexts == 0 and num_gens > 0 and self.guided_decoder is None:
+            self._pending_ctx_projection = self._launch_gen_ctx_projection(
+                draft_model, spec_metadata, attn_metadata, input_ids.shape[0], num_gens, K
+            )
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -1768,64 +2009,103 @@ class DFlashWorker(SpecWorkerBase):
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_hidden_states = hidden_states_out[gen_gather_ids]
-                gen_logits = draft_model.logits_processor(
-                    gen_hidden_states, draft_model.lm_head, attn_metadata, True
-                )
-
-                vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
-                block_hidden_states = gen_hidden_states.reshape(num_gens, K, -1)
-
-                gen_draft_tokens = None
+                gen_hidden_block = gen_hidden_states.reshape(num_gens, K, -1)
+                vocab_parallel = self._vocab_parallel
                 if (
-                    not spec_metadata.wants_advanced_draft_sampling
-                    and getattr(draft_model, "lilicorr", None) is None
-                    and not getattr(draft_model, "has_candidate_selector", False)
+                    vocab_parallel is not None
+                    and vocab_parallel.draft_tokens is not None
+                    and not spec_metadata.wants_advanced_draft_sampling
                 ):
-                    gen_draft_tokens = self._refine_and_greedy_sample_block(
+                    # Greedy draft tokens straight from this rank's vocab shard
+                    # of the block logits, eliminating the full-vocab gather.
+                    local_block = vocab_parallel.head.local_logits(gen_hidden_states)
+                    gen_draft_tokens = vocab_parallel.draft_tokens(
                         draft_model,
-                        gen_logits,
+                        local_block.view(num_gens, K, -1),
                         inputs,
-                        spec_metadata,
-                        block_hidden_states,
+                        gen_hidden_block,
                     )
-
-                if gen_draft_tokens is None:
-                    gen_logits = self._refine_block_logits(
-                        draft_model,
-                        gen_logits,
-                        inputs,
-                        spec_metadata,
-                        block_hidden_states,
+                    vocab_size = vocab_parallel.head.vocab_size
+                elif (
+                    vocab_parallel is not None
+                    and spec_metadata.wants_advanced_draft_sampling
+                    and getattr(draft_model, "markov_output_is_sharded", False)
+                    and callable(getattr(draft_model, "vocab_parallel_markov_logits", None))
+                ):
+                    # Rejection sampling with sharded Markov output: run the
+                    # Markov chain on this rank's vocab shard and gather once.
+                    local_block = vocab_parallel.head.local_logits(gen_hidden_states)
+                    gen_logits = draft_model.vocab_parallel_markov_logits(
+                        local_block.view(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        gen_hidden_block,
+                        vocab_parallel.head,
                     )
-
-                    # DFlash 2: replace the independent per-position picks with one
-                    # coherent path through the block (absent for plain DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            block_hidden_states,
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
-                            gen_logits,
-                            block_hidden_states,
-                            inputs["first_prev_tokens"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-
+                    vocab_size = gen_logits.shape[-1]
                     gen_draft_tokens = self.sample_draft_tokens(
                         gen_logits,
                         spec_metadata,
                         batch_size,
                         num_contexts=num_contexts,
                     )
+                else:
+                    gen_logits = draft_model.logits_processor(
+                        gen_hidden_states, draft_model.lm_head, attn_metadata, True
+                    )
+
+                    vocab_size = gen_logits.shape[-1]
+                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                    gen_draft_tokens = None
+                    if (
+                        not spec_metadata.wants_advanced_draft_sampling
+                        and getattr(draft_model, "lilicorr", None) is None
+                        and not getattr(draft_model, "has_candidate_selector", False)
+                    ):
+                        gen_draft_tokens = self._refine_and_greedy_sample_block(
+                            draft_model,
+                            gen_logits,
+                            inputs,
+                            spec_metadata,
+                            gen_hidden_block,
+                        )
+
+                    if gen_draft_tokens is None:
+                        gen_logits = self._refine_block_logits(
+                            draft_model,
+                            gen_logits,
+                            inputs,
+                            spec_metadata,
+                            gen_hidden_block,
+                        )
+
+                        # DFlash 2: replace the independent per-position picks with one
+                        # coherent path through the block (absent for plain DFlash).
+                        if getattr(draft_model, "lilicorr", None) is not None:
+                            gen_logits = self._apply_lilicorr(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_block,
+                                inputs["lilicorr_anchor"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+                        elif getattr(draft_model, "has_candidate_selector", False):
+                            gen_logits = self._apply_dflash2_selector(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_block,
+                                inputs["first_prev_tokens"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+
+                        gen_draft_tokens = self.sample_draft_tokens(
+                            gen_logits,
+                            spec_metadata,
+                            batch_size,
+                            num_contexts=num_contexts,
+                        )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -1887,6 +2167,7 @@ class DFlashWorker(SpecWorkerBase):
 
         return {
             "logits": raw_logits,
+            "logits_vocab_shard": logits_vocab_shard,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
@@ -2064,6 +2345,183 @@ class DFlashWorker(SpecWorkerBase):
         block_logits = gen_logits.new_full((*gen_logits.shape[:-1], full_vocab), float("-inf"))
         return candidate_ids, unary_logits, block_logits
 
+    def _launch_gen_ctx_projection(
+        self,
+        draft_model,
+        spec_metadata: DFlashSpecMetadata,
+        attn_metadata: AttentionMetadata,
+        total_target_tokens: int,
+        num_gens: int,
+        K: int,
+    ) -> Optional[dict]:
+        """Fork the gen tokens' context projection onto an aux stream.
+
+        Runs ``project_target_hidden`` + ``precompute_context_kv`` in parallel
+        with target sample/accept on the main stream and is joined right before
+        the accepted-mask context write in :meth:`prepare_1st_drafter_inputs`.
+        Pure-generation steps only: neither target sample/accept nor kv-len
+        bookkeeping writes ``captured_hidden_states`` or ``_ctx_len``.
+        """
+        captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+        if (
+            captured_hs is None
+            or not self._ctx_buf_inited
+            or not callable(getattr(draft_model, "project_target_hidden", None))
+            or getattr(draft_model, "lilicorr", None) is not None
+            or K + 1 != self._draft_tokens_per_req
+            or not captured_hs.is_cuda
+        ):
+            return None
+        cache_dtype = self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
+        main = torch.cuda.current_stream()
+        aux = self._ctx_projection_stream
+        if aux is None or aux.device != main.device:
+            aux = self._ctx_projection_stream = torch.cuda.Stream(device=main.device)
+            self._ctx_proj_fork_event = torch.cuda.Event()
+            self._ctx_proj_join_event = torch.cuda.Event()
+        fork_ev = self._ctx_proj_fork_event
+        join_ev = self._ctx_proj_join_event
+        total_tokens_per_req = self._draft_tokens_per_req
+        # Compute pre-step context RoPE positions on main BEFORE forking so
+        # aux never races with prepare_1st_drafter_inputs updating _ctx_len in place.
+        slots = self._batch_to_slot[:num_gens]
+        positions = compute_gen_ctx_positions(slots, self._ctx_len, K + 1)
+        fork_ev.record(main)
+        aux.wait_event(fork_ev)
+        with torch.cuda.stream(aux):
+            gen_start = attn_metadata.num_ctx_tokens
+            gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+            projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+            k_new, v_new = draft_model.precompute_context_kv(projected.to(cache_dtype), positions)
+            join_ev.record(aux)
+        if not torch.cuda.is_current_stream_capturing():
+            positions.record_stream(aux)
+            for t in (k_new, v_new):
+                if t is not None:
+                    t.record_stream(main)
+        # Keep `positions` and `projected` alive until after `main.wait_event(join_ev)` so
+        # PyTorch's CUDA graph memory pool cannot reuse their addresses on `main` while `aux`
+        # is still executing `project_target_hidden` / `precompute_context_kv` in parallel.
+        return {"ev": join_ev, "k": k_new, "v": v_new, "keep": (positions, projected)}
+
+    def _fused_gen_prepare_applies(
+        self, spec_metadata: DFlashSpecMetadata, draft_model: nn.Module
+    ) -> bool:
+        """Whether :meth:`_prepare_paged_latent_gen_inputs` covers this step."""
+        return (
+            self._paged_latent_prepare
+            and self._ctx_kv_ptrs is not None
+            and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
+            and spec_metadata.captured_hidden_states is not None
+            and callable(getattr(draft_model, "project_target_hidden", None))
+            and getattr(draft_model, "lilicorr", None) is None
+        )
+
+    def _prepare_paged_latent_gen_inputs(
+        self,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: DFlashSpecMetadata,
+        draft_model: nn.Module,
+        total_target_tokens: int,
+        mask_token_id: int,
+        pre: Optional[dict],
+    ) -> dict:
+        """Fused single-latent generation-step prologue.
+
+        Produces identical inputs and side effects (context latents stored,
+        ``_ctx_len`` advanced, ``_seq_lens`` set) as the eager branch with
+        per-request bookkeeping in one Triton launch and all-layer latent store
+        in another.
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
+        width = self._draft_tokens_per_req
+        block_size = self._compute_block_size
+        slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
+        table = (
+            self._ctx_block_tables if self._ctx_block_tables is not None else self._ctx_page_table
+        )
+        prep = dflash_paged_latent_prepare(
+            num_accepted_tokens,
+            accepted_tokens,
+            slots,
+            self._ctx_len,
+            self._ctx_block_counts if self._ctx_block_tables is not None else None,
+            table,
+            attn_metadata._seq_lens_cuda,
+            num_contexts,
+            self._dummy_slot,
+            self._max_ctx,
+            self._ctx_page_size,
+            block_size,
+            width,
+            compute_block_placement=False,
+        )
+        attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
+
+        trained_mask_embedding = (
+            getattr(draft_model, "mask_token_embedding", None)
+            if mask_token_id == getattr(draft_model, "mask_token_id", None)
+            else None
+        )
+        embed_block = getattr(draft_model, "embed_draft_block", None)
+        if embed_block is not None:
+            noise_embedding = embed_block(prep.bonus, block_size)
+        else:
+            noise_embedding = dflash_noise_block_embedding(
+                draft_model.draft_model_full.model.embed_tokens,
+                prep.bonus,
+                mask_token_id,
+                block_size,
+                trained_mask_embedding,
+            )
+
+        if pre is not None:
+            torch.cuda.current_stream().wait_event(pre["ev"])
+            latent = pre["k"]
+        else:
+            gen_start = attn_metadata.num_ctx_tokens
+            captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+            gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
+            projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+            latent, _ = draft_model.precompute_context_kv(
+                projected.to(self._ctx_kv_buf[0].dtype), prep.ctx_positions
+            )
+        store_context_latents(
+            latent[:, :, 0],
+            self._ctx_kv_buf,
+            self._ctx_kv_ptrs,
+            prep.store_pages,
+            prep.store_offsets,
+            prep.store_mask,
+        )
+        if self._ctx_block_tables is not None:
+            if (
+                self._ctx_batch_arange is not None
+                and num_contexts + num_gens <= self._ctx_batch_arange.shape[0]
+            ):
+                ctx_batch_idx = self._ctx_batch_arange[num_contexts : num_contexts + num_gens]
+            else:
+                ctx_batch_idx = torch.arange(
+                    num_contexts, num_contexts + num_gens, dtype=torch.long, device=slots.device
+                )
+        else:
+            ctx_batch_idx = slots
+        return {
+            "lilicorr_anchor": None,
+            "noise_embedding": noise_embedding,
+            "query_positions": prep.query_positions,
+            "num_ctx_per_req": prep.num_ctx,
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": ctx_batch_idx,
+            "first_prev_tokens": prep.bonus,
+            "ctx_kv_cache": self._ctx_kv_buf,
+            "ctx_page_table": table,
+        }
+
     def prepare_1st_drafter_inputs(
         self,
         input_ids: torch.LongTensor,
@@ -2112,7 +2570,24 @@ class DFlashWorker(SpecWorkerBase):
         )
         lilicorr_anchor = None
 
+        pre = self._pending_ctx_projection
+        self._pending_ctx_projection = None
+
         if num_gens > 0:
+            if self._fused_gen_prepare_applies(spec_metadata, draft_model) and (
+                accepted_tokens.is_cuda or os.environ.get("TRITON_INTERPRET") == "1"
+            ):
+                return self._prepare_paged_latent_gen_inputs(
+                    accepted_tokens,
+                    num_accepted_tokens,
+                    attn_metadata,
+                    spec_metadata,
+                    draft_model,
+                    total_target_tokens,
+                    mask_token_id,
+                    pre,
+                )
+
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
@@ -2177,8 +2652,12 @@ class DFlashWorker(SpecWorkerBase):
                 # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
-                projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
+                if pre is None or getattr(draft_model, "lilicorr", None) is not None:
+                    projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 if getattr(draft_model, "lilicorr", None) is not None:
+                    if pre is not None:
+                        torch.cuda.current_stream().wait_event(pre["ev"])
+                        pre = None
                     # The last accepted output is predicted by the corresponding input
                     # row; the newly committed token itself has no target row yet.
                     projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
@@ -2201,7 +2680,6 @@ class DFlashWorker(SpecWorkerBase):
                 # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
                 pos_flat = ctx_position_ids.long().reshape(-1)
                 mask_1d = write_mask.reshape(-1)
 
@@ -2210,9 +2688,17 @@ class DFlashWorker(SpecWorkerBase):
                 cache_dtype = (
                     self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
                 )
-                k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(cache_dtype), pos_flat
-                )
+                if pre is not None:
+                    torch.cuda.current_stream().wait_event(pre["ev"])
+                    k_new, v_new = pre["k"], pre["v"]
+                    pre_keep = pre
+                    pre = None
+                else:
+                    pre_keep = None
+                    proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
+                    k_new, v_new = draft_model.precompute_context_kv(
+                        proj_flat.to(cache_dtype), pos_flat
+                    )
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
                 if v_new is not None:
@@ -2231,6 +2717,7 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_k_buf[slot_long, :, col_long] = k_new
                     if v_new is not None:
                         self._ctx_v_buf[slot_long, :, col_long] = v_new
+                del pre_keep
 
                 self._advance_ctx_len(slots, gen_num_accepted_long)
 
@@ -2253,7 +2740,11 @@ class DFlashWorker(SpecWorkerBase):
                 total_tokens_per_req
             )
             attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
+            if pre is not None:
+                torch.cuda.current_stream().wait_event(pre["ev"])
         else:
+            if pre is not None:
+                torch.cuda.current_stream().wait_event(pre["ev"])
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")

@@ -191,6 +191,11 @@ def inject_disk_io_faults(manager: Any, reads: bool, count: int, errno_value: in
     _cpp().inject_disk_io_faults(manager, reads, count, errno_value)
 
 
+def disk_copy_counters(manager: Any) -> dict[str, int]:
+    """Return retained disk copy counters for ``manager``."""
+    return {k: int(v) for k, v in _cpp().disk_copy_counters(manager).items()}
+
+
 def is_commit_allowed(kv_cache: Any) -> bool:
     """Return whether the KV cache still allows token commits."""
     return bool(_cpp().is_commit_allowed(kv_cache))

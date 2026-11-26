@@ -1,38 +1,273 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM107 tests of the one-launch cluster radix selector against the split selector's contract."""
+"""CPU contract tests and SM107 GPU tests for the 1-launch cluster radix decode top-k selector."""
+
+from __future__ import annotations
 
 from unittest.mock import patch
 
 import pytest
 import torch
 
-if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-    pytest.skip("cluster radix requires SM107 validation", allow_module_level=True)
-
-import tensorrt_llm._torch.custom_ops  # noqa: E402,F401
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (  # noqa: E402
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
+    _cluster_radix_topk_decode as cluster_kernel_mod,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
+    cute_dsl_radix_topk_decode as topk_mod,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    CLUSTER_SIZES,
+    DEFAULT_VERIFY_CLUSTERS,
     TOP_K,
+    CompiledClusterRadixTopkDecode,
+    blocks_per_row,
     build_cluster,
-    build_dynamic,
+    build_cluster_variants,
     build_split,
     cluster_radix_topk_decode,
-    dynamic_radix_topk_decode,
+    reachable_cluster_sizes,
+    resolve_compiled_cluster,
+    select_cluster_size,
     split_radix_topk_decode,
+)
+
+_IS_SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+_requires_sm107 = pytest.mark.skipif(
+    not _IS_SM107, reason="cluster radix GPU tests require SM107 validation"
 )
 
 #: key(-FLT_MAX), the op's pad entries.
 _PAD_KEY = 0xFF7FFFFF
-#: build_cluster arguments: the dep4 target's build, narrower and wider clusters, the unpipelined
-#: passes and a register cap of two CTAs per SM.
+#: build_cluster arguments covering 2..32 CTAs/cluster, threads, unroll, unpipelined and min_blocks.
 _CONFIGS = [
     dict(),
     dict(cluster=2, threads=512, unroll=2, pipe=False),
     dict(cluster=4, threads=512, unroll=4),
+    dict(cluster=16, threads=512, unroll=2),
     dict(cluster=16, threads=256, unroll=1),
+    dict(cluster=32, threads=512, unroll=2),
     dict(cluster=4, threads=1024, unroll=8, pipe=False),
     dict(cluster=8, threads=512, unroll=2, min_blocks=2),
 ]
+
+
+# ============================================================================
+# CPU-only routing, occupancy/SMEM footprint, and mathematical contract tests
+# ============================================================================
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rows,width,sm_count,available,expected",
+    [
+        # VR200 (212 SMs), full {8, 16, 32} ladder
+        (4, 1048584, 212, (8, 16, 32), 32),
+        (4, 780000, 212, (8, 16, 32), 32),
+        (4, 262144, 212, (8, 16, 32), 32),
+        (4, 131072, 212, (8, 16, 32), 16),
+        (4, 65536, 212, (8, 16, 32), 8),
+        (4, 32768, 212, (8, 16, 32), 8),
+        (4, 20480, 212, (8, 16, 32), 8),
+        (8, 1048584, 212, (8, 16, 32), 16),
+        (8, 780000, 212, (8, 16, 32), 16),
+        (8, 131072, 212, (8, 16, 32), 16),
+        (8, 65536, 212, (8, 16, 32), 8),
+        (8, 32768, 212, (8, 16, 32), 8),
+        (8, 20480, 212, (8, 16, 32), 8),
+        (16, 1048584, 212, (8, 16, 32), 8),
+        (32, 1048584, 212, (8, 16, 32), 8),
+        (64, 1048584, 212, (8, 16, 32), 8),
+        # Graceful downgrade when device caps non-portable cluster at 16 or 8
+        (4, 780000, 212, (8, 16), 16),
+        (4, 262144, 212, (8, 16), 16),
+        (4, 65536, 212, (8, 16), 8),
+        (4, 780000, 212, (8,), 8),
+        # Blackwell (148 SMs), non-portable max 16
+        (4, 1048584, 148, (8, 16), 16),
+        (8, 1048584, 148, (8, 16), 16),
+        (16, 1048584, 148, (8, 16), 8),
+        # Zero rows safely returns smallest candidate
+        (0, 1048584, 212, (8, 16, 32), 8),
+    ],
+)
+def test_select_cluster_size_policy(rows, width, sm_count, available, expected):
+    assert select_cluster_size(rows, width, sm_count, available) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "width,sm_count,candidates,expected",
+    [
+        (20480, 212, (8, 16, 32), (8,)),
+        (32768, 212, (8, 16, 32), (8,)),
+        (65536, 212, (8, 16, 32), (8,)),
+        (131072, 212, (8, 16, 32), (8, 16)),
+        (262144, 212, (8, 16, 32), (8, 16, 32)),
+        (780000, 212, (8, 16, 32), (8, 16, 32)),
+        (1048584, 212, (8, 16, 32), (8, 16, 32)),
+        (1048584, 212, (8, 16), (8, 16)),
+        (1048584, 212, (8,), (8,)),
+    ],
+)
+def test_reachable_cluster_sizes(width, sm_count, candidates, expected):
+    row_counts = (4, 8, 16, 32, 64)
+    assert reachable_cluster_sizes(row_counts, width, sm_count, candidates) == expected
+
+
+@pytest.mark.cpu_only
+def test_resolve_compiled_cluster_single_and_mapping():
+    def _fake(cluster: int, sm_count: int = 212) -> CompiledClusterRadixTopkDecode:
+        return CompiledClusterRadixTopkDecode(
+            launch=object(),
+            device_id=0,
+            next_n=4,
+            cluster=cluster,
+            threads=512,
+            unroll=2,
+            pipe=True,
+            min_blocks=0,
+            use_pdl=True,
+            sm_count=sm_count,
+        )
+
+    h8, h16, h32 = _fake(8), _fake(16), _fake(32)
+    assert resolve_compiled_cluster(h16, 64, 1048584) is h16
+
+    variants = {8: h8, 16: h16, 32: h32}
+    assert resolve_compiled_cluster(variants, 4, 780000) is h32
+    assert resolve_compiled_cluster(variants, 4, 131072) is h16
+    assert resolve_compiled_cluster(variants, 4, 65536) is h8
+    assert resolve_compiled_cluster(variants, 4, 32768) is h8
+    assert resolve_compiled_cluster(variants, 8, 780000) is h16
+    assert resolve_compiled_cluster(variants, 16, 780000) is h8
+    assert resolve_compiled_cluster(variants, 64, 1048584) is h8
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        resolve_compiled_cluster({}, 4, 780000)
+
+
+@pytest.mark.cpu_only
+def test_build_cluster_variants_fallback_on_non_portable_rejection():
+    built: list[int] = []
+
+    def _fake_build(device_id, *, cluster, **kwargs):
+        built.append(cluster)
+        if cluster == 32:
+            raise RuntimeError("cluster size 32 unsupported")
+        return CompiledClusterRadixTopkDecode(
+            launch=object(),
+            device_id=device_id,
+            next_n=4,
+            cluster=cluster,
+            threads=512,
+            unroll=2,
+            pipe=True,
+            min_blocks=0,
+            use_pdl=True,
+            sm_count=212,
+        )
+
+    with patch.object(topk_mod, "build_cluster", side_effect=_fake_build):
+        variants = build_cluster_variants(0, next_n=4, clusters=(8, 16, 32))
+    assert built == [8, 16, 32]
+    assert set(variants.keys()) == {8, 16}
+
+    # If cluster=16 is rejected, cluster=32 is not attempted.
+    built.clear()
+
+    def _reject_16(device_id, *, cluster, **kwargs):
+        if cluster >= 16:
+            built.append(cluster)
+            raise RuntimeError(f"cluster size {cluster} unsupported")
+        return _fake_build(device_id, cluster=cluster, **kwargs)
+
+    with patch.object(topk_mod, "build_cluster", side_effect=_reject_16):
+        variants = build_cluster_variants(0, next_n=4, clusters=(8, 16, 32))
+    assert built == [8, 16]
+    assert set(variants.keys()) == {8}
+
+    # Portable cluster=8 failures must propagate rather than be swallowed.
+    with (
+        patch.object(topk_mod, "build_cluster", side_effect=RuntimeError("boom")),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        build_cluster_variants(0, next_n=4, clusters=(8, 16))
+
+
+@pytest.mark.cpu_only
+def test_cluster_kernel_smem_and_validation_cpu():
+    assert DEFAULT_VERIFY_CLUSTERS == (8, 16, 32)
+    assert CLUSTER_SIZES == (2, 4, 8, 16, 32)
+    for cluster in CLUSTER_SIZES:
+        for threads in (256, 512, 1024):
+            smem = cluster_kernel_mod.cluster_kernel_smem_bytes(cluster, threads)
+            # Fits 2 CTAs/SM comfortably inside 228 KiB standard SMEM on SM100/SM107.
+            assert 65536 <= smem <= 96 * 1024
+            assert smem * 2 <= 228 * 1024
+            # Verify kernel constructor accepts every valid power-of-two cluster in 2..32.
+            k = cluster_kernel_mod.ClusterRadixTopkDecodeKernel(4, cluster, threads, 2, True)
+            assert k.C == cluster and k.T == threads
+
+    for kwargs in (
+        {"cluster": 64},
+        {"cluster": 12},
+        {"threads": 128},
+        {"unroll": 3},
+        {"next_n": 2},
+        {"min_blocks": 3},
+    ):
+        with pytest.raises(ValueError, match="cluster radix requires"):
+            build_cluster(0, **kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cluster", [8, 16, 32])
+@pytest.mark.parametrize("end", [512, 2048, 2049, 16384, 20480, 262144, 780000, 1048584])
+def test_cluster_slice_partition_and_ring_bijection_cpu(cluster, end):
+    """Verify slice geometry, 8-float alignment, complete disjoint coverage of [0, end), and
+    rank-staggered DSMEM ring bijection for cluster=8/16/32 across short through 780K/1M."""
+    span = ((end + cluster - 1) // cluster + 7) // 8 * 8
+    assert span % 8 == 0
+    covered = 0
+    prev_hi = 0
+    for rank in range(cluster):
+        lo = min(rank * span, end)
+        hi = min(lo + span, end)
+        assert lo % 8 == 0 or lo == end
+        assert lo == prev_hi
+        assert lo <= hi <= end
+        covered += hi - lo
+        prev_hi = hi
+        # Rank-staggered peer ring visits every peer rank in {0..cluster-1} exactly once.
+        peers = [(rank + r) & (cluster - 1) for r in range(cluster)]
+        assert peers[0] == rank
+        assert sorted(peers) == list(range(cluster))
+    assert covered == end
+    assert prev_hi == end
+    # At rows=4 on VR200 (212 SMs), every width >= 20480 hits the 10-partition split contract.
+    if end >= 20480:
+        assert blocks_per_row(4, end, 212) == 10
+
+
+# ============================================================================
+# SM107 GPU correctness, edge-case, and CUDA Graph replay tests (VR200 ready)
+# ============================================================================
+
+
+@pytest.fixture(scope="module")
+def _custom_ops():
+    if _IS_SM107:
+        import tensorrt_llm._torch.custom_ops  # noqa: F401
+
+
+def _build_or_skip_cluster(device: int, **config) -> CompiledClusterRadixTopkDecode:
+    cluster = config.get("cluster", 8)
+    try:
+        return build_cluster(device, **config)
+    except RuntimeError as exc:
+        if cluster > 8:
+            pytest.skip(f"device does not support non-portable cluster={cluster}: {exc}")
+        raise
 
 
 def _buffers(batch, width, next_n=4):
@@ -114,19 +349,19 @@ def _same_sets(logits, lengths, output, reference, next_n=4):
 
 def _dep4_lengths(width):
     """Sixteen KV lengths a DSpark scorer row of `width` columns holds: the shortest legal
-    request, the top-k edge, the ten-block edge, the slice edges, half the row and the full
-    row."""
+    request, short/512, top-k edge, ten-block edge, 16K/256K/780K slices and the full row."""
     return [
-        *(3, 4, 5, 2047, 2048, 2049, 2051, 20479, 20480, 20481, 32769),
-        *(width // 2 + 1, width - 9, width - 8, width - 1, width),
+        *(3, 4, 512, 2047, 2048, 2049, 16384, 20479, 20480, 20481, 32769),
+        *(min(262144, width), min(780000, width), width - 8, width - 1, width),
     ]
 
 
+@_requires_sm107
 @pytest.mark.parametrize("config", _CONFIGS)
 @pytest.mark.parametrize("seed,kind", [(0, "ordinary"), (17, "ties"), (42, "boundaries")])
 @pytest.mark.parametrize("batch,width", [(1, 32776), (4, 65536), (16, 1048584)])
-def test_cluster_radix_causal_selection(config, seed, kind, batch, width):
-    compiled = build_cluster(torch.cuda.current_device(), **config)
+def test_cluster_radix_causal_selection(_custom_ops, config, seed, kind, batch, width):
+    compiled = _build_or_skip_cluster(torch.cuda.current_device(), **config)
     logits, output, aux_i, aux_l = _buffers(batch, width)
     edges = _dep4_lengths(width)
     for offset in range(0, len(edges), batch):
@@ -141,12 +376,29 @@ def test_cluster_radix_causal_selection(config, seed, kind, batch, width):
         _check(logits, lengths, output)
 
 
-@pytest.mark.parametrize("config", _CONFIGS[:2])
-@pytest.mark.parametrize("length", [20481, 300001, 1048584])
-def test_cluster_radix_wide_threshold_bin(config, length):
+@_requires_sm107
+@pytest.mark.parametrize("cluster", [8, 16, 32])
+@pytest.mark.parametrize("length", [512, 2048, 16384, 262144, 780000, 1048584])
+@pytest.mark.parametrize("kind", ["ordinary", "ties", "dense"])
+def test_cluster_radix_c1_rows4_lengths(_custom_ops, cluster, length, kind):
+    """Exact Top-2048 for c=1 (rows=4, next_n=4) across cluster=8/16/32 and 512..780K..1M."""
+    compiled = _build_or_skip_cluster(torch.cuda.current_device(), cluster=cluster)
+    logits, output, aux_i, aux_l = _buffers(1, 1048584)
+    lengths = [length]
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    _fill(logits, lengths, 4, 13 + cluster, kind)
+    output.fill_(-7)
+    cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+    _check(logits, lengths, output)
+
+
+@_requires_sm107
+@pytest.mark.parametrize("config", _CONFIGS[:2] + [dict(cluster=16), dict(cluster=32)])
+@pytest.mark.parametrize("length", [20481, 300001, 780000, 1048584])
+def test_cluster_radix_wide_threshold_bin(_custom_ops, config, length):
     """Scores sharing their first 12 key bits: the first digit's threshold bin holds every
     column, so the select narrows over the slices (and gathers or claims the tie group)."""
-    compiled = build_cluster(torch.cuda.current_device(), **config)
+    compiled = _build_or_skip_cluster(torch.cuda.current_device(), **config)
     logits, output, aux_i, aux_l = _buffers(1, 1048584)
     for kind in ("dense", "ties"):
         lengths = [length]
@@ -157,11 +409,12 @@ def test_cluster_radix_wide_threshold_bin(config, length):
         _check(logits, lengths, output)
 
 
+@_requires_sm107
 @pytest.mark.parametrize("seed,kind", [(0, "ordinary"), (17, "ties"), (3, "dense")])
-def test_cluster_radix_matches_split_selector(seed, kind):
-    """dep4's largest graph batch (64 rows) at its 1M width: the split selector's sets."""
+def test_cluster_radix_matches_split_selector(_custom_ops, seed, kind):
+    """Largest graph batch (64 rows) at 1M width: exact match with the split selector's sets."""
     device = torch.cuda.current_device()
-    compiled = build_cluster(device)
+    compiled = build_cluster_variants(device)
     split = build_split(device)
     width = 1048584
     logits, output, aux_i, aux_l = _buffers(16, width)
@@ -175,13 +428,15 @@ def test_cluster_radix_matches_split_selector(seed, kind):
     _same_sets(logits, lengths, output, reference)
 
 
+@_requires_sm107
+@pytest.mark.parametrize("cluster", [8, 16, 32])
 @pytest.mark.parametrize("length,seed", [(5, 0), (2049, 17), (65536, 42), (400003, 7)])
-def test_cluster_radix_nonfinite_semantics(length, seed):
+def test_cluster_radix_nonfinite_semantics(_custom_ops, cluster, length, seed):
     """NaN, inf, -inf, -FLT_MAX and -0.0 in the windows: a row holding a negative NaN takes the
     split selector's code, the others the cluster select; both give the split selector's sets
     (key for key, -FLT_MAX columns and pads alike)."""
     device = torch.cuda.current_device()
-    compiled = build_cluster(device)
+    compiled = _build_or_skip_cluster(device, cluster=cluster)
     split = build_split(device)
     logits, output, aux_i, aux_l = _buffers(2, 1048584)
     lengths = [length, length]
@@ -209,17 +464,16 @@ def test_cluster_radix_nonfinite_semantics(length, seed):
     _same_sets(logits, lengths, output, reference)
 
 
-def test_cluster_radix_selector_contract():
-    """The output layout the dep4 sparse MLA decode reads (its per-row `topk_length`), on a
-    graph batch of 16 with padding dummies: for finite scores, exactly min(max(end, 0), 2048)
-    distinct columns of [0, end) first, -1 after them, whatever the columns past `end` hold; a
-    dummy (kv_len next_n) selects {0..t} in its row t. -FLT_MAX columns count as columns. A row
-    holding a negative NaN (the split selector's code) keeps the layout: distinct in-window
-    columns first, then -1."""
-    compiled = build_cluster(torch.cuda.current_device())
+@_requires_sm107
+def test_cluster_radix_selector_contract(_custom_ops):
+    """The output layout sparse MLA decode reads on a graph batch of 16 with padding dummies:
+    for finite scores, exactly min(max(end, 0), 2048) distinct columns of [0, end) first, -1
+    after them, whatever the columns past `end` hold; a dummy (kv_len next_n) selects {0..t} in
+    its row t. -FLT_MAX columns count as columns."""
+    compiled = build_cluster_variants(torch.cuda.current_device())
     width = 1048584
     logits, output, aux_i, aux_l = _buffers(16, width)
-    lengths = [3, 4, 4, 4, 5, 1000, 2048, 2051, 20481, 133337, 300001, 777777, width, 4, 4, 4]
+    lengths = [3, 4, 4, 4, 5, 512, 2048, 2051, 16384, 133337, 262144, 780000, width, 4, 4, 4]
     lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     generator = torch.Generator(device="cuda").manual_seed(9)
     logits.fill_(float("nan"))
@@ -252,21 +506,23 @@ def test_cluster_radix_selector_contract():
             assert sorted(valid.tolist()) == list(range(row % 4 + 1))
 
 
-@pytest.mark.parametrize("batch", [16, 20, 24, 32])
-def test_cluster_radix_graph_replay(batch):
-    """dep4 graph batches 16..32 (64..128 rows) at 1048584 columns, captured once and
-    replayed over new lengths and scores."""
-    compiled = build_cluster(torch.cuda.current_device())
+@_requires_sm107
+@pytest.mark.parametrize("batch", [1, 2, 16, 20, 24, 32])
+def test_cluster_radix_graph_replay(_custom_ops, batch):
+    """Graph batches 1 (c=1, widest cluster), 2 (c=2), and 16..32 (64..128 rows) at 1M width,
+    captured once through `build_cluster_variants` and replayed over 512..780K..1M lengths."""
+    variants = build_cluster_variants(torch.cuda.current_device())
     width = 1048584
     logits, output, aux_i, aux_l = _buffers(batch, width)
-    edges = (_dep4_lengths(width) * 2)[:batch]
-    lens = torch.tensor(edges, dtype=torch.int32, device="cuda")
-    _fill(logits, edges, 4, 0, "ordinary")
+    edges = (_dep4_lengths(width) * 2)[: max(batch, len(_dep4_lengths(width)))]
+    lengths = edges[:batch]
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    _fill(logits, lengths, 4, 0, "ordinary")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+        cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=variants)
     for replay in range(4):
-        lengths = edges[replay + 1 :] + edges[: replay + 1]
+        lengths = [edges[(replay * 3 + b) % len(edges)] for b in range(batch)]
         _fill(logits, lengths, 4, replay, ("ordinary", "ties", "boundaries", "dense")[replay])
         lens.copy_(torch.tensor(lengths, dtype=torch.int32))
         output.fill_(-7)
@@ -274,7 +530,8 @@ def test_cluster_radix_graph_replay(batch):
         _check(logits, lengths, output)
 
 
-def test_cluster_radix_empty_slice_pass2_skip():
+@_requires_sm107
+def test_cluster_radix_empty_slice_pass2_skip(_custom_ops):
     """Long row whose top-2048 values all live in the first CTA slice so all other slices
     have my_above == 0 and my_eq == 0 and skip Pass 2."""
     compiled = build_cluster(torch.cuda.current_device())
@@ -292,14 +549,15 @@ def test_cluster_radix_empty_slice_pass2_skip():
     _check(logits, lengths, output)
 
 
+@_requires_sm107
 @pytest.mark.parametrize("layout", ["unaligned_rows", "unaligned_width", "eight_blocks"])
-def test_cluster_radix_native_shapes(layout):
+def test_cluster_radix_native_shapes(_custom_ops, layout):
     """The shapes the split selector leaves to the op take the op here too."""
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.indexer_topk_decode import (
         indexer_topk_decode as native_topk,
     )
 
-    compiled = build_cluster(torch.cuda.current_device())
+    compiled = build_cluster_variants(torch.cuda.current_device())
     _, output, aux_i, aux_l = _buffers(1, 65536)
     storage = torch.empty(4 * 65536 + 9, dtype=torch.float32, device="cuda")
     offset = 1 if layout == "unaligned_rows" else 8
@@ -318,17 +576,9 @@ def test_cluster_radix_native_shapes(layout):
     _check(logits, lengths, output)
 
 
-def test_cluster_radix_rejects_invalid_inputs():
+@_requires_sm107
+def test_cluster_radix_rejects_invalid_cuda_inputs(_custom_ops):
     device = torch.cuda.current_device()
-    for kwargs in (
-        {"cluster": 32},
-        {"threads": 128},
-        {"unroll": 3},
-        {"next_n": 2},
-        {"min_blocks": 3},
-    ):
-        with pytest.raises(ValueError, match="cluster radix requires"):
-            build_cluster(device, **kwargs)
     compiled = build_cluster(device)
     logits, output, aux_i, aux_l = _buffers(1, 16384)
     lens = torch.tensor([16384], dtype=torch.int32, device="cuda")
@@ -342,62 +592,3 @@ def test_cluster_radix_rejects_invalid_inputs():
     lens = torch.full((33,), 16384, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="at most 128 rows"):
         cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
-
-
-@pytest.mark.parametrize("batch", [16, 20, 24, 32])
-def test_dynamic_radix_graph_replay_and_state_self_clean(batch):
-    """Dynamic cluster=(1,1,1) selector across b16..b32: exact set match against split selector,
-    CUDA Graph replay across varying KV distributions, and L2 state restored to all-zeros."""
-    device = torch.cuda.current_device()
-    compiled = build_dynamic(device, min_blocks=1)
-    split = build_split(device)
-    width = 1048584
-    logits, output, aux_i, aux_l = _buffers(batch, width)
-    edges = (_dep4_lengths(width) * 2)[:batch]
-    lens = torch.tensor(edges, dtype=torch.int32, device="cuda")
-    _fill(logits, edges, 4, 0, "ordinary")
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        dynamic_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
-    reference = torch.empty_like(output)
-    for replay in range(4):
-        lengths = edges[replay + 1 :] + edges[: replay + 1]
-        _fill(logits, lengths, 4, replay, ("ordinary", "ties", "boundaries", "dense")[replay])
-        lens.copy_(torch.tensor(lengths, dtype=torch.int32))
-        output.fill_(-7)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert int(compiled.state.count_nonzero().item()) == 0, "L2 state not restored to zero"
-        split_radix_topk_decode(logits, lens, reference, aux_i, aux_l, compiled=split)
-        _same_sets(logits, lengths, output, reference)
-
-
-@pytest.mark.parametrize("length,seed", [(5, 0), (2049, 17), (65536, 42), (400003, 7)])
-def test_dynamic_radix_nonfinite_and_negnan_fallback(length, seed):
-    """Dynamic selector preserves exact -NaN 10-partition fallback and restores L2 state to zero."""
-    device = torch.cuda.current_device()
-    compiled = build_dynamic(device, min_blocks=1)
-    split = build_split(device)
-    logits, output, aux_i, aux_l = _buffers(2, 1048584)
-    lengths = [length, length]
-    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-    _fill(logits, lengths, 4, seed, "ordinary")
-    patterns = torch.tensor(
-        [0x7FC00000, 0x7F800000, -0x400000, -0x800000, -0x800001, -0x80000000],
-        dtype=torch.int32,
-        device="cuda",
-    ).view(torch.float32)
-    for row in range(8):
-        end = _end(lengths, row)
-        positions = torch.arange(row % 4, end, 19, device="cuda")
-        values = patterns[torch.arange(positions.numel(), device="cuda") % 6]
-        if row >= 4:
-            values = torch.where(values.view(torch.int32) == -0x400000, 0.5, values)
-        logits[row, positions] = values
-    reference = torch.empty_like(output)
-    split_radix_topk_decode(logits, lens, reference, aux_i, aux_l, compiled=split)
-    output.fill_(-7)
-    dynamic_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
-    torch.cuda.synchronize()
-    assert int(compiled.state.count_nonzero().item()) == 0
-    _same_sets(logits, lengths, output, reference)

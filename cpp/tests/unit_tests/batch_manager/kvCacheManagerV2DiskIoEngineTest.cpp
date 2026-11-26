@@ -424,3 +424,56 @@ TEST_F(DiskIoEngineTest, RejectsBadOptions)
     options.ringSize = 8;
     EXPECT_THROW(kv::DiskIoEngine(options, nullptr), std::invalid_argument);
 }
+
+TEST_F(DiskIoEngineTest, RequiredWritesPreemptBackgroundWrites)
+{
+    TempFile file(2 * kPage, false);
+    auto engine = makeEngine(1, /*numWritePreferring=*/1);
+    auto backgroundData = alignedBuffer(kPage);
+    auto requiredData = alignedBuffer(kPage);
+    fillPattern(backgroundData.get(), kPage, 10);
+    fillPattern(requiredData.get(), kPage, 20);
+
+    engine->setPausedForTest(true);
+    auto const bg = engine->submit(
+        kv::DiskIoKind::kWrite, pageOps(file.fd(), backgroundData.get(), 1), true, kv::DiskIoPriority::kBackground);
+    auto const req = engine->submit(
+        kv::DiskIoKind::kWrite, pageOps(file.fd(), requiredData.get(), 1), true, kv::DiskIoPriority::kRequired);
+    engine->setPausedForTest(false);
+    ASSERT_EQ(engine->wait(req), kv::DiskIoStatus::kOk);
+    ASSERT_EQ(engine->wait(bg), kv::DiskIoStatus::kOk);
+
+    // Required ran first and background overwrote the same slot afterwards.
+    auto check = alignedBuffer(kPage);
+    ASSERT_EQ(kv::diskReadAll(file.fd(), 0, check.get(), kPage), 0);
+    EXPECT_EQ(std::memcmp(backgroundData.get(), check.get(), kPage), 0);
+
+    auto const stats = engine->takeStats();
+    EXPECT_EQ(stats.writeBytes, 2 * kPage);
+    EXPECT_EQ(stats.requiredWriteBytes, kPage);
+}
+
+TEST_F(DiskIoEngineTest, AgedRequiredWriteRunsAheadOfReads)
+{
+    TempFile file(2 * kPage, false);
+    auto engine = makeEngine(1, /*numWritePreferring=*/0);
+    auto oldData = alignedBuffer(kPage);
+    auto newData = alignedBuffer(kPage);
+    auto readBack = alignedBuffer(kPage);
+    fillPattern(oldData.get(), kPage, 31);
+    fillPattern(newData.get(), kPage, 42);
+    ASSERT_EQ(kv::diskWriteAll(file.fd(), 0, oldData.get(), kPage), 0);
+
+    engine->setPausedForTest(true);
+    auto const write = engine->submit(
+        kv::DiskIoKind::kWrite, pageOps(file.fd(), newData.get(), 1), true, kv::DiskIoPriority::kRequired);
+    // Let the required write wait past kRequiredWriteMaxWaitNs (10 ms) before unpausing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    auto const read = engine->submit(kv::DiskIoKind::kRead, pageOps(file.fd(), readBack.get(), 1), true);
+    engine->setPausedForTest(false);
+    ASSERT_EQ(engine->wait(write), kv::DiskIoStatus::kOk);
+    ASSERT_EQ(engine->wait(read), kv::DiskIoStatus::kOk);
+
+    // The aged required write ran ahead of the read on the read-preferring worker.
+    EXPECT_EQ(std::memcmp(newData.get(), readBack.get(), kPage), 0);
+}

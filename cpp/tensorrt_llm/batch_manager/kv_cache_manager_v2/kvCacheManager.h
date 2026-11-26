@@ -160,6 +160,12 @@ public:
     std::optional<BlockKey> probeFirstNewBlockKey(
         ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
+    // Read-only check whether the matched prefix currently has any page on a disk tier or with an
+    // in-flight disk read. Used by the onboarding gate when onboarding slots are full so disk-hit
+    // requests wait for a slot instead of bypassing into synchronous resume-time reads.
+    [[nodiscard]] bool hasDiskResidentPrefix(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+
     // ---- Memory pool queries -----------------------------------------------
 
     // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base

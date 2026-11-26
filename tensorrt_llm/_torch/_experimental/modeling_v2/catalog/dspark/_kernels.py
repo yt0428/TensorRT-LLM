@@ -192,6 +192,71 @@ def latent_tail_kernel(
 
 
 @triton.jit
+def query_rope_tail_kernel(
+    q_ptr,
+    q_s_row,
+    query_ptr,
+    query_s_row,
+    pos_ptr,
+    rope_ptr,
+    HEADS: tl.constexpr,
+    NOPE: tl.constexpr,
+    QK: tl.constexpr,
+    LAT: tl.constexpr,
+    PE: tl.constexpr,
+):
+    """Row ``r``: write each head's ``query[r, h, LAT:] = rope(q[r, h, NOPE:])``.
+
+    Split from ``latent_tail_kernel`` so the draft block's Q path can run on
+    the main stream concurrently with ``kv_a`` + ``latent_tail_kernel(HAS_Q=False)``
+    on an auxiliary stream without sharing any write target.
+    """
+    r = tl.program_id(0).to(tl.int64)
+    half = tl.arange(0, PE // 2)
+    pos = tl.load(pos_ptr + r).to(tl.int64)
+    cos = tl.load(rope_ptr + pos * PE + half)
+    sin = tl.load(rope_ptr + pos * PE + PE // 2 + half)
+    h = tl.arange(0, HEADS)
+    q = q_ptr + r * q_s_row + h[:, None] * QK + NOPE
+    even = tl.load(q + 2 * half[None, :]).to(tl.float32)
+    odd = tl.load(q + 2 * half[None, :] + 1).to(tl.float32)
+    c = cos[None, :]
+    s = sin[None, :]
+    dst = query_ptr + r * query_s_row + h[:, None] * (LAT + PE) + LAT
+    tl.store(dst + 2 * half[None, :], (even * c - odd * s).to(tl.bfloat16))
+    tl.store(dst + 2 * half[None, :] + 1, (even * s + odd * c).to(tl.bfloat16))
+
+
+@triton.jit
+def embed_draft_block_kernel(
+    anchors_ptr,
+    emb_ptr,
+    masks_ptr,
+    out_ptr,
+    vocab,
+    BLOCK: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HID_BLOCK: tl.constexpr,
+):
+    """``out[b, 0] = emb[anchors[b]]`` (zero if off-vocab); ``out[b, j > 0] = masks[j - 1]``."""
+    tok = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1).to(tl.int64)
+    b = tok // BLOCK
+    j = tok % BLOCK
+    d = tile * HID_BLOCK + tl.arange(0, HID_BLOCK)
+    dmask = d < HIDDEN
+    if j == 0:
+        anchor = tl.load(anchors_ptr + b).to(tl.int64)
+        valid = (anchor >= 0) & (anchor < vocab)
+        idx = tl.where(valid, anchor, 0)
+        vals = tl.load(emb_ptr + idx * HIDDEN + d, mask=dmask, other=0.0)
+        vals = tl.where(valid, vals, tl.zeros_like(vals))
+    else:
+        vals = tl.load(masks_ptr + (j - 1) * HIDDEN + d, mask=dmask, other=0.0)
+    tl.store(out_ptr + tok * HIDDEN + d, vals, mask=dmask)
+
+
+@triton.jit
 def markov_input_kernel(
     prev_ptr,
     emb_ptr,

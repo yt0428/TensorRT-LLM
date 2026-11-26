@@ -4749,7 +4749,10 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+_DEFAULT_TORCH_MEM_SAFETY_MARGIN = 32 * 1024**2
+
+
+def _adjust_torch_mem_fraction(safety_margin: Optional[int] = None):
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -4787,7 +4790,9 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
-    safety_margin = 32 * 1024**2
+    if safety_margin is None:
+        safety_margin = _DEFAULT_TORCH_MEM_SAFETY_MARGIN
+    safety_margin = min(safety_margin, mem_free)
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(

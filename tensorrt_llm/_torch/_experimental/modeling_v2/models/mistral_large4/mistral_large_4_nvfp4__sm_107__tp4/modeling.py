@@ -119,14 +119,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_in
     cute_dsl_indexer_q_side_fused,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    DEFAULT_VERIFY_CLUSTERS,
+    cluster_radix_topk_decode,
+    cute_dsl_radix_topk_decode,
+    reachable_cluster_sizes,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    build_split as build_ix_topk_verify,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
-    cute_dsl_radix_topk_decode,
-    split_radix_topk_decode,
+    build_cluster_variants as build_ix_topk_verify,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather_tiled import (
     ds_mla_dequant_gather_tiled,
@@ -167,10 +169,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
     triton_draft_attention,
+    triton_embed_draft_block,
     triton_latent_tail,
     triton_markov_gate,
     triton_markov_input,
     triton_markov_logits,
+    triton_query_rope_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
@@ -201,6 +205,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     get_indexer_mqa_logits_workspace_bytes,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed import allgather as tp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds,
@@ -208,10 +213,18 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream,
+    maybe_execute_in_parallel,
+)
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabParallelHead,
+    rnn_markov_chain_tokens,
+)
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.flash_mla import get_mla_metadata
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -225,8 +238,27 @@ from .ops.comm.moe_tail_allreduce import (
 )
 from .ops.comm.symm_logits_gather import build_workspace as build_logits_gather
 from .ops.comm.symm_logits_gather import symm_logits_gather_softcap
+from .ops.dsa._hist_topk import (
+    DG_SCHEDULE_BLOCK_KV,
+    ISS_WORLD_SIZES,
+    MAX_SHARD,
+    SHARD_ALIGN,
+    default_iss_min_ctx_len,
+    get_hist_topk_workspace,
+    hist_topk_supported,
+    shard_capacity,
+    should_use_iss,
+)
+from .ops.dsa.hist_shard_meta import hist_shard_meta
+from .ops.dsa.hist_topk import hist_topk
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
+from .ops.gemm.ml4_mx_gemv import ml4_mx_gemv, ml4_mx_gemv_swiglu
+from .ops.gemm.ml4_mx_gemv import precompile as precompile_ml4_gemv
+from .ops.moe.ml4_moe_kernel import SUPPORTED_INTER as _ML4_MOE_SUPPORTED_INTER
+from .ops.moe.ml4_moe_kernel import Ml4MoeLayer, Ml4MoeState, ml4_moe_engine
+from .ops.moe.ml4_moe_kernel import is_supported as _ml4_moe_is_supported
+from .runtime_hooks import make_ml4_runtime_hooks
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -343,16 +375,20 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # exits the process, raising nothing, past 11622 one-row sequences on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
-# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and ten
-# partitions plus a radix merge for DSpark verification from 20480 columns (the narrowest
-# row the native op splits into ten blocks) to 1048584 (the split kernel's widest row).
-# split_radix_topk_decode keeps the native op for a call the op would not split into ten
-# blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
+# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and one thread-block
+# cluster per row (`cluster_radix_topk_decode`, 8/16/32 CTAs per row chosen by `(rows, width)`
+# and device cluster support) for DSpark verification from 20480 columns (the narrowest row the
+# native op splits into ten blocks) to 1048584 (the selector's widest row) across graph batches
+# 1..16 (4..64 rows). `cluster_radix_topk_decode` keeps the native op for a call the op would
+# not split into ten blocks, or whose rows are not 32-byte aligned with a width multiple of 8.
 # Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
-_TOPK_VERIFY_ROWS = (4, 8, 16)
+_TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
+_TOPK_VERIFY_CLUSTERS = DEFAULT_VERIFY_CLUSTERS
+
+
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -376,6 +412,14 @@ _LOGITS_GATHER_ROWS = 64
 # The gather's buffer slot per caller: one target and one draft gather a step.
 _TARGET_LOGITS_SLOT = 0
 _DRAFT_LOGITS_SLOT = 1
+# Maximum decode tokens per step served by the persistent CuTe DSL MoE kernel.
+_ML4_MOE_ENGINE_MAX_TOKENS = 8
+
+
+def _cublas_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    return cublas_mm(x, weight.t(), bias, None)
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -664,10 +708,15 @@ def _layer_views(core: "MistralLarge4Tp4ModelingV2") -> list[SimpleNamespace]:
         if i >= core.dense_layers:
             moe = SimpleNamespace(
                 router=w[p + "router"].t(),
+                router_raw=w[p + "router"],
                 fc1_w=w[p + "fc1_w"],
                 fc1_s=w[p + "fc1_s"],
                 fc2_w=w[p + "fc2_w"],
                 fc2_s=w[p + "fc2_s"],
+                placed_fc1_w=None,
+                placed_fc1_s=None,
+                placed_fc2_w=None,
+                placed_fc2_s=None,
                 **vars(_moe_scalars(w[p + "isc1"], w[p + "isc2"], w[p + "ws2_13"], w[p + "ws2_2"])),
             )
         layers.append(
@@ -795,6 +844,11 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         # The prefill scorer's handle, built on the first step.
         self._ix_logits = None
         self._ix_topk_verify = None
+        self._hist_workspace = None
+        self._hist_buffers = None
+        self._iss_stats = dict(capture=0, eager_hit=0, eager_miss=0)
+        self._iss_logged_capture = False
+        self._iss_logged_eager_hit = False
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
@@ -821,6 +875,34 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         # the MPI session's, or the TP process group's when MPI is disabled.
         mapping = self.model_config.mapping
         self.tp_pg = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+        if self.tp_size in ISS_WORLD_SIZES and hist_topk_supported(mapping):
+            self._hist_workspace = get_hist_topk_workspace(mapping)
+            if self.tp_rank == 0:
+                import atexit
+
+                logger.info(
+                    f"[ML4-ISS] workspace ready: tp_size={self.tp_size}, "
+                    f"l_thresh={default_iss_min_ctx_len(self.tp_size)}"
+                )
+
+                def _log_iss_exit(
+                    ws=self._hist_workspace,
+                    stats=self._iss_stats,
+                    n_idx=len(self.indexer_layers),
+                    tp=self.tp_size,
+                ) -> None:
+                    try:
+                        exchanges = int(ws.state[:2].view(torch.int64).item()) // 64
+                        logger.info(
+                            f"[ML4-ISS] summary tp_size={tp}: gpu_hist_exchanges={exchanges}, "
+                            f"est_iss_steps={exchanges / max(n_idx, 1):.1f}, "
+                            f"capture={stats['capture']}, eager_hit={stats['eager_hit']}, "
+                            f"eager_miss={stats['eager_miss']}"
+                        )
+                    except Exception:
+                        pass
+
+                atexit.register(_log_iss_exit)
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -895,9 +977,16 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         lo, hi = _TOPK_VERIFY_COLUMNS
         if not (_TOPK_DECODE_CUTE_DSL and lo <= self._max_ctx_len <= hi and self.idx_topk == 2048):
             self._ix_topk_verify = None
-        elif self._ix_topk_verify is None:
+        else:
+            sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
+            clusters = reachable_cluster_sizes(
+                _TOPK_VERIFY_ROWS, self._max_ctx_len, sm_count, _TOPK_VERIFY_CLUSTERS
+            )
             self._ix_topk_verify = build_ix_topk_verify(
-                dev, next_n=4, use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+                dev,
+                next_n=4,
+                clusters=clusters,
+                use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0",
             )
         # Both key-pool layouts: a launcher compiled for a contiguous view addresses a strided
         # one as if it were dense.
@@ -906,7 +995,138 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                 contiguous: build_ix_k_cache(dev, is_neox=False, cache_contiguous=contiguous)
                 for contiguous in (False, True)
             }
+        if (
+            self._hist_workspace is not None
+            and md.tokens_per_block > 0
+            and (SHARD_ALIGN % md.tokens_per_block == 0)
+        ):
+            cap = min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
+            if cap > 0:
+                self._ensure_hist_buffers(cap, md.tokens_per_block, torch.device("cuda", dev))
         self._derived_for = md.kv_cache_manager
+
+    def _ensure_hist_buffers(
+        self, capacity: int, tokens_per_block: int, device: torch.device
+    ) -> dict:
+        """Allocate or reuse persistent ISS shard-metadata buffers for CUDA-graph stability."""
+        buffers = self._hist_buffers
+        if (
+            buffers is None
+            or buffers["capacity"] < capacity
+            or buffers["tokens_per_block"] != tokens_per_block
+            or buffers["shard_ctx"].device != device
+        ):
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            self._hist_buffers = dict(
+                capacity=capacity,
+                tokens_per_block=tokens_per_block,
+                shard_ctx=torch.zeros(1, dtype=torch.int32, device=device),
+                shard_block_table=torch.zeros(
+                    (1, -(-capacity // tokens_per_block)), dtype=torch.int32, device=device
+                ),
+                schedule=torch.zeros((sms + 1, 2), dtype=torch.int32, device=device),
+                sms=sms,
+            )
+            buffers = self._hist_buffers
+        return buffers
+
+    def _prepare_iss_step(self, step: dict, rows: int, skip_gen: bool) -> dict | None:
+        """Prepare rank-local key-shard metadata once per decode step when ISS-8/16 is active."""
+        num_seqs = step["num_seqs"]
+        kv_len = int(step["kv_lens_host"][0]) if num_seqs == 1 else 0
+        capturing = torch.cuda.is_current_stream_capturing()
+        tokens_per_block = step["tokens_per_block"]
+        l_thresh = default_iss_min_ctx_len(self.tp_size)
+        if not should_use_iss(
+            kv_len,
+            self._max_ctx_len,
+            num_seqs,
+            rows,
+            self.tp_size,
+            tokens_per_block,
+            l_thresh,
+            capturing=capturing,
+            has_workspace=self._hist_workspace is not None,
+            skip_gen=skip_gen,
+        ):
+            if not capturing and hasattr(self, "_iss_stats"):
+                self._iss_stats["eager_miss"] += 1
+            return None
+        cap = (
+            shard_capacity(self._max_ctx_len, self.tp_size)
+            if capturing
+            else min(shard_capacity(self._max_ctx_len, self.tp_size), MAX_SHARD)
+        )
+        if hasattr(self, "_iss_stats"):
+            if capturing:
+                self._iss_stats["capture"] += 1
+                if self.tp_rank == 0 and not getattr(self, "_iss_logged_capture", False):
+                    self._iss_logged_capture = True
+                    logger.info(
+                        f"[ML4-ISS] captured ISS-{self.tp_size} decode graph: rows={rows}, "
+                        f"cap={cap}, max_ctx_len={self._max_ctx_len}, l_thresh={l_thresh}, "
+                        f"tpb={tokens_per_block}"
+                    )
+            else:
+                self._iss_stats["eager_hit"] += 1
+                if self.tp_rank == 0 and not getattr(self, "_iss_logged_eager_hit", False):
+                    self._iss_logged_eager_hit = True
+                    logger.info(
+                        f"[ML4-ISS] eager ISS-{self.tp_size} activated: kv_len={kv_len}, "
+                        f"rows={rows}, cap={cap}, l_thresh={l_thresh}"
+                    )
+        kv_lens_cuda = step["kv_lens_cuda"][:1]
+        buffers = self._ensure_hist_buffers(cap, tokens_per_block, kv_lens_cuda.device)
+        hist_shard_meta(
+            kv_lens_cuda,
+            step["indexer_k_cache_block_offsets"][0],
+            buffers["shard_ctx"],
+            buffers["shard_block_table"],
+            self.tp_size,
+            self.tp_rank,
+            tokens_per_block,
+        )
+        buffers["schedule"].copy_(
+            get_paged_mqa_logits_metadata(
+                buffers["shard_ctx"].view(-1, 1), DG_SCHEDULE_BLOCK_KV, buffers["sms"]
+            ),
+            non_blocking=True,
+        )
+        return buffers
+
+    def _select_indexer_topk(
+        self,
+        logits: torch.Tensor,
+        kv_lens: torch.Tensor,
+        indices: torch.Tensor,
+        next_n: int,
+        aux_indices: torch.Tensor,
+        aux_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select generation-row top-k indices for their static shape.
+
+        Centralizes decode top-k dispatch (1-launch cluster radix at next_n=4 with automatic
+        8/16/32-CTA CGA selection, 1-CTA radix at next_n=1, or the native op) so long-context
+        distributed selectors can hook in at one place.
+        """
+        lo, hi = _TOPK_VERIFY_COLUMNS
+        if (
+            self._ix_topk_verify is not None
+            and next_n == 4
+            and logits.shape[0] in _TOPK_VERIFY_ROWS
+            and lo <= logits.shape[1] <= hi
+            and logits.dtype == torch.float32
+        ):
+            return cluster_radix_topk_decode(
+                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
+            )
+        if next_n != 1 or self._ix_topk is None:
+            return indexer_topk_decode(
+                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
+            )
+        return cute_dsl_radix_topk_decode(
+            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        )
 
     def _select_indexer_decode(
         self,
@@ -918,23 +1138,11 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         aux_logits: torch.Tensor,
     ) -> torch.Tensor:
         """Select generation rows with the compiled selector for their static shape."""
-        lo, hi = _TOPK_VERIFY_COLUMNS
-        if (
-            self._ix_topk_verify is not None
-            and next_n == 4
-            and logits.shape[0] in _TOPK_VERIFY_ROWS
-            and lo <= logits.shape[1] <= hi
-            and logits.dtype == torch.float32
-        ):
-            return split_radix_topk_decode(
-                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
-            )
-        if next_n != 1 or self._ix_topk is None:
-            return indexer_topk_decode(
-                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
-            )
-        return cute_dsl_radix_topk_decode(
-            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        selector = getattr(self, "_select_indexer_topk", None)
+        if selector is not None:
+            return selector(logits, kv_lens, indices, next_n, aux_indices, aux_logits)
+        return MistralLarge4Tp4ModelingV2._select_indexer_topk(
+            self, logits, kv_lens, indices, next_n, aux_indices, aux_logits
         )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
@@ -999,25 +1207,61 @@ def _dspark_block(
     residual = noise_embedding.reshape(rows, hidden).clone()
     normalized = torch.empty_like(residual)
     x = flashinfer_rmsnorm(residual, draft._layers[0].attn_norm, core.eps)
+    flat_positions = query_positions.reshape(rows)
+    split_qkv = noise_embedding.is_cuda
+    if split_qkv:
+        draft._ensure_kv_stream(noise_embedding.device)
     for i, layer in enumerate(draft._layers):
-        q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
-        bmm_out(
-            q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
-            layer.k_b,
-            query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
-        )
-        kv = cublas_mm(x, layer.kv_a, None, None)
-        block_kv = triton_latent_tail(
-            kv,
-            layer.kv_norm.view(1, core.kv_lora),
-            core.eps,
-            query_positions.reshape(rows),
-            draft._rope.indexer,
-            kv.new_empty((batch, block, core.lat_dim)),
-            q=q.view(rows, core.heads * core.qk_dim),
-            query=query,
-            nope=core.nope,
-        )
+        if split_qkv:
+
+            def _q_path():
+                q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
+                bmm_out(
+                    q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
+                    layer.k_b,
+                    query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
+                )
+                triton_query_rope_tail(
+                    q.view(rows, core.heads * core.qk_dim),
+                    flat_positions,
+                    draft._rope.indexer,
+                    query,
+                    nope=core.nope,
+                )
+
+            def _kv_path():
+                kv = cublas_mm(x, layer.kv_a, None, None)
+                return triton_latent_tail(
+                    kv,
+                    layer.kv_norm.view(1, core.kv_lora),
+                    core.eps,
+                    flat_positions,
+                    draft._rope.indexer,
+                    kv.new_empty((batch, block, core.lat_dim)),
+                )
+
+            _, block_kv = maybe_execute_in_parallel(
+                _q_path, _kv_path, draft._kv_fork, draft._kv_join, draft._kv_stream
+            )
+        else:
+            q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
+            bmm_out(
+                q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
+                layer.k_b,
+                query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
+            )
+            kv = cublas_mm(x, layer.kv_a, None, None)
+            block_kv = triton_latent_tail(
+                kv,
+                layer.kv_norm.view(1, core.kv_lora),
+                core.eps,
+                flat_positions,
+                draft._rope.indexer,
+                kv.new_empty((batch, block, core.lat_dim)),
+                q=q.view(rows, core.heads * core.qk_dim),
+                query=query,
+                nope=core.nope,
+            )
         latent = triton_draft_attention(
             query,
             ctx_kv_cache[i][:, 0, 0],
@@ -1037,9 +1281,13 @@ def _dspark_block(
         o = cute_dsl_allreduce_add_rmsnorm(
             partial, residual, layer.ffn_norm, normalized, core._lamport
         )
-        gate = cublas_mm(o, layer.gate, None, None)
-        up = cublas_mm(o, layer.up, None, None)
-        activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
+        gate_up = getattr(layer, "gate_up", None)
+        if gate_up is not None:
+            activated = flashinfer_silu_and_mul(cublas_mm(o, gate_up, None, None))
+        else:
+            gate = cublas_mm(o, layer.gate, None, None)
+            up = cublas_mm(o, layer.up, None, None)
+            activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
         mlp = cublas_mm(activated, layer.down, None, None)
         x = cute_dsl_allreduce_add_rmsnorm(
             mlp, residual, layer.next_norm, normalized, core._lamport
@@ -1600,10 +1848,114 @@ class DecodeTarget:
         self._shared_fork = torch.cuda.Event()
         self._shared_join = torch.cuda.Event()
         # The same for the attention block's query and latent half (`_attention`), beside the
-        # indexer.
+        # indexer. On indexer layers the key half runs ahead of the query half on the side
+        # stream; its events fork it and mark its keys and head weights ready. On layers without
+        # an indexer the owner's latent runs on the main stream instead, and `_latent_ready`
+        # marks it ready for the query half's rope append.
         self._latent_stream = torch.cuda.Stream()
         self._latent_fork = torch.cuda.Event()
         self._latent_join = torch.cuda.Event()
+        self._keys_fork = torch.cuda.Event()
+        self._keys_ready = torch.cuda.Event()
+        self._latent_ready = torch.cuda.Event()
+
+        # Paradigm-B die-aware MoE placement, fused persistent CuTe DSL MoE engine, and
+        # single-launch cluster FP8 GEMV (initialized outside CUDA-graph capture).
+        self._use_ml4_mx_gemv = True
+        self._moe_states: dict[int, Ml4MoeState] = {}
+        self._moe_layers: dict[int, dict[int, Ml4MoeLayer]] = {}
+        self._moe_locality_mode = "none"
+
+        dev = self._norm0.device
+        if dev.type == "cuda":
+            ugpu_info = _weights.place_target_ugpu_weights(
+                self._layers,
+                moe_locality_mode="auto",
+                gemv_ugpu=False,
+                device=dev,
+            )
+            if ugpu_info is not None:
+                self._moe_locality_mode = ugpu_info.moe_locality_mode
+            self._precompile_target_gemv()
+            for m_pre in (1, 2, 3, 4, 8):
+                if m_pre <= min(_ML4_MOE_ENGINE_MAX_TOKENS, core.max_num_tokens):
+                    self._ensure_moe_engine(m_pre)
+
+    def _precompile_target_gemv(self) -> None:
+        """Precompile single-launch ``ml4_mx_gemv`` for the step's target FP8 shapes before
+        CUDA-graph capture."""
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or not self._layers
+            or torch.cuda.get_device_capability(self._norm0.device) != (10, 7)
+        ):
+            return
+        L0 = self._layers[0]
+        ix_layer = next((L for L in self._layers if L.indexer is not None), None)
+        for m in (4, 16):
+            if m > self.core.max_num_tokens:
+                continue
+            precompile_ml4_gemv(L0.wq, L0.wq_s, m)
+            precompile_ml4_gemv(L0.wo, L0.wo_s, m)
+            if L0.moe is None:
+                precompile_ml4_gemv(L0.mlp_gu, L0.mlp_gu_s, m)
+                precompile_ml4_gemv(L0.mlp_dn, L0.mlp_dn_s, m, x_swiglu=True)
+            if ix_layer is not None:
+                precompile_ml4_gemv(ix_layer.indexer.wq_b, ix_layer.indexer.wq_b_s, m)
+
+    def _ensure_moe_engine(self, rows: int) -> bool:
+        """Ensure the persistent ML4 MoE engine state and layer bindings exist for ``rows`` tokens.
+        Returns False when unsupported or unbuilt during CUDA-graph capture."""
+        if rows in self._moe_layers:
+            return True
+        core = self.core
+        if (
+            not (1 <= rows <= _ML4_MOE_ENGINE_MAX_TOKENS)
+            or core.moe_inter not in _ML4_MOE_SUPPORTED_INTER
+            or core.local_experts != core.num_experts
+            or core.expert_offset != 0
+        ):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        dev = self._norm0.device
+        ok, _ = _ml4_moe_is_supported(dev)
+        if not ok:
+            return False
+        state = Ml4MoeState(
+            dev,
+            num_tokens=rows,
+            inter=core.moe_inter,
+            shared_inter=core.moe_inter,
+            shared=True,
+            locality_mode=self._moe_locality_mode,
+        )
+        bound: dict[int, Ml4MoeLayer] = {}
+        for L in self._layers:
+            if L.moe is None:
+                continue
+            m = L.moe
+            bound[L.index] = state.layer(
+                m.fc1_w,
+                m.fc1_s,
+                m.fc2_w,
+                m.fc2_s,
+                m.out1_gate,
+                m.out1,
+                m.out2,
+                m.router_raw,
+                m.gscale,
+                shared_weights=(L.mlp_gu, L.mlp_gu_s, L.mlp_dn, L.mlp_dn_s),
+                placed_fc1_w=m.placed_fc1_w,
+                placed_fc1_s=m.placed_fc1_s,
+                placed_fc2_w=m.placed_fc2_w,
+                placed_fc2_s=m.placed_fc2_s,
+            )
+        self._moe_states[rows] = state
+        self._moe_layers[rows] = bound
+        if bound:
+            state.precompile(next(iter(bound.values())))
+        return True
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
@@ -1624,9 +1976,13 @@ class DecodeTarget:
         step.update(num_contexts=0, num_ctx_tokens=0)
         return step
 
-    def _linear_fp8(self, x, w, w_s):
-        """K128-quantized FP8 linear: activation quantization fused into the GEMM at the
-        (M, N, K) shapes the entry has tuned, the Rubin MXFP8 kernel at every other."""
+    def _linear_fp8(self, x, w, w_s, placed=None):
+        """K128-quantized FP8 linear: single-launch cluster ``ml4_mx_gemv`` when served,
+        else ``cute_dsl_fused_fp8_block_scale_linear`` / Rubin MXFP8."""
+        if getattr(self, "_use_ml4_mx_gemv", False):
+            out = ml4_mx_gemv(x, w, w_s, placed=placed)
+            if out is not None:
+                return out
         return cute_dsl_fused_fp8_block_scale_linear(x, w, w_s)
 
     def _latent(self, x, L, nope_lat):
@@ -1648,28 +2004,57 @@ class DecodeTarget:
         flashinfer_rmsnorm(kv, L.kv_norm, core.eps, out=nope_lat[:, : core.kv_lora])
         return nope_lat
 
-    def _indexer(self, step, x, pos, L, topk_buf, skip_gen: bool):
-        """Append this step's keys to the layer's key pool; unless the engine skipped the
-        indexer (every sequence within index_topk), score every sequence's paged keys and
-        select `index_topk` positions per row into `topk_buf`."""
+    def _indexer_keys(self, step, x, pos, L):
+        """The indexer's key half: the wk | weights_proj projection, and this step's keys
+        normalized, roped and appended to the layer's key pool in place off `kw`'s leading
+        columns. Returns the projection, whose trailing columns are the head weights the
+        selection reads."""
+        core = self.core
+        ix = L.indexer
+        table = core._rope.indexer if ix.rope else core._rope.identity
+        kw = cublas_mm(x, ix.wk_wp)
+        k_pool = step["ix_pools"][L.index]
+        # The keys are read in place, the leading columns of `kw`'s rows.
+        cute_dsl_indexer_k_cache_update(
+            kw[:, : core.idx_dim], ix.k_norm_w, ix.k_norm_b, pos,
+            table.view(-1, 2, core.rope_dim // 2), k_pool,
+            step["slot_mapping_fp8"], step["slot_mapping_scale"], x.shape[0],
+            is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
+        )  # fmt: skip
+        return kw
+
+    def _indexer(
+        self,
+        step,
+        x,
+        pos,
+        L,
+        topk_buf,
+        skip_gen: bool = False,
+        iss=None,
+        *,
+        kw=None,
+        keys_ready=None,
+    ):
+        """Score every sequence's paged keys and select `index_topk` positions per row into
+        `topk_buf`: the q side from `x`, the head weights out of `kw` and the keys out of the
+        layer's pool, both `_indexer_keys`'s. `keys_ready`, when the key half ran on the side
+        stream, is the event behind it, waited for once the q side's projection is issued. When
+        `kw` is None, `_indexer_keys` runs inline first."""
+        if kw is None:
+            kw = DecodeTarget._indexer_keys(self, step, x, pos, L)
+        if skip_gen:
+            return
         core = self.core
         ix = L.indexer
         rows = x.shape[0]
         table = core._rope.indexer if ix.rope else core._rope.identity
-        kw = cublas_mm(x, ix.wk_wp)
-        k = kw[:, : core.idx_dim].contiguous()
-        k_pool = step["ix_pools"][L.index]
-        k_pool = cute_dsl_indexer_k_cache_update(
-            k, ix.k_norm_w, ix.k_norm_b, pos, table.view(-1, 2, core.rope_dim // 2), k_pool,
-            step["slot_mapping_fp8"], step["slot_mapping_scale"], rows,
-            is_neox=False, compiled=core._ix_k[k_pool.is_contiguous()], validate=False,
-        )  # fmt: skip
-        if skip_gen:
-            return
         qn = layer_norm(x, ix.q_norm_w, ix.q_norm_b, core.idx_eps)
         q = torch.reshape(self._linear_fp8(qn, ix.wq_b, ix.wq_b_s), [rows, core.idx_heads, -1])
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         weights = torch.empty([rows, core.idx_heads], dtype=torch.float32, device=x.device)
+        if keys_ready is not None:
+            keys_ready.wait()
         if core.unfused_glue:
             q = ssmax_scaling(q, pos, ix.ssmax_s, ix.ssmax_b)
             q_fp8, weights = cute_dsl_indexer_q_side_fused(
@@ -1685,9 +2070,29 @@ class DecodeTarget:
         num_gens = step["num_seqs"]
         next_n = rows // num_gens
         kv_lens = step["kv_lens_cuda"][:num_gens]
+        if iss is not None:
+            logits = cute_dsl_fp8_paged_mqa_logits(
+                torch.reshape(q_fp8, [1, next_n, core.idx_heads, core.idx_dim]),
+                step["ix_pools"][L.index],
+                weights,
+                iss["shard_ctx"],
+                iss["shard_block_table"],
+                iss["schedule"],
+                iss["capacity"],
+            )
+            hist_topk(
+                logits,
+                kv_lens,
+                topk_buf,
+                core._hist_workspace.comm_buffer,
+                core._hist_workspace.state,
+                next_n,
+                core.tp_size,
+            )
+            return
         logits = cute_dsl_fp8_paged_mqa_logits(
             torch.reshape(q_fp8, [num_gens, next_n, core.idx_heads, core.idx_dim]),
-            k_pool,
+            step["ix_pools"][L.index],
             weights,
             kv_lens,
             step["indexer_k_cache_block_offsets"][:num_gens],
@@ -1711,12 +2116,22 @@ class DecodeTarget:
         core = self.core
 
         def shared():
-            act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
+            gu = self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s)
+            if getattr(self, "_use_ml4_mx_gemv", False):
+                dn = ml4_mx_gemv_swiglu(gu, L.mlp_dn, L.mlp_dn_s)
+                if dn is not None:
+                    return dn
+            act = flashinfer_silu_and_mul(gu)
             return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
 
         m = L.moe
         if m is None:
             return None, shared()
+
+        rows = o.shape[0]
+        moe_layers = getattr(self, "_moe_layers", None)
+        if moe_layers is not None and rows in moe_layers:
+            return None, ml4_moe_engine(o, moe_layers[rows][L.index])
 
         def routed():
             logits = cublas_mm(o, m.router, None, torch.float32)
@@ -1772,19 +2187,23 @@ class DecodeTarget:
         else:
             topk_buf = torch.empty([rows, core.idx_topk], dtype=torch.int32, device=dev)
         scratch = self._scratch(rows, h.dtype, dev)
+        iss = core._prepare_iss_step(step, rows, skip_gen)
         # A MoE layer's NVFP4 quantization and its routed + shared add fold into the all-reduces
         # around it (each the same bits as the separate op). Those are one-shot kernels, so a
         # step of more rows than they take keeps the separate ops: per step, by its row count.
         one_shot = rows <= ONE_SHOT_ROWS
+        use_moe_engine = self._ensure_moe_engine(rows)
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         residual = h
         spec_metadata = kwargs.get("spec_metadata")
         for layer_idx, L in enumerate(self._layers):
-            attn_out = self._attention(step, L, x, pos, req_idx, topk_buf, scratch, skip_gen)
+            attn_out = self._attention(
+                step, L, x, pos, req_idx, topk_buf, scratch, skip_gen, iss=iss
+            )
             partial = self._linear_fp8(attn_out, L.wo, L.wo_s)
             quantized = None
-            if one_shot and L.moe is not None:
+            if one_shot and L.moe is not None and not use_moe_engine:
                 o, *quantized = allreduce_add_rmsnorm_nvfp4(
                     partial, residual, L.ffn_norm, L.moe.gscale, core._lamport
                 )
@@ -1833,22 +2252,66 @@ class DecodeTarget:
             sched=get_mla_metadata()[0] if core.gen_attn_flash_mla else None,
         )
 
-    def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool):
+    def _attention(self, step, L, x, pos, req_idx, topk_buf, s, skip_gen: bool, iss=None):
         """One layer's attention block into `s.attn_out` (returned): the indexer's selection and
         its pool slots; the query with SSMax, the absorbed query, the owner's rope and
         fp8_ds_mla append; sparse decode over the pool, and the V up-projection of the latent
         output (FlashMLA's live heads read in place under `gen_attn_flash_mla` with the fused
-        glue). Under CUDA-graph capture the query half runs on the side stream beside the
-        selection: the selection writes the indexer's key pool and `topk_buf`, the query half
-        `s` and the latent pool, neither reads what the other writes, and the decode reads
-        both."""
+        glue).
+
+        Under CUDA-graph capture the indexer's key half and then the query half run on the side
+        stream beside the selection. The key half writes the indexer's key pool and `kw`, which
+        the selection reads only after waiting for it, past its own q_input_norm and wq_b; the
+        selection writes `topk_buf` and, through the native top-k fallback, the engine's radix
+        arena; the query half writes `s.fused_q`, `s.nope_lat` and, on an owner layer, its row
+        of the latent pool. The query half and the selection read nothing the other writes, and
+        the decode reads both after the join. A NoPE sharer appends nothing: its decode reads
+        layer 35's rows, appended on the side stream and joined in layer 35. `kw` stays
+        referenced past the join (recorded on the main stream outside a capture), so the side
+        stream's allocator cannot hand its memory out while the selection reads it. Each later
+        use of the side stream first waits for the main stream past this join, so the uses never
+        overlap.
+
+        On a layer without an indexer the selection is the one slot conversion, so the owner's
+        latent (the kv_a projection and its norm) runs on the main stream ahead of it instead,
+        and the query half waits for it only at the rope append; the latent stays referenced
+        past the join (recorded on the side stream outside a capture), so its memory is not
+        reused while the rope append reads it."""
         core = self.core
         rows = x.shape[0]
         fq = s.fused_q[:, : core.heads]
+        side = self._latent_stream
+        multi = do_multi_stream() and side is not None
+        kw, keys_ready = None, None
+        if L.indexer is not None:
+            if multi:
+                self._keys_fork.record()
+                with torch.cuda.stream(side):
+                    self._keys_fork.wait()
+                    kw = self._indexer_keys(step, x, pos, L)
+                    if not skip_gen:
+                        self._keys_ready.record()
+                if not skip_gen:
+                    keys_ready = self._keys_ready
+                    if not torch.cuda.is_current_stream_capturing():
+                        kw.record_stream(torch.cuda.current_stream())
+            else:
+                kw = self._indexer_keys(step, x, pos, L)
+
+        latent = None
+        latent_on_main = L.owner and L.indexer is None and multi
 
         def select():
-            if L.indexer is not None:
-                self._indexer(step, x, pos, L, topk_buf, skip_gen)
+            nonlocal latent
+            if L.indexer is not None and not skip_gen:
+                self._indexer(
+                    step, x, pos, L, topk_buf, False, iss=iss, kw=kw, keys_ready=keys_ready
+                )
+            if latent_on_main:
+                latent = self._latent(x, L, s.nope_lat)
+                self._latent_ready.record()
+                if not torch.cuda.is_current_stream_capturing():
+                    latent.record_stream(side)
             return convert_req_index_to_global(
                 req_idx, step["block_table"], topk_buf, step["tokens_per_block"], core.idx_topk,
                 core._stride_factor, core._pool_row[L.kv_source],
@@ -1874,13 +2337,18 @@ class DecodeTarget:
                 torch.transpose(fq[..., : core.kv_lora], 0, 1),
             )  # fmt: skip
             if L.owner:
+                if latent_on_main:
+                    self._latent_ready.wait()
+                    lat = latent
+                else:
+                    lat = self._latent(x, L, s.nope_lat)
                 ds_mla_rope_append(
-                    self._latent(x, L, s.nope_lat), fq, pos, core._rope.indexer, req_idx,
+                    lat, fq, pos, core._rope.indexer, req_idx,
                     step["block_table"], step["latent_pool"], core._pool_row[L.index], L.rope,
                 )  # fmt: skip
 
         slots, _ = maybe_execute_in_parallel(
-            select, query, self._latent_fork, self._latent_join, self._latent_stream
+            select, query, self._latent_fork, self._latent_join, side
         )
         if core.gen_attn_flash_mla and core.unfused_glue:
             lat = flash_mla_sparse_decode(
@@ -1964,6 +2432,11 @@ class DraftModel(nn.Module):
         self._runtime_position_ceiling = None
         self._rope = None
         self._layers = None
+        self._fused_kv_a = None
+        self._fused_kv_norm = None
+        self._kv_stream = None
+        self._kv_fork = None
+        self._kv_join = None
 
     @property
     def core(self):
@@ -1977,6 +2450,24 @@ class DraftModel(nn.Module):
     def markov_w2(self):
         return self.core.w["draft_markov_output"]
 
+    @property
+    def markov_vocab_size(self) -> int:
+        return self.core.w["draft_markov_embedding"].shape[0]
+
+    @property
+    def markov_output_is_sharded(self) -> bool:
+        tp_size = getattr(self.core, "tp_size", 1)
+        return (
+            tp_size > 1
+            and self.core.w["draft_markov_output"].shape[0] * tp_size == self.markov_vocab_size
+        )
+
+    def _ensure_kv_stream(self, device: torch.device) -> None:
+        if self._kv_stream is None or self._kv_stream.device != device:
+            self._kv_stream = torch.cuda.Stream(device=device)
+            self._kv_fork = torch.cuda.Event()
+            self._kv_join = torch.cuda.Event()
+
     def logits_processor(self, hidden, lm_head, attn_metadata, gather):
         # The shared-head logits are soft-capped before the RNN bias is added.
         if gather and lm_head is self._shell.lm_head:
@@ -1986,14 +2477,24 @@ class DraftModel(nn.Module):
 
     def _build_fused_kv_buffers(self):
         # The worker calls this before sizing its cache. Take views once after
-        # materialization; context projection is explicit per layer here.
+        # materialization; also pack per-layer wkv_a and kv_a_norm for a single
+        # stacked context-KV projection.
         if self._layers is not None:
             return
         w, core = self.core.w, self.core
         self._layers = []
+        kv_a_rows = []
+        kv_norms = []
         for i in range(self._num_attn_layers):
             prefix = f"l{i}_draft_"
             kv_b = w[prefix + "wkv_b"].view(core.heads, core.nope + core.v_dim, core.kv_lora)
+            kv_a_rows.append(w[prefix + "wkv_a"])
+            kv_norms.append(w[prefix + "kv_a_norm"])
+            mlp_weights = (
+                {"gate_up": w[prefix + "w13"].t()}
+                if prefix + "w13" in w
+                else {"gate": w[prefix + "w1"].t(), "up": w[prefix + "w3"].t()}
+            )
             self._layers.append(
                 SimpleNamespace(
                     attn_norm=w[prefix + "attn_norm"],
@@ -2004,16 +2505,18 @@ class DraftModel(nn.Module):
                     v_b=kv_b[:, core.nope :].contiguous(),
                     out=w[prefix + "wo"].t(),
                     ffn_norm=w[prefix + "ffn_norm"],
-                    gate=w[prefix + "w1"].t(),
-                    up=w[prefix + "w3"].t(),
                     down=w[prefix + "w2"].t(),
                     next_norm=(
                         w[f"l{i + 1}_draft_attn_norm"]
                         if i + 1 < self._num_attn_layers
                         else w["draft_final_norm"]
                     ),
+                    **mlp_weights,
                 )
             )
+        if kv_a_rows:
+            self._fused_kv_a = torch.cat(kv_a_rows, dim=0).contiguous().t()
+            self._fused_kv_norm = torch.stack(kv_norms, dim=0).contiguous()
 
     def _ensure_rope(self):
         cap = self._runtime_position_ceiling or self.core.rope_rows
@@ -2032,16 +2535,30 @@ class DraftModel(nn.Module):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
         weight = self.core.w["embed"]
-        valid = (anchors >= 0) & (anchors < weight.shape[0])
-        embedded = nn.functional.embedding(anchors.clamp(0, weight.shape[0] - 1), weight)
-        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
-        masks = self.core.w["draft_mask"].unsqueeze(0).expand(anchors.shape[0], -1, -1)
-        return torch.cat((embedded.unsqueeze(1), masks), dim=1)
+        masks = self.core.w["draft_mask"]
+        if anchors.is_cuda or os.environ.get("TRITON_INTERPRET") == "1":
+            return triton_embed_draft_block(anchors, weight, masks, block_size)
+        return triton_embed_draft_block.reference(anchors, weight, masks, block_size)
 
     def project_target_hidden(self, hidden):
         w = self.core.w
-        projected = cublas_mm(hidden, w["draft_target_projection"].t(), None, None)
-        return flashinfer_rmsnorm(projected, w["draft_target_norm"], self.core.eps)
+        w_proj = w["draft_target_projection"]
+        if w_proj.shape[1] == hidden.shape[1]:
+            projected = cublas_mm(hidden, w_proj.t(), None, None)
+            return flashinfer_rmsnorm(projected, w["draft_target_norm"], self.core.eps)
+        k_shard = w_proj.shape[1]
+        k_start = self.core.tp_rank * k_shard
+        hidden_shard = hidden[:, k_start : k_start + k_shard].contiguous()
+        partial = cublas_mm(hidden_shard, w_proj.t(), None, None)
+        lamport = getattr(self.core, "_lamport", None)
+        if lamport is not None:
+            out = torch.empty_like(partial)
+            return cute_dsl_allreduce_add_rmsnorm(
+                partial, torch.zeros_like(partial), w["draft_target_norm"], out, lamport
+            )
+        if torch.distributed.is_initialized() and getattr(self.core, "tp_size", 1) > 1:
+            torch.distributed.all_reduce(partial)
+        return flashinfer_rmsnorm(partial, w["draft_target_norm"], self.core.eps)
 
     def precompute_context_kv(self, projected_hidden, positions):
         self._build_fused_kv_buffers()
@@ -2050,21 +2567,78 @@ class DraftModel(nn.Module):
         rows = projected_hidden.shape[0]
         out = projected_hidden.new_empty((rows, len(self._layers), 1, core.lat_dim))
         positions = positions.reshape(-1)
-        for i, layer in enumerate(self._layers):
-            kv = cublas_mm(projected_hidden, layer.kv_a, None, None)
+        if self._fused_kv_a is not None and self._fused_kv_norm is not None:
+            kv = cublas_mm(projected_hidden, self._fused_kv_a, None, None)
             triton_latent_tail(
                 kv,
-                layer.kv_norm.view(1, core.kv_lora),
+                self._fused_kv_norm,
                 core.eps,
                 positions,
                 self._rope.indexer,
-                out[:, i],
+                out,
             )
         return out, None
 
     def dflash_forward_with_metadata(self, *, attn_metadata, **kwargs):
         # The phase belongs to this engine step, including mixed batches.
         return self.core._select_target(attn_metadata).dspark_forward(self, **kwargs)
+
+    def vocab_parallel_markov_tokens(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        vp_head: VocabParallelHead,
+    ) -> torch.Tensor:
+        """Vocab-parallel greedy RNN-Markov chain directly from shard block logits."""
+        w = self.core.w
+        return vp_head.rnn_markov_tokens(
+            local_block,
+            first_prev_tokens,
+            hidden_states,
+            w["draft_markov_embedding"],
+            w["draft_joint"],
+            w["draft_joint_bias"],
+            w["draft_markov_output"],
+            linear_fn=_cublas_linear,
+            gate_fn=triton_markov_gate,
+        )
+
+    def vocab_parallel_markov_logits(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        vp_head: VocabParallelHead,
+    ) -> torch.Tensor:
+        """Full-vocab float32 biased RNN-Markov logits via sharded compute + single gather."""
+        w = self.core.w
+        w_out = w["draft_markov_output"]
+        w_out_rows = (
+            w_out
+            if w_out.shape[0] == vp_head.shard_width
+            else w_out[vp_head.col_base : vp_head.col_base + vp_head.shard_width]
+        )
+        local_biased = torch.empty(
+            local_block.shape, dtype=torch.float32, device=local_block.device
+        )
+        rnn_markov_chain_tokens(
+            local_block,
+            first_prev_tokens,
+            hidden_states,
+            w["draft_markov_embedding"],
+            w["draft_joint"],
+            w["draft_joint_bias"],
+            w_out_rows,
+            vp_head.col_base,
+            vp_head.exchange,
+            softcap=vp_head.softcap,
+            biased_out=local_biased,
+            need_final_tokens=False,
+            linear_fn=_cublas_linear,
+            gate_fn=triton_markov_gate,
+        )
+        return tp_allgather(local_biased, self.core.model_config.mapping, dim=-1)
 
     def apply_markov_chain_logits(
         self,
@@ -2074,16 +2648,38 @@ class DraftModel(nn.Module):
         argmax_fn,
         vocab_slice=None,
         hidden_states,
+        tp_exchange=None,
     ):
-        # The shell's lm_head gathers the whole vocabulary, so the worker never slices it and
-        # its argmax_fn is a plain argmax: the chain's own argmax stands in for it, fused with
-        # the bias add.
-        assert vocab_slice is None, vocab_slice
         w = self.core.w
-        output = w["draft_markov_output"]
+        output = (
+            w["draft_markov_output"]
+            if vocab_slice is None
+            else w["draft_markov_output"][vocab_slice]
+        )
+        if tp_exchange is not None and base_logits.is_cuda:
+            col_base = tp_exchange.tp_rank * base_logits.shape[-1]
+            refined = torch.empty(base_logits.shape, dtype=torch.float32, device=base_logits.device)
+            rnn_markov_chain_tokens(
+                base_logits,
+                first_prev_tokens,
+                hidden_states,
+                w["draft_markov_embedding"],
+                w["draft_joint"],
+                w["draft_joint_bias"],
+                output,
+                col_base,
+                tp_exchange,
+                softcap=None,
+                biased_out=refined,
+                need_final_tokens=False,
+                linear_fn=_cublas_linear,
+                gate_fn=triton_markov_gate,
+            )
+            return refined
         previous = first_prev_tokens.long()
         state = None
         refined = torch.empty_like(base_logits)
+        sharded_fallback = vocab_slice is not None or self.markov_output_is_sharded
         for i in range(base_logits.shape[1]):
             joint = cublas_mm(
                 triton_markov_input(
@@ -2095,7 +2691,11 @@ class DraftModel(nn.Module):
             )
             state, emitted = triton_markov_gate(joint, state)
             bias = cublas_mm(emitted, output.t(), None, None)
-            previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
+            if sharded_fallback:
+                refined[:, i].copy_(base_logits[:, i] + bias)
+                previous = argmax_fn(refined[:, i]).long()
+            else:
+                previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
         return refined
 
 
@@ -2397,6 +2997,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             vocab_size=cfg.vocab_size,
         )
         self.softcap = float(cfg.softmax_tanh_gating)
+        self.runtime_hooks = make_ml4_runtime_hooks(model_config.mapping)
         self._vision: Optional[VisionTower] = None
         vis = getattr(cfg, "vision_config", None)
         self._image_token_ids = (
@@ -2442,6 +3043,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
                 model_config.mapping,
                 use_separate_draft_kv_cache=True,
             )
+            self.spec_worker.set_target_model(self)
             self.spec_worker.set_draft_model(self.draft_model)
             self.epilogue.append(self.spec_worker)
 
@@ -2496,11 +3098,16 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             lora_params=lora_params,
             **kwargs,
         )
-        logits = self.capped_logits(
-            nn.functional.embedding(spec_metadata.gather_ids, hidden),
-            attn_metadata,
-            _TARGET_LOGITS_SLOT,
-        )
+        gathered_hidden = nn.functional.embedding(spec_metadata.gather_ids, hidden)
+        vp_head = getattr(self.spec_worker, "target_vocab_parallel_head", None)
+        if isinstance(vp_head, VocabParallelHead):
+            logits = vp_head.shard_logits(gathered_hidden)
+        else:
+            logits = self.capped_logits(
+                gathered_hidden,
+                attn_metadata,
+                _TARGET_LOGITS_SLOT,
+            )
         return self.spec_worker(
             input_ids=worker_input_ids,
             position_ids=position_ids,
@@ -2512,12 +3119,20 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             resource_manager=kwargs.get("resource_manager"),
         )
 
+    def _gather_capped_local_logits(self, local: torch.Tensor) -> torch.Tensor:
+        """Materialize full-vocab soft-capped fp32 logits from this rank's bf16 shard."""
+        gather = self._logits_gather
+        if gather is not None and local.shape[0] <= gather.rows:
+            return symm_logits_gather_softcap(local, gather, _TARGET_LOGITS_SLOT, self.softcap)
+        logits = tp_allgather(local, self.model_config.mapping, dim=-1).float()
+        return tanh_softcap(logits, self.softcap)
+
     def capped_logits(self, hidden: torch.Tensor, attn_metadata, slot: int) -> torch.Tensor:
         """The soft-capped full-vocabulary fp32 logits of every row of `hidden`, through the
         shared lm_head: the symmetric gather when the step's rows fit it, else the NCCL
         gather, the upcast and the soft-cap. Every rank takes the same side."""
         gather = self._logits_gather
-        if hidden.shape[0] > gather.rows:
+        if gather is None or hidden.shape[0] > gather.rows:
             logits = self.logits_processor(hidden, self.lm_head, attn_metadata, True)
             return tanh_softcap(logits, self.softcap)
         local = self.lm_head.apply_linear(hidden, self.lm_head.bias)
@@ -2543,14 +3158,24 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
         if self.draft_model is not None:
             self.draft_model._build_fused_kv_buffers()
         if self.spec_worker is not None:
-            # The route fixes the lm_head the gather is written for: a bf16 column shard of the
-            # whole vocabulary on every rank of the 4- or 8-rank TP group, gathered, no padding.
+            # The route fixes the lm_head: a bf16 column shard of the whole vocabulary on every
+            # rank of the 4-, 8- or 16-rank TP group, gathered, no padding. Above TP8, decode
+            # selects tokens vocab-parallel without full-vocab gather and any gathered fallback
+            # uses NCCL allgather instead of allocating a 16-rank symmetric gather workspace.
             mapping = self.model_config.mapping
             lm_head = self.lm_head
             assert lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.gather_output
             assert lm_head.padding_size == 0 and lm_head.weight.dtype == torch.bfloat16
-            # Collective: every rank of the TP group (the process group the Lamport workspace
-            # brought up) builds it at load, with the same arguments.
-            self._logits_gather = build_logits_gather(
-                _LOGITS_GATHER_ROWS, self.lm_head.weight.shape[0], mapping.tp_rank, mapping.tp_size
-            )
+            if mapping.tp_size <= 8:
+                # Collective: every rank of the TP group (the process group the Lamport workspace
+                # brought up) builds it at load, with the same arguments.
+                self._logits_gather = build_logits_gather(
+                    _LOGITS_GATHER_ROWS,
+                    self.lm_head.weight.shape[0],
+                    mapping.tp_rank,
+                    mapping.tp_size,
+                )
+            else:
+                self._logits_gather = None
+            if callable(getattr(self.spec_worker, "post_load_weights", None)):
+                self.spec_worker.post_load_weights()

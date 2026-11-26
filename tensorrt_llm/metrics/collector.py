@@ -77,9 +77,12 @@ class MetricsCollector:
             trtllm_kv_cache_offload_bytes_total
             trtllm_kv_cache_disk_prefetch_blocks_total
             trtllm_kv_cache_disk_write_bytes_total
+            trtllm_kv_cache_disk_required_write_bytes_total
             trtllm_kv_cache_disk_read_bytes_total
             trtllm_kv_cache_disk_pending_write_bytes
             trtllm_kv_cache_disk_failed_pages_total
+            trtllm_kv_cache_disk_retained_copies
+            trtllm_kv_cache_disk_retained_copies_reused_total
             trtllm_kv_cache_host_reserve_written_pages_total
             trtllm_kv_cache_host_reserve_deferred_pages_total
             trtllm_kv_cache_last_tier_dropped_pages_total
@@ -322,6 +325,13 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_disk_write_bytes_total",
             documentation="Total bytes the KV cache wrote to its disk tier",
             labelnames=self.labels.keys())
+        self.kv_cache_disk_required_write_bytes_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_disk_required_write_bytes_total",
+            documentation=(
+                "Total bytes written to the disk tier by fenced (required) "
+                "evictions"),
+            labelnames=self.labels.keys())
         self.kv_cache_disk_read_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_disk_read_bytes_total",
             documentation="Total bytes the KV cache read from its disk tier",
@@ -335,6 +345,19 @@ class MetricsCollector:
             documentation=(
                 "Total KV cache pages whose disk read or write failed and "
                 "that left prefix reuse"),
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_retained_copies = Gauge(
+            name=self.metric_prefix + "kv_cache_disk_retained_copies",
+            documentation=(
+                "Current disk copies retained after restore for pages also "
+                "living in a hotter tier"),
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_retained_copies_reused_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_disk_retained_copies_reused_total",
+            documentation=(
+                "Total evictions to disk that reused a retained copy instead "
+                "of writing again"),
             labelnames=self.labels.keys())
         self.kv_cache_host_reserve_written_pages_total = Counter(
             name=self.metric_prefix +
@@ -359,8 +382,12 @@ class MetricsCollector:
             labelnames=self.labels.keys())
         self._disk_io_counters = (
             ("writeBytes", self.kv_cache_disk_write_bytes_total),
+            ("requiredWriteBytes",
+             self.kv_cache_disk_required_write_bytes_total),
             ("readBytes", self.kv_cache_disk_read_bytes_total),
             ("failedPages", self.kv_cache_disk_failed_pages_total),
+            ("retainedCopiesReused",
+             self.kv_cache_disk_retained_copies_reused_total),
             ("reserveEvictedPages",
              self.kv_cache_host_reserve_written_pages_total),
             ("reserveDeferredPages",
@@ -945,6 +972,9 @@ class MetricsCollector:
             if "pendingWriteBytes" in disk_io:
                 self._log_gauge(self.kv_cache_disk_pending_write_bytes,
                                 disk_io["pendingWriteBytes"])
+            if "retainedCopiesCurrent" in disk_io:
+                self._log_gauge(self.kv_cache_disk_retained_copies,
+                                disk_io["retainedCopiesCurrent"])
 
         self._log_cached_tokens_by_level(
             iteration_stats.get("iterCachedTokensByLevel"),

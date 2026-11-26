@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cutlass
@@ -11,9 +13,10 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
+from tensorrt_llm.logger import logger
+
 from .._op import Arch, Cell, OpWrapper
 from . import _cluster_radix_topk_decode as _cluster_kernel
-from . import _dynamic_radix_topk_decode as _dynamic_kernel
 from . import _radix_topk_decode as _kernel
 from .indexer_topk_decode import indexer_topk_decode
 
@@ -584,6 +587,59 @@ def build_split(
     return handle
 
 
+#: Supported CTAs per cluster for `cluster_radix_topk_decode`.
+CLUSTER_SIZES = (2, 4, 8, 16, 32)
+#: Portable CUDA cluster limit; larger sizes require non-portable opt-in and device verification.
+_PORTABLE_MAX_CLUSTER = 8
+#: Default verification cluster ladder ordered from portable baseline to SM107 wide CGA.
+DEFAULT_VERIFY_CLUSTERS = (8, 16, 32)
+#: Minimum scorer width (columns) per cluster size so each CTA scans enough vectors to amortize
+#: DSMEM histogram reduction: C=8 through 64K, C=16 above 64K, and C=32 from 256K upward when
+#: supported by the device.
+_CLUSTER_MIN_WIDTH = {8: 20480, 16: 65537, 32: 262144}
+
+
+def select_cluster_size(
+    rows: int,
+    width: int,
+    sm_count: int,
+    available_clusters: tuple[int, ...] = DEFAULT_VERIFY_CLUSTERS,
+) -> int:
+    """Pick the largest cluster size in `available_clusters` that keeps `rows * cluster` within
+    one SM wave and gives each CTA enough columns to amortize DSMEM histogram reduction.
+
+    Pure function of host-known static shapes `(rows, width, sm_count)`, safe for CUDA-graph
+    capture without inspecting device lengths.
+    """
+    candidates = tuple(sorted({int(c) for c in available_clusters if int(c) in CLUSTER_SIZES}))
+    if not candidates:
+        raise ValueError("available_clusters must contain at least one valid cluster size")
+    if rows <= 0:
+        return candidates[0]
+    best = candidates[0]
+    for cluster in candidates:
+        if rows * cluster <= sm_count and width >= _CLUSTER_MIN_WIDTH.get(cluster, 0):
+            best = cluster
+    return best
+
+
+def reachable_cluster_sizes(
+    row_counts: tuple[int, ...],
+    width: int,
+    sm_count: int,
+    candidates: tuple[int, ...] = DEFAULT_VERIFY_CLUSTERS,
+) -> tuple[int, ...]:
+    """Sorted cluster sizes up to the widest size `select_cluster_size` can pick across
+    `row_counts` for `(width, sm_count)`, preserving smaller fallback sizes."""
+    ordered = tuple(sorted({int(c) for c in candidates if int(c) in CLUSTER_SIZES}))
+    if not ordered:
+        raise ValueError("candidates must contain at least one valid cluster size")
+    if not row_counts:
+        return (ordered[0],)
+    max_needed = max(select_cluster_size(r, width, sm_count, ordered) for r in row_counts)
+    return tuple(c for c in ordered if c <= max_needed)
+
+
 def _split_call_runs(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -681,6 +737,77 @@ class CompiledClusterRadixTopkDecode:
 _CLUSTER_COMPILED: dict[tuple, CompiledClusterRadixTopkDecode] = {}
 
 
+def _probe_cubin_cluster_support(
+    cubin: bytes | None,
+    device_id: int,
+    cluster: int,
+    threads: int,
+) -> bool | None:
+    """Check via `cuOccupancyMaxActiveClusters` whether the compiled cubin can launch with
+    `cluster` CTAs per cluster on `device_id`. Returns `None` if probing is unavailable."""
+    if not cubin:
+        return None
+    from cuda.bindings import driver
+
+    lib = None
+    try:
+        err, dev = driver.cuDeviceGet(device_id)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return None
+        err, lib = driver.cuLibraryLoadData(cubin, None, None, 0, None, None, 0)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return None
+        err, kernels = driver.cuLibraryEnumerateKernels(1, lib)
+        if err != driver.CUresult.CUDA_SUCCESS or not kernels:
+            return None
+        err, fn = driver.cuKernelGetFunction(kernels[0])
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return None
+        err, max_smem = driver.cuDeviceGetAttribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            dev,
+        )
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return None
+        driver.cuFuncSetAttribute(
+            fn,
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            max_smem,
+        )
+        err_attr = driver.cuFuncSetAttribute(
+            fn,
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+            1,
+        )
+        if err_attr[0] != driver.CUresult.CUDA_SUCCESS:
+            return False
+        smem_bytes = _cluster_kernel.cluster_kernel_smem_bytes(cluster, threads)
+        cfg = driver.CUlaunchConfig()
+        cfg.gridDimX = cluster
+        cfg.gridDimY = 1
+        cfg.gridDimZ = 1
+        cfg.blockDimX = threads
+        cfg.blockDimY = 1
+        cfg.blockDimZ = 1
+        cfg.sharedMemBytes = smem_bytes
+        attr = driver.CUlaunchAttribute()
+        attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        val = driver.CUlaunchAttributeValue()
+        val.clusterDim.x = cluster
+        val.clusterDim.y = 1
+        val.clusterDim.z = 1
+        attr.value = val
+        cfg.attrs = [attr]
+        cfg.numAttrs = 1
+        err, active = driver.cuOccupancyMaxActiveClusters(fn, cfg)
+        if err != driver.CUresult.CUDA_SUCCESS:
+            return False
+        return int(active) > 0
+    finally:
+        if lib is not None:
+            driver.cuLibraryUnload(lib)
+
+
 def build_cluster(
     device_id: int,
     *,
@@ -699,12 +826,12 @@ def build_cluster(
     if next_n not in (1, 4):
         raise ValueError("cluster radix requires next_n 1 or 4")
     if (
-        cluster not in (2, 4, 8, 16)
+        cluster not in CLUSTER_SIZES
         or threads not in (256, 512, 1024)
         or unroll not in (1, 2, 4, 8)
     ):
         raise ValueError(
-            "cluster radix requires cluster 2/4/8/16, threads 256/512/1024, unroll 1/2/4/8"
+            "cluster radix requires cluster 2/4/8/16/32, threads 256/512/1024, unroll 1/2/4/8"
         )
     if min_blocks not in (0, 1, 2, 4):
         raise ValueError("cluster radix requires min_blocks 0, 1, 2 or 4")
@@ -730,16 +857,37 @@ def build_cluster(
         kernel = _cluster_kernel.ClusterRadixTopkDecodeKernel(
             next_n, cluster, threads, unroll, use_pdl, pipe=pipe, min_blocks=min_blocks
         )
-        launch = cute.compile(
-            kernel,
-            fake_logits,
-            fake_lens,
-            fake_aux_i,
-            fake_aux_l,
-            fake_out,
-            stream,
-            options="--enable-tvm-ffi",
-        )
+        if cluster > _PORTABLE_MAX_CLUSTER:
+            with tempfile.TemporaryDirectory() as dump_dir:
+                launch = cute.compile(
+                    kernel,
+                    fake_logits,
+                    fake_lens,
+                    fake_aux_i,
+                    fake_aux_l,
+                    fake_out,
+                    stream,
+                    options=f"--enable-tvm-ffi --dump-dir={dump_dir} --keep-cubin",
+                )
+            cubin = getattr(getattr(launch, "artifacts", None), "CUBIN", None)
+            supported = _probe_cubin_cluster_support(
+                cubin, int(device_id), int(cluster), int(threads)
+            )
+            if supported is False:
+                raise RuntimeError(
+                    f"cluster size {cluster} (threads={threads}) is not supported on cuda:{device_id}"
+                )
+        else:
+            launch = cute.compile(
+                kernel,
+                fake_logits,
+                fake_lens,
+                fake_aux_i,
+                fake_aux_l,
+                fake_out,
+                stream,
+                options="--enable-tvm-ffi",
+            )
         sm_count = torch.cuda.get_device_properties(device_id).multi_processor_count
         handle = CompiledClusterRadixTopkDecode(launch, *key, int(sm_count))
         logits = torch.zeros((next_n, 4096), dtype=torch.float32, device="cuda")
@@ -753,6 +901,78 @@ def build_cluster(
     return handle
 
 
+def build_cluster_variants(
+    device_id: int,
+    *,
+    next_n: int = 4,
+    clusters: tuple[int, ...] = DEFAULT_VERIFY_CLUSTERS,
+    threads: int = 512,
+    unroll: int = 2,
+    pipe: bool = True,
+    min_blocks: int = 0,
+    use_pdl: bool = True,
+) -> dict[int, CompiledClusterRadixTopkDecode]:
+    """Compile each requested cluster size supported on `device_id`, keyed by cluster size.
+
+    Portable sizes (`<= 8`) propagate compilation/launch errors; non-portable sizes (`> 8`) are
+    built in ascending order and stop cleanly at the first size the device/driver rejects.
+    """
+    ordered = tuple(sorted({int(c) for c in clusters}))
+    if not ordered or any(c not in CLUSTER_SIZES for c in ordered):
+        raise ValueError(f"clusters must be non-empty subset of {CLUSTER_SIZES}, got {clusters}")
+    variants: dict[int, CompiledClusterRadixTopkDecode] = {}
+    for cluster in ordered:
+        if cluster <= _PORTABLE_MAX_CLUSTER:
+            variants[cluster] = build_cluster(
+                device_id,
+                next_n=next_n,
+                cluster=cluster,
+                threads=threads,
+                unroll=unroll,
+                pipe=pipe,
+                min_blocks=min_blocks,
+                use_pdl=use_pdl,
+            )
+            continue
+        try:
+            variants[cluster] = build_cluster(
+                device_id,
+                next_n=next_n,
+                cluster=cluster,
+                threads=threads,
+                unroll=unroll,
+                pipe=pipe,
+                min_blocks=min_blocks,
+                use_pdl=use_pdl,
+            )
+        except RuntimeError as exc:
+            logger.info(
+                f"cluster_radix_topk_decode: skipping non-portable cluster={cluster} on "
+                f"cuda:{device_id}: {exc}"
+            )
+            break
+    if not variants:
+        raise RuntimeError(
+            f"no requested cluster size in {ordered} could be built on cuda:{device_id}"
+        )
+    return variants
+
+
+def resolve_compiled_cluster(
+    compiled: CompiledClusterRadixTopkDecode | Mapping[int, CompiledClusterRadixTopkDecode],
+    rows: int,
+    width: int,
+) -> CompiledClusterRadixTopkDecode:
+    """Resolve one compiled cluster launcher for `(rows, width)` from a handle or size map."""
+    if isinstance(compiled, CompiledClusterRadixTopkDecode):
+        return compiled
+    if not compiled:
+        raise ValueError("compiled cluster selector mapping must not be empty")
+    first = next(iter(compiled.values()))
+    chosen = select_cluster_size(rows, width, first.sm_count, tuple(compiled.keys()))
+    return compiled[chosen]
+
+
 def cluster_radix_topk_decode(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -760,181 +980,28 @@ def cluster_radix_topk_decode(
     aux_indices: torch.Tensor,
     aux_logits: torch.Tensor,
     *,
-    compiled: CompiledClusterRadixTopkDecode,
+    compiled: CompiledClusterRadixTopkDecode | Mapping[int, CompiledClusterRadixTopkDecode],
 ) -> torch.Tensor:
     """`split_radix_topk_decode`'s selection and contract in one cluster launch per call.
 
     The same set per row (ties at the k-th key taken in no particular order, columns before
     the op's pads), valid columns first in no particular order, then -1. The scratch buffers
     are read only for rows holding a negative NaN, which take the split selector's code; the
-    native op serves the shapes `split_radix_topk_decode` gives it.
+    native op serves the shapes `split_radix_topk_decode` gives it. `compiled` may be one
+    handle or a `{cluster_size: handle}` map from `build_cluster_variants`, selected per call
+    by `(rows, width)` via `select_cluster_size`.
     """
+    selected = resolve_compiled_cluster(compiled, logits.shape[0], logits.shape[1])
     runs = _split_call_runs(
         logits, seq_lens, indices, aux_indices, aux_logits,
-        next_n=compiled.next_n, device_id=compiled.device_id, sm_count=compiled.sm_count,
+        next_n=selected.next_n, device_id=selected.device_id, sm_count=selected.sm_count,
     )  # fmt: skip
     if logits.shape[0]:
         if not runs:
             return indexer_topk_decode(
-                logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
+                logits, seq_lens, indices, selected.next_n, TOP_K, 1, aux_indices, aux_logits
             )
-        compiled.launch(logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), indices)
-    return indices
-
-
-@dataclass(frozen=True)
-class CompiledDynamicRadixTopkDecode:
-    """Precompiled one-launch cluster=(1,1,1) dynamic CTA decode selector and persistent L2 state."""
-
-    launch: object
-    state: torch.Tensor
-    device_id: int
-    next_n: int
-    total_ctas: int
-    max_ctas_per_row: int
-    threads: int
-    unroll: int
-    pipe: bool
-    min_blocks: int
-    use_pdl: bool
-    sm_count: int
-
-
-_DYNAMIC_COMPILED: dict[tuple, CompiledDynamicRadixTopkDecode] = {}
-
-
-def build_dynamic(
-    device_id: int,
-    *,
-    next_n: int = 4,
-    total_ctas: int | None = None,
-    max_ctas_per_row: int = _dynamic_kernel.DEFAULT_MAX_CTAS_PER_ROW,
-    threads: int = 512,
-    unroll: int = 2,
-    pipe: bool = True,
-    min_blocks: int = 1,
-    use_pdl: bool = True,
-) -> CompiledDynamicRadixTopkDecode:
-    """Compile ``dynamic_radix_topk_decode`` before capture.
-
-    Defaults ``total_ctas`` to ``sm_count * max(1, min_blocks)`` so every CTA in the grid is
-    co-resident on the GPU (deadlock-free inter-CTA synchronization). Allocates one zero-initialized
-    per-handle L2 state buffer (``MAX_ROWS x STATE_WORDS_PER_ROW`` int32, ~3.16 MiB) that each
-    launch self-cleans back to all-zeros before exiting, keeping CUDA Graph replay safe.
-    """
-    if next_n not in (1, 4):
-        raise ValueError("dynamic radix requires next_n 1 or 4")
-    if threads not in (256, 512, 1024) or unroll not in (1, 2, 4, 8):
-        raise ValueError("dynamic radix requires threads 256/512/1024 and unroll 1/2/4/8")
-    if min_blocks not in (1, 2):
-        raise ValueError("dynamic radix requires min_blocks 1 or 2")
-    if max_ctas_per_row < 1:
-        raise ValueError("dynamic radix requires max_ctas_per_row >= 1")
-    sm_count = int(torch.cuda.get_device_properties(device_id).multi_processor_count)
-    ctas = sm_count * min_blocks if total_ctas is None else int(total_ctas)
-    if ctas < _dynamic_kernel.MAX_ROWS or ctas > sm_count * min_blocks:
-        raise ValueError(
-            f"dynamic radix requires total_ctas in [{_dynamic_kernel.MAX_ROWS}, "
-            f"{sm_count * min_blocks}] to guarantee co-resident sync; got {ctas}"
-        )
-    key = (
-        int(device_id),
-        int(next_n),
-        int(ctas),
-        int(max_ctas_per_row),
-        int(threads),
-        int(unroll),
-        bool(pipe),
-        int(min_blocks),
-        bool(use_pdl),
-    )
-    if key in _DYNAMIC_COMPILED:
-        return _DYNAMIC_COMPILED[key]
-    with torch.cuda.device(device_id):
-        rows, cols, batch, size = (cute.sym_int() for _ in range(4))
-        stride = cute.sym_int64()
-        fake_logits = make_fake_tensor(
-            cutlass.Float32, (rows, cols), stride=(stride, 1), assumed_align=4
-        )
-        fake_lens = make_fake_compact_tensor(cutlass.Int32, (batch,), assumed_align=4)
-        fake_aux_i = make_fake_compact_tensor(cutlass.Int32, (size,), assumed_align=4)
-        fake_aux_l = make_fake_compact_tensor(cutlass.Float32, (size,), assumed_align=4)
-        fake_state = make_fake_compact_tensor(
-            cutlass.Int32,
-            (_dynamic_kernel.MAX_ROWS, _dynamic_kernel.STATE_WORDS_PER_ROW),
-            stride_order=(1, 0),
-            assumed_align=16,
-        )
-        fake_out = make_fake_compact_tensor(
-            cutlass.Int32, (rows, TOP_K), stride_order=(1, 0), assumed_align=4
-        )
-        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = _dynamic_kernel.DynamicRadixTopkDecodeKernel(
-            next_n=next_n,
-            total_ctas=ctas,
-            max_ctas_per_row=max_ctas_per_row,
-            threads=threads,
-            unroll=unroll,
-            use_pdl=use_pdl,
-            pipe=pipe,
-            min_blocks=min_blocks,
-        )
-        launch = cute.compile(
-            kernel,
-            fake_logits,
-            fake_lens,
-            fake_aux_i,
-            fake_aux_l,
-            fake_state,
-            fake_out,
-            stream,
-            options="--enable-tvm-ffi",
-        )
-        state = torch.zeros(
-            (_dynamic_kernel.MAX_ROWS, _dynamic_kernel.STATE_WORDS_PER_ROW),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        handle = CompiledDynamicRadixTopkDecode(launch, state, *key, sm_count)
-        logits = torch.zeros((next_n, 4096), dtype=torch.float32, device="cuda")
-        lens = torch.full((1,), 4096, dtype=torch.int32, device="cuda")
-        out = torch.empty((next_n, TOP_K), dtype=torch.int32, device="cuda")
-        aux_i = torch.empty(next_n * _MAX_BLOCKS_PER_ROW * TOP_K, dtype=torch.int32, device="cuda")
-        aux_l = torch.empty_like(aux_i, dtype=torch.float32)
-        launch(logits, lens, aux_i, aux_l, state, out)
-        torch.cuda.synchronize()
-    _DYNAMIC_COMPILED[key] = handle
-    return handle
-
-
-def dynamic_radix_topk_decode(
-    logits: torch.Tensor,
-    seq_lens: torch.Tensor,
-    indices: torch.Tensor,
-    aux_indices: torch.Tensor,
-    aux_logits: torch.Tensor,
-    *,
-    compiled: CompiledDynamicRadixTopkDecode,
-) -> torch.Tensor:
-    """Single-launch ``cluster=(1, 1, 1)`` length-proportional decode top-k selector.
-
-    Matches ``cluster_radix_topk_decode``'s exact selection contract (valid columns first in no
-    particular order, then -1; -NaN fallback through the 10-partition split/merge path) while
-    allocating CTAs proportional to per-row causal length to eliminate straggler tail latency and
-    GPC cluster fragmentation.
-    """
-    runs = _split_call_runs(
-        logits, seq_lens, indices, aux_indices, aux_logits,
-        next_n=compiled.next_n, device_id=compiled.device_id, sm_count=compiled.sm_count,
-    )  # fmt: skip
-    if logits.shape[0]:
-        if not runs:
-            return indexer_topk_decode(
-                logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
-            )
-        compiled.launch(
-            logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), compiled.state, indices
-        )
+        selected.launch(logits, seq_lens, aux_indices.view(-1), aux_logits.view(-1), indices)
     return indices
 
 

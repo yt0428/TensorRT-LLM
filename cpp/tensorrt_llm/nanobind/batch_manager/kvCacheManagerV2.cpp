@@ -912,6 +912,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::DiskIoIterationStats>(m, "DiskIoIterationStats")
         .def_prop_ro("read_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.readBytes; })
         .def_prop_ro("write_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.writeBytes; })
+        .def_prop_ro(
+            "required_write_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.requiredWriteBytes; })
         .def_prop_ro("read_ops", [](kv::DiskIoIterationStats const& self) { return self.io.readOps; })
         .def_prop_ro("write_ops", [](kv::DiskIoIterationStats const& self) { return self.io.writeOps; })
         .def_prop_ro("read_busy_ns", [](kv::DiskIoIterationStats const& self) { return self.io.readBusyNs; })
@@ -937,6 +939,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("reserve_deferred_pages", &kv::DiskIoIterationStats::reserveDeferredPages)
         .def_ro("last_level_dropped_pages", &kv::DiskIoIterationStats::lastLevelDroppedPages)
         .def_ro("failed_pages", &kv::DiskIoIterationStats::failedPages)
+        .def_ro("retained_copies_current", &kv::DiskIoIterationStats::retainedCopiesCurrent)
+        .def_ro("retained_copies_created", &kv::DiskIoIterationStats::retainedCopiesCreated)
+        .def_ro("retained_copies_reused", &kv::DiskIoIterationStats::retainedCopiesReused)
+        .def_ro("retained_copies_reclaimed", &kv::DiskIoIterationStats::retainedCopiesReclaimed)
+        .def_ro("retained_copies_dropped", &kv::DiskIoIterationStats::retainedCopiesDropped)
         .def_ro("stream_mem_ops", &kv::DiskIoIterationStats::streamMemOps);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
@@ -1393,6 +1400,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_ro("retained_copies", &kv::StorageStatistics::retainedCopies)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
 
@@ -1643,6 +1651,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
         .def_rw("host_reserve_fraction", &kv::DiskCacheTierConfig::hostReserveFraction)
         .def_rw("max_pending_write_bytes", &kv::DiskCacheTierConfig::maxPendingWriteBytes)
+        .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
+        .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2398,6 +2408,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def("inject_disk_io_faults", &kv::KvCacheIntrospection::injectDiskIoFaults, nb::arg("manager"),
         nb::arg("reads"), nb::arg("count"), nb::arg("errno_value"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "disk_copy_counters",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const c = manager.storage().diskCopyCounters();
+            nb::dict counters;
+            counters["retained"] = c.retained;
+            counters["created"] = c.created;
+            counters["reused"] = c.reused;
+            counters["reclaimed"] = c.reclaimed;
+            counters["dropped"] = c.dropped;
+            return counters;
+        },
+        nb::arg("manager"));
     nb::class_<kv::HostMemPlacement>(mIntrospection, "HostMemPlacement")
         .def_ro("gpu_numa_node", &kv::HostMemPlacement::gpuNumaNode)
         .def_ro("strict_binding", &kv::HostMemPlacement::strictBinding)
@@ -2734,6 +2758,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                             return nb::none();
                         }
                         return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
+                    });
+            },
+            nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        .def(
+            "has_disk_resident_prefix",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
+            {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
+                if (inputTokens.is_none())
+                {
+                    return false;
+                }
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->hasDiskResidentPrefix(std::move(reuseScope), view, knownNoDigest);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())

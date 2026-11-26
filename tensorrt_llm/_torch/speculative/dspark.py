@@ -30,10 +30,13 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..distributed import AllReduceStrategy, allgather
+from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from .dflash import DFlashWorker, dflash_draft_slot_ids
+from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
+from .vocab_parallel import tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -1208,6 +1211,34 @@ class DSparkWorker(DFlashWorker):
                 "(d2t vocab mapping is not supported); drafter "
                 f"{type(draft_model).__name__} declares one."
             )
+        # Built by bind_draft_lm_head when the drafter's head is known.
+        self._markov_tp_exchange = None
+
+    def bind_draft_lm_head(self, draft_model) -> None:
+        """Also build the Markov chain's TP exchange where it is used."""
+        super().bind_draft_lm_head(draft_model)
+        if self._vocab_parallel is not None:
+            self._markov_tp_exchange = self._vocab_parallel.head.exchange
+            return
+        head = draft_model.lm_head
+        mapping = self.mapping
+        needs_exchange = (
+            self._markov_tp_exchange is None
+            and getattr(draft_model, "has_markov_head", False)
+            and mapping is not None
+            and mapping.tp_size > 1
+            and not mapping.enable_attention_dp
+            and (
+                (
+                    isinstance(head, Linear)
+                    and head.tp_mode == TensorParallelMode.COLUMN
+                    and not head.gather_output
+                )
+                or getattr(draft_model, "markov_output_is_sharded", False)
+            )
+        )
+        if needs_exchange:
+            self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.AUTO)
 
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
@@ -1235,6 +1266,43 @@ class DSparkWorker(DFlashWorker):
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
         )
 
+    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """A drafter with a Markov head chains the greedy block through it."""
+        draft_tokens = super()._vocab_parallel_draft_tokens(draft_model)
+        if draft_tokens is None or not getattr(draft_model, "has_markov_head", False):
+            return draft_tokens
+        if getattr(draft_model, "has_recurrent_markov_head", False):
+            if callable(getattr(draft_model, "vocab_parallel_markov_tokens", None)):
+                return self._rnn_markov_block_tokens
+            return None
+        return self._markov_block_tokens
+
+    def _markov_block_tokens(
+        self,
+        draft_model,
+        local_block: torch.Tensor,
+        inputs: dict,
+        draft_hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del draft_hidden_states
+        return self._vocab_parallel.head.markov_tokens(
+            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+        )
+
+    def _rnn_markov_block_tokens(
+        self,
+        draft_model,
+        local_block: torch.Tensor,
+        inputs: dict,
+        draft_hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return draft_model.vocab_parallel_markov_tokens(
+            local_block,
+            inputs["first_prev_tokens"],
+            draft_hidden_states,
+            self._vocab_parallel.head,
+        )
+
     def _refine_and_greedy_sample_block(
         self,
         draft_model,
@@ -1245,6 +1313,8 @@ class DSparkWorker(DFlashWorker):
     ) -> Optional[torch.Tensor]:
         """Direct greedy Markov chain sampling without materializing refined full-vocab logits."""
         if not getattr(draft_model, "has_markov_head", False):
+            return None
+        if getattr(draft_model, "markov_output_is_sharded", False):
             return None
         greedy_fn = getattr(draft_model, "apply_markov_chain_greedy", None)
         if greedy_fn is None:
@@ -1316,6 +1386,45 @@ class DSparkWorker(DFlashWorker):
         # duplicate the draft head's sharding rules. A standalone drafter
         # borrows the target lm_head, whose gather_output defaults to True, so
         # the logits normally arrive full-vocab and this branch is skipped.
+        if getattr(draft_model, "markov_output_is_sharded", False):
+            mapping = self.mapping
+            shard_w = draft_model.markov_w2.shape[0]
+            full_vocab = getattr(draft_model, "markov_vocab_size", shard_w * mapping.tp_size)
+            if gen_logits.shape[-1] == full_vocab:
+                col_base = mapping.tp_rank * shard_w
+                local_base = gen_logits[..., col_base : col_base + shard_w].contiguous()
+            elif gen_logits.shape[-1] == shard_w:
+                local_base = gen_logits
+            else:
+                raise NotImplementedError(
+                    f"DSpark Markov head: draft logits width {gen_logits.shape[-1]} "
+                    f"matches neither full vocab {full_vocab} nor shard {shard_w}."
+                )
+
+            def sharded_argmax_fn(step_logits):
+                return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
+
+            head_kwargs = {}
+            if getattr(draft_model, "has_recurrent_markov_head", False):
+                head_kwargs["hidden_states"] = draft_hidden_states
+            exchange = (
+                self._vocab_parallel.head.exchange
+                if self._vocab_parallel is not None
+                else self._markov_tp_exchange
+            )
+            if exchange is not None:
+                head_kwargs["tp_exchange"] = exchange
+            local_refined = draft_model.apply_markov_chain_logits(
+                local_base,
+                first_prev_tokens,
+                argmax_fn=sharded_argmax_fn,
+                vocab_slice=None,
+                **head_kwargs,
+            )
+            if gen_logits.shape[-1] == full_vocab:
+                return allgather(local_refined, mapping, dim=-1)
+            return local_refined
+
         full_vocab = draft_model.markov_w2.shape[0]
         shard = gen_logits.shape[-1]
         vocab_slice = None

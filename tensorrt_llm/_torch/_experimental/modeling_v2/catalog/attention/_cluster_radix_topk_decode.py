@@ -8,15 +8,17 @@ add (`pad` entries at `key(-FLT_MAX)`, ranked after the columns of that key), ti
 taken in no particular order. The selected columns come first and every selected pad as a -1 after
 them.
 
-The row's `C` CTAs each own a contiguous slice of its causal window, read in 16-byte vectors. An
-exact radix select over the full 32-bit key runs digit by digit (bits 31..20, 19..10, 9..0):
+The row's `C` CTAs (power of two in `2..32`) each own a contiguous slice of its causal window, read
+in 16-byte vectors. An exact radix select over the full 32-bit key runs digit by digit (bits
+31..20, 19..10, 9..0):
 
 1. Each CTA counts its slice's digit (rank 0 adds the row's pads) into a shared-memory histogram
    and publishes the first nonzero bin and the bin where its own cumulative count reaches the
    number still needed. The row's threshold bin lies between the smallest of the first bins and
    the smallest of the crossing bins, so after a cluster barrier each CTA sums only that range of
-   the C histograms over distributed shared memory and finds the threshold bin, the count above
-   it and the count in it, identically in every CTA.
+   the C histograms over distributed shared memory (reading local SMEM first and staggering remote
+   peer ranks to avoid crossbar hotspots at 16/32 CTAs) and finds the threshold bin, the count
+   above it and the count in it, identically in every CTA.
 2. While the threshold bin holds more columns than rank 0's gather list, the next digit is counted
    over the slice among the keys sharing the prefix, into the other histogram buffer.
 3. One pass over the slice writes each column above the prefix to the output, at a base each CTA
@@ -215,6 +217,36 @@ def _saddr(tensor, index):
     return (tensor.iterator + index).toint()
 
 
+def _align_up(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) // alignment * alignment
+
+
+def cluster_kernel_smem_bytes(cluster: int, threads: int) -> int:
+    """Dynamic shared memory footprint (bytes) of `ClusterRadixTopkDecodeKernel.cluster_kernel`."""
+    warps = threads // 32
+    allocs = (
+        (D1_BINS * 4, 128),  # s_hist0
+        (LEVELS[1][2] * 4, 128),  # s_hist1
+        (D1_BINS * 4, 128),  # s_ghist
+        (LIST_CAPACITY * 4, 128),  # s_lkey
+        (LIST_CAPACITY * 4, 128),  # s_lcol
+        (warps * 4, 128),  # s_warp
+        (warps * 4, 128),  # s_red
+        (8 * 4, 16),  # s_thr
+        (_SCALARS * 4, 16),  # s_scal
+        (8 * 4, 16),  # s_fb
+        (_INFO_WORDS * 4, 16),  # s_info0
+        (_INFO_WORDS * 4, 16),  # s_info1
+        (3 * cluster * 4, 16),  # s_peer
+        (_COUNTERS * 4, 16),  # s_cnt
+        (MAX_REQUESTS * 4, 16),  # s_order
+    )
+    offset = 0
+    for size, align in allocs:
+        offset = _align_up(offset, align) + size
+    return _align_up(offset, 128)
+
+
 class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
     """`cluster` CTAs of `threads` threads per row, `unroll` 16-byte vectors per thread in each
     batch of a pass over the slice, the next batch's loads issued before a batch is processed
@@ -233,7 +265,13 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
         trace: bool = False,
     ):
         super().__init__(next_n, PARTITIONS, use_pdl)
-        assert threads % 32 == 0 and D1_BINS % threads == 0 and LEVELS[1][2] % threads == 0
+        assert (
+            2 <= cluster <= 32
+            and (cluster & (cluster - 1)) == 0
+            and threads % 32 == 0
+            and D1_BINS % threads == 0
+            and LEVELS[1][2] % threads == 0
+        )
         self.C = cluster
         self.T = threads
         self.W = threads // 32
@@ -474,13 +512,15 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
             s_info[_I_CUT] = cutlass.Int32(nbins - 1)
 
     @cute.jit
-    def _peer_range(self, s_info, s_peer, tid):
+    def _peer_range(self, s_info, s_peer, rank, tid):
         """(first bin, crossing bin, negative NaNs) over the cluster: the smallest first bin and
-        crossing bin, and the summed count. Every CTA reads the same words."""
+        crossing bin, and the summed count. Every CTA reads the same words in rank-staggered
+        order to avoid crossbar hotspots."""
         if tid < cutlass.Int32(self.C):
+            peer = (rank + tid) & cutlass.Int32(self.C - 1)
             for i in cutlass.range_constexpr(3):
                 s_peer[tid * cutlass.Int32(3) + cutlass.Int32(i)] = _ld_cluster(
-                    _mapa(_saddr(s_info, cutlass.Int32(i)), tid)
+                    _mapa(_saddr(s_info, cutlass.Int32(i)), peer)
                 )
         cute.arch.barrier()
         lo = s_peer[_I_LO]
@@ -495,11 +535,11 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
         return lo, cut, neg
 
     @cute.jit
-    def _sum_range(self, s_hist, s_ghist, nbins: cutlass.Constexpr[int], lo, cut, tid):
+    def _sum_range(self, s_hist, s_ghist, nbins: cutlass.Constexpr[int], lo, cut, rank, tid):
         """The cluster's histogram over bins [lo, cut] into `s_ghist`, zero elsewhere. The bins of
-        the range go to the threads in turn (each reads the C peers' counts of its bins); the
-        rest are zeroed by the thread that owns them in the base class's `_threshold`. Ends with
-        a barrier."""
+        the range go to the threads in turn (each reads local SMEM then the C-1 peers in
+        rank-staggered ring order); the rest are zeroed by the thread that owns them in the base
+        class's `_threshold`. Ends with a barrier."""
         per = cutlass.const_expr(nbins // self.T)
         base = tid * cutlass.Int32(per)
         for j in cutlass.range_constexpr(per):
@@ -509,9 +549,10 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
         b = lo + tid
         while b <= cut:
             addr = _saddr(s_hist, b)
-            g = cutlass.Int32(0)
-            for r in cutlass.range_constexpr(self.C):
-                g = g + _ld_cluster(_mapa(addr, cutlass.Int32(r)))
+            g = s_hist[b]
+            for r in cutlass.range_constexpr(1, self.C):
+                peer = (rank + cutlass.Int32(r)) & cutlass.Int32(self.C - 1)
+                g = g + _ld_cluster(_mapa(addr, peer))
             s_ghist[b] = g
             b = b + cutlass.Int32(self.T)
         cute.arch.barrier()
@@ -808,11 +849,11 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
                     cute.arch.cluster_wait()
                     if cutlass.const_expr(level == 0):
                         self._stamp(aux_indices, trace_base, bid, 2, tid)
-                    rlo, rcut, rneg = self._peer_range(s_info, s_peer, tid)
+                    rlo, rcut, rneg = self._peer_range(s_info, s_peer, rank, tid)
                     if rneg > zero:
                         mode = cutlass.Int32(_FALLBACK)
                     else:
-                        self._sum_range(s_hist, s_ghist, nbins, rlo, rcut, tid)
+                        self._sum_range(s_hist, s_ghist, nbins, rlo, rcut, rank, tid)
                         t, before, count = self._threshold(s_ghist, s_warp, s_thr, nbins, need, tid)
                         below = self._split_at(s_hist, nbins, t, s_red, s_scal, tid)
                         eq = s_scal[_S_EQN]

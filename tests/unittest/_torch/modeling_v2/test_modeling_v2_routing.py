@@ -287,6 +287,9 @@ _TP8 = dict(_TEP8, moe_ep_size=1, moe_tp_size=8)
 _TP8_BARE = dict(world_size=8, tp_size=8, gpus_per_node=4)
 # Eight ranks over two nodes of four with attention data parallel (dep8): dep4 over eight ranks.
 _DEP8 = dict(_DEP4, world_size=8, tp_size=8, moe_ep_size=8, gpus_per_node=4)
+# Sixteen ranks over four nodes of four (tp16 on sm_107): every expert on every rank, cut 16 ways.
+_TP16 = dict(_TP4, world_size=16, tp_size=16, moe_tp_size=16, gpus_per_node=4)
+_TP16_BARE = dict(world_size=16, tp_size=16, gpus_per_node=4)
 
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
@@ -510,8 +513,10 @@ def test_mistral_large4_nvfp4_tep4_matches(mode):
         (_DEP8, _MISTRAL_LARGE4_NVFP4_SM107_DEP4_TARGET),
         (_TP4, _MISTRAL_LARGE4_NVFP4_SM107_TP4_TARGET),
         (_TP8, _MISTRAL_LARGE4_NVFP4_SM107_TP4_TARGET),
+        (_TP16, _MISTRAL_LARGE4_NVFP4_SM107_TP4_TARGET),
+        (_TP16_BARE, _MISTRAL_LARGE4_NVFP4_SM107_TP4_TARGET),
     ],
-    ids=["tep4", "tep8", "dep4", "dep8", "tp4", "tp8"],
+    ids=["tep4", "tep8", "dep4", "dep8", "tp4", "tp8", "tp16", "tp16_bare"],
 )
 def test_mistral_large4_nvfp4_sm107_topologies_match(monkeypatch, mode, mapping, target):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
@@ -536,7 +541,7 @@ def test_mistral_large4_nvfp4_sm107_refuses_other_topologies(monkeypatch, mappin
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-@pytest.mark.parametrize("mapping", [_TEP4, _TEP8, _DEP4, _DEP8, _TP4, _TP8])
+@pytest.mark.parametrize("mapping", [_TEP4, _TEP8, _DEP4, _DEP8, _TP4, _TP8, _TP16])
 def test_mistral_large4_nvfp4_sm107_refuses_non_native_speculation(monkeypatch, mapping):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     config = _model_config(

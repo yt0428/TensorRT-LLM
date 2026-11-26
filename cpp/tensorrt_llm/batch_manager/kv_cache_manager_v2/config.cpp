@@ -44,6 +44,10 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: hostReserveFraction must be in [0, 1)");
     }
+    if (!(protectedCopyFraction >= 0.0F && protectedCopyFraction <= 1.0F)) // also rejects NaN
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: protectedCopyFraction must be between 0 and 1");
+    }
 }
 
 void KVCacheManagerConfig::validate() const

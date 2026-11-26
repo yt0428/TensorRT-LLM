@@ -69,12 +69,22 @@ enum class DiskIoStatus : uint8_t
     kFailed,
 };
 
+enum class DiskIoPriority : uint8_t
+{
+    //! Latency-critical transfers: reads, and fenced writes that a GPU stream or read waits on.
+    kRequired,
+    //! Best-effort background transfers such as unfenced host-reserve writes.
+    kBackground,
+};
+
 //! Counters since the last DiskIoEngine::takeStats(). Busy times are summed over workers, so they can
 //! exceed the wall time of the window.
 struct DiskIoStats
 {
     uint64_t readBytes = 0;
     uint64_t writeBytes = 0;
+    //! Subset of writeBytes from kRequired (fenced) write and copy operations.
+    uint64_t requiredWriteBytes = 0;
     uint64_t readOps = 0;
     uint64_t writeOps = 0;
     uint64_t readBusyNs = 0;
@@ -134,7 +144,8 @@ public:
     DiskIoEngine& operator=(DiskIoEngine const&) = delete;
 
     //! Queues a batch and returns its ticket. A batch with no operations completes when it is activated.
-    DiskIoTicket submit(DiskIoKind kind, std::vector<DiskIoOp> ops, bool activate);
+    DiskIoTicket submit(
+        DiskIoKind kind, std::vector<DiskIoOp> ops, bool activate, DiskIoPriority priority = DiskIoPriority::kRequired);
 
     //! Makes a batch submitted inactive runnable. Activating twice, or an unknown ticket, terminates.
     void activate(DiskIoTicket ticket) noexcept;
@@ -178,6 +189,7 @@ private:
     {
         DiskIoTicket ticket = kNoDiskIoTicket;
         DiskIoKind kind = DiskIoKind::kRead;
+        DiskIoPriority priority = DiskIoPriority::kRequired;
         std::vector<DiskIoOp> ops;
         size_t nextOp = 0;
         size_t remainingOps = 0;
@@ -203,11 +215,19 @@ private:
         return kind != DiskIoKind::kRead;
     }
 
+    [[nodiscard]] bool hasWorkLocked() const noexcept
+    {
+        return !mReadQueue.empty() || !mRequiredWriteQueue.empty() || !mBackgroundWriteQueue.empty();
+    }
+
+    [[nodiscard]] std::deque<DiskIoTicket>& selectQueueLocked(bool preferWrites);
     [[nodiscard]] DiskIoStatus statusLocked(DiskIoTicket ticket) const;
     void enqueueLocked(Batch& batch);
     void completeLocked(Batch& batch);
     void workerLoop(bool preferWrites);
     int runOp(DiskIoKind kind, DiskIoOp const& op, std::vector<std::byte>& bounce, std::byte*& bounceAligned);
+
+    static constexpr int64_t kRequiredWriteMaxWaitNs = 10'000'000;
 
     uint32_t const mRingSize;
     uint32_t* const mCompletionWords;
@@ -220,7 +240,9 @@ private:
     DiskIoTicket mNextTicket = 1;
     uint64_t mNumIncomplete = 0;
     std::deque<DiskIoTicket> mReadQueue;
-    std::deque<DiskIoTicket> mWriteQueue;
+    std::deque<DiskIoTicket> mRequiredWriteQueue;
+    std::deque<DiskIoTicket> mBackgroundWriteQueue;
+    bool mServedAgedWriteLast = false;
     std::unordered_set<DiskIoTicket> mFailedTickets;
     DiskIoStats mStats;
     int mFaultsLeft[3] = {0, 0, 0};

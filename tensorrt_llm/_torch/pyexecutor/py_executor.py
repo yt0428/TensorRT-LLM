@@ -114,6 +114,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
+from .runtime_hooks import ExecutorEvents, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -431,6 +432,18 @@ class PendingEncoderStep:
 
 
 class PyExecutor:
+    # True while the overlap loop runs with the execution stream current
+    # (_overlap_loop_stream_scope).
+    _loop_on_execution_stream = False
+    # Whether the model opted into running the overlap loop on the execution
+    # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
+    _execution_stream_loop_armed = False
+    # The model's executor events (RuntimeHooks.executor_events); read once at
+    # construction.
+    _executor_events: Optional[ExecutorEvents] = None
+    # Streaming early-emission window (RuntimeHooks.first_content_emit_iters).
+    first_content_emit_iters = 1
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -548,6 +561,9 @@ class PyExecutor:
         # related modules
         self.resource_manager = resource_manager
         self.model_engine = model_engine
+        hooks = runtime_hooks_of(getattr(model_engine, "model", None))
+        self._execution_stream_loop_armed = hooks.loop_on_execution_stream
+        self._executor_events = hooks.executor_events
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
         self._enable_scheduler_aware_adp_dummy = getattr(
@@ -613,8 +629,15 @@ class PyExecutor:
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
         self.stream_interval = self.llm_args.stream_interval
+        self.first_content_emit_iters = max(1, hooks.first_content_emit_iters)
+        if self.stream_interval > 1 and self.first_content_emit_iters > 1:
+            logger.info(
+                f"first-content emission engaged: emit on decoding iters "
+                f"<= {self.first_content_emit_iters} (stream_interval "
+                f"{self.stream_interval}), rank {self.dist.rank}")
         self.perf_manager = PerfMetricsManager(
-            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
+            enabled=getattr(self.llm_args, 'return_perf_metrics', False),
+            timing_side_stream=hooks.perf_metrics_timing_side_stream)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -942,6 +965,9 @@ class PyExecutor:
         # Ensure the default stream waits for execution_stream to complete
         # before subsequent operations.
         torch.cuda.current_stream().wait_stream(self.execution_stream)
+        if self._executor_events is not None:
+            with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                self._executor_events.after_warmup()
         self.encoder_launch_executor = (ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="encoder-launch")
                                         if self.is_encoder_decoder else None)
@@ -3049,6 +3075,9 @@ class PyExecutor:
                     f"Error waiting on PP send handles during cleanup: "
                     f"{traceback.format_exc()}")
 
+        if self._executor_events is not None and self._event_loop_completed:
+            self._executor_events.at_shutdown()
+
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
@@ -4191,17 +4220,28 @@ class PyExecutor:
         budget = (kv_cache_manager.disk_prefetch_num_reqs -
                   kv_cache_manager.num_context_onboards)
         for req in self.active_requests:
-            if budget <= 0:
-                break
             if (not req.is_first_context_chunk or req.is_dummy
                     or req.is_disagg_generation_init_state
                     or req.py_request_id in kv_cache_manager.kv_cache_map
                     or req.py_request_id in self._prefetched_request_ids):
                 continue
-            self._prefetched_request_ids.add(req.py_request_id)
-            if kv_cache_manager.start_context_onboard(req):
-                budget -= 1
-                req.py_kv_onboard_pending = gate
+            if budget > 0:
+                self._prefetched_request_ids.add(req.py_request_id)
+                if kv_cache_manager.start_context_onboard(req):
+                    budget -= 1
+                    req.py_kv_onboard_pending = gate
+                else:
+                    req.py_kv_onboard_pending = False
+            elif gate:
+                if req.py_kv_onboard_pending:
+                    continue
+                if kv_cache_manager.has_disk_prefix_to_onboard(req):
+                    req.py_kv_onboard_pending = True
+                else:
+                    self._prefetched_request_ids.add(req.py_request_id)
+                    req.py_kv_onboard_pending = False
+            else:
+                break
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
@@ -4554,6 +4594,16 @@ class PyExecutor:
         if not getattr(self, "_is_kv_manager_v2", False):
             return False
         return self.kv_cache_manager.is_preemption_pending(request)
+
+    def _has_pending_preemption(self) -> bool:
+        """True while any victim is parked mid-preemption (V2 only).
+
+        Lets per-request loops skip `_is_preemption_pending` in the common
+        case where nothing is parked.
+        """
+        if not getattr(self, "_is_kv_manager_v2", False):
+            return False
+        return self.kv_cache_manager.has_pending_preemption()
 
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.
@@ -5758,11 +5808,46 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    @contextmanager
+    def _overlap_loop_stream_scope(self):
+        """Run the overlap loop with the execution stream current, when the model opted in.
+
+        _forward_step makes the execution stream wait for the current stream
+        before every forward and the current stream wait for the execution
+        stream after it. On the thread's default stream, which in steady decode
+        carries only these waits and timing events, step N+1's inputs wait for
+        decode graph N through two cross-stream event hops. With the execution
+        stream current the loop's stream work is queued in the same order on one
+        stream and _forward_step skips both waits.
+
+        Not taken with a two-model drafter, a guided decoder, a KV connector,
+        an encoder-decoder model or multimodal encoder item scheduling, whose
+        side streams synchronize with the current stream.
+        """
+        if not (self._execution_stream_loop_armed and self.drafter is None and
+                self.draft_model_engine is None and self.guided_decoder is None
+                and self.kv_connector_manager is None
+                and not self.is_encoder_decoder
+                and not self._mm_encoder_item_scheduling_enabled):
+            yield
+            return
+        with torch.cuda.stream(self.execution_stream):
+            self._loop_on_execution_stream = True
+            try:
+                yield
+            finally:
+                self._loop_on_execution_stream = False
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        if self._executor_events is not None:
+            self._executor_events.before_overlap_loop()
+        on_iteration = (getattr(self._executor_events, "on_iteration", None)
+                        if self._executor_events is not None else None)
+        with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
+                self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
@@ -5771,6 +5856,8 @@ class PyExecutor:
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                if on_iteration is not None:
+                    on_iteration(self.iter_counter)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -8492,8 +8579,10 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
-            # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            # with KVCacheTransferManager's onboard/offload operations. With the
+            # loop on the execution stream both waits are program order.
+            if not self._loop_on_execution_stream:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8507,7 +8596,8 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if not self._loop_on_execution_stream:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
@@ -9210,6 +9300,26 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _should_emit_response(self,
+                              request: LlmRequest,
+                              emit_first_iter: bool = True) -> bool:
+        """Whether ``_handle_responses`` emits a response for ``request`` now.
+
+        Emits on decoding iteration 1, on finish, every ``stream_interval``
+        iterations, and on iterations ``2..first_content_emit_iters``.
+        """
+        decoding_iter = request.py_decoding_iter
+        if request.is_finished:
+            return True
+        if decoding_iter == 1:
+            # The early-emit prototype issues the (non-terminal) iter-1
+            # response from `_emit_first_token_responses`; suppress it here.
+            return emit_first_iter
+        if (self.first_content_emit_iters > 1
+                and 1 < decoding_iter <= self.first_content_emit_iters):
+            return True
+        return decoding_iter % self.stream_interval == 0
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -9225,6 +9335,8 @@ class PyExecutor:
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
+        check_preemption = self._has_pending_preemption()
+        perf_metrics_enabled = self.perf_manager.enabled
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -9237,7 +9349,7 @@ class PyExecutor:
             # Responding would hand the client a final response for a request
             # about to re-prefill, and dropping it from active_requests would
             # leave _resume_preempted_request nothing to put back.
-            if self._is_preemption_pending(request):
+            if check_preemption and self._is_preemption_pending(request):
                 new_active_requests.append(request)
                 continue
 
@@ -9275,18 +9387,22 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and getattr(request, "py_csa2_remote_tail_mode", None)
                         != "destination" and request.py_decoding_iter <= 1):
-                    self.perf_manager.append_step_metrics(
-                        request,
-                        self.iter_counter,
-                        batch_token_time=batch_token_time)
+                    if perf_metrics_enabled:
+                        self.perf_manager.append_step_metrics(
+                            request,
+                            self.iter_counter,
+                            batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+            if perf_metrics_enabled:
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
@@ -9302,13 +9418,15 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
-            should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
-            # The early-emit prototype issues the (non-terminal) iter-1
-            # response from `_emit_first_token_responses`; suppress it here.
-            if (not emit_first_iter and request.py_decoding_iter == 1
-                    and not request.is_finished):
+            should_emit = self._should_emit_response(request, emit_first_iter)
+            # A non-streaming request yields no result until it finishes
+            # (LlmRequest::createResult), so creating a response for it on
+            # every earlier step only costs a native call. Requests that
+            # return perf metrics keep the call: it finalizes their ctx GPU
+            # totals.
+            if (should_emit and not request.is_finished
+                    and not getattr(request, "streaming", True)
+                    and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
                 if request.return_perf_metrics:

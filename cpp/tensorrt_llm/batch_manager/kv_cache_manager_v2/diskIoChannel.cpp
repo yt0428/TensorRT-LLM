@@ -103,7 +103,9 @@ DiskIoChannel::~DiskIoChannel()
 DiskIoTicket DiskIoChannel::enqueue(CUstream stream, DiskIoKind kind, std::vector<DiskIoOp> ops, bool fence)
 {
     TLLM_CHECK_WITH_INFO(mEngine != nullptr, "DiskIoChannel used after destroy()");
-    DiskIoTicket const ticket = mEngine->submit(kind, std::move(ops), /*activate=*/false);
+    DiskIoPriority const priority
+        = (kind == DiskIoKind::kRead || fence) ? DiskIoPriority::kRequired : DiskIoPriority::kBackground;
+    DiskIoTicket const ticket = mEngine->submit(kind, std::move(ops), /*activate=*/false, priority);
 
     auto activateArgs = std::make_unique<HostFnArgs>(HostFnArgs{mEngine.get(), ticket});
     if (CUresult const result = cuLaunchHostFunc(stream, activateHostFn, activateArgs.get()); result != CUDA_SUCCESS)
