@@ -396,8 +396,9 @@ class DecoderInputPreparer:
             and self._steady_gen_cache_supported
             and not self.mapping.has_cp_helix()
         ):
-            stage_rng = (
-                self.runtime_hooks.pack_spec_rng_uploads
+            stage_rng = bool(self.runtime_hooks.pack_spec_rng_uploads)
+            self._steady_mtp_uses_defer_rng = (
+                stage_rng
                 and "defer_rng_rows"
                 in inspect.signature(SpecMetadata.populate_sampling_params_for_one_model).parameters
             )
@@ -410,6 +411,11 @@ class DecoderInputPreparer:
                 use_mrope=self._config.use_mrope,
                 has_static_inputs=cuda_graph_runner is not None and cuda_graph_runner.enabled,
                 stage_rng=stage_rng,
+                steady_dsa=self.runtime_hooks.steady_dsa_prepare,
+                defer_dsa_derived=(
+                    self.runtime_hooks.steady_dsa_prepare
+                    and self.runtime_hooks.decode_prologue is None
+                ),
             )
 
     def _new_extra_inputs(self) -> ExtraInputsCollector:
@@ -788,10 +794,15 @@ class DecoderInputPreparer:
         rng_rows = steady_mtp.rng_rows()
         sampling_populated = False
         if rng_rows is not None and scheduled_requests.num_context_requests == 0:
-            rng_state = spec_metadata.populate_sampling_params_for_one_model(
-                scheduled_requests.all_requests(), defer_rng_rows=rng_rows
-            )
-            sampling_populated = True
+            if getattr(self, "_steady_mtp_uses_defer_rng", False):
+                rng_state = spec_metadata.populate_sampling_params_for_one_model(
+                    scheduled_requests.all_requests(), defer_rng_rows=rng_rows
+                )
+                sampling_populated = True
+            else:
+                rng_state = steady_mtp.try_take_steady_rng_state(requests, spec_metadata)
+                if rng_state is not None:
+                    sampling_populated = True
         num_cached_tokens_per_seq, kv_lens, static_inputs_staged = steady_mtp.stage(
             requests,
             new_tensors_device,
@@ -840,7 +851,8 @@ class DecoderInputPreparer:
         spec_metadata.host_position_ids = None
         if not sampling_populated:
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
-        spec_metadata.prepare()
+        if not steady_mtp.try_prepare_steady_spec(requests, spec_metadata):
+            spec_metadata.prepare()
 
         inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])
         inputs["spec_metadata"] = spec_metadata
