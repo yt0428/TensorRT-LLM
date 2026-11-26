@@ -788,6 +788,7 @@ def _register_fake():
         metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
+        mpi_comm_fortran_handle: Optional[int] = None,
     ) -> None:
         return None
 

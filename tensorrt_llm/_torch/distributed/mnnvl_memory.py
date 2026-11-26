@@ -284,6 +284,8 @@ class MnnvlMemory:
         "comm": None,  # MPI communicator.
         # Parallel layout "comm" was split for; see comm_layout_signature().
         "comm_signature": None,
+        # Parent communicator/ProcessGroup from which "comm" was constructed.
+        "comm_parent": None,
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
         # Derived from get_allocation_prop(), whose handle type differs per class.
@@ -297,6 +299,7 @@ class MnnvlMemory:
     current_address_comm_size: int = 0
     comm = None
     comm_signature = None
+    comm_parent = None
     allocated_map = {}
     address_refcnt = {}
     allocation_granularity: int = 0
@@ -343,6 +346,11 @@ class MnnvlMemory:
         # the index has to come from the same record and not from the current
         # class-level communicator, whose rank may refer to a different layout.
         return int(record.mem_handles[record.comm_rank])
+
+    @property
+    def allocation_comm(self) -> Any:
+        """Return the communicator that exported and mapped this allocation."""
+        return type(self).allocated_map[self.ptr].comm
 
     @staticmethod
     def initialize():
@@ -413,12 +421,16 @@ class MnnvlMemory:
         Rebuild the communicator whenever the layout changes.
         """
         signature = cls.comm_layout_signature(mapping)
+        parent_comm = cls.comm_process_group(mapping) if mpi_disabled() else mpi_comm()
         if cls.comm is not None:
-            if cls.comm_signature == signature:
+            if cls.comm_signature == signature and (
+                cls.comm_parent is None or cls.comm_parent is parent_comm
+            ):
                 return cls.comm
             logger.warning(
                 f"[{cls.__name__}] cached communicator was created for parallel layout "
-                f"{cls.comm_signature}, but {signature} is requested; recreating it."
+                f"{cls.comm_signature}, but {signature} or a new parent communicator is requested; "
+                "recreating it."
             )
             cls.drop_cached_comm()
         if mpi_disabled():
@@ -426,7 +438,7 @@ class MnnvlMemory:
             # own singleton, so Split() would yield a size-1 communicator while
             # the workspace is sized with the caller's parallel size; route
             # through the Torch ProcessGroup for the same rank group instead.
-            pg = cls.comm_process_group(mapping)
+            pg = parent_comm
             if pg is None:
                 raise ValueError(
                     f"{cls.__name__}: ProcessGroup not initialised; it is "
@@ -435,8 +447,9 @@ class MnnvlMemory:
             cls.comm = ProcessGroupComm(pg)
         else:
             color, key = cls.comm_split_color_key(mapping)
-            cls.comm = mpi_comm().Split(color, key)
+            cls.comm = parent_comm.Split(color, key)
         cls.comm_signature = signature
+        cls.comm_parent = parent_comm
         return cls.comm
 
     @classmethod
@@ -466,6 +479,7 @@ class MnnvlMemory:
         """
         cls.comm = None
         cls.comm_signature = None
+        cls.comm_parent = None
 
     @classmethod
     def get_allocation_prop(cls, dev_id: int):
@@ -975,6 +989,7 @@ class MnnvlMemory:
         # because MPI_Comm_free is collective and this path is per-allocation.
         type(self).comm = record.comm
         type(self).comm_signature = record.comm_signature or None
+        type(self).comm_parent = None
         record.pending_comm = None
         record.state = _MnnvlAllocationState.MAPPED
 

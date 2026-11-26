@@ -27,7 +27,7 @@ NVLINK One-Sided supports post-quant dispatch.
 import os
 import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pynvml
 import torch
@@ -49,6 +49,7 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (
     cuda,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import BuildInfo
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
@@ -63,6 +64,26 @@ _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR
 _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
 _CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
 FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
+
+
+def _workspace_allocation_comm(mnnvl_mem: Any) -> Any:
+    """Return the communicator that exported and mapped ``mnnvl_mem``."""
+    alloc_comm = getattr(mnnvl_mem, "allocation_comm", None)
+    if alloc_comm is not None:
+        return alloc_comm
+    return getattr(mnnvl_mem, "comm", None)
+
+
+def _mpi_comm_fortran_handle(comm: Any) -> Optional[int]:
+    """Return the Fortran MPI_Comm handle for ``comm``, or None for non-MPI/test fakes."""
+    if comm is None or mpi_disabled():
+        return None
+    py2f = getattr(comm, "py2f", None)
+    if callable(py2f):
+        return int(py2f())
+    return None
+
+
 _CFT_ALIGNMENT_BYTES = 16
 _CFT_MIN_DRIVER_BRANCH = 615
 
@@ -611,7 +632,13 @@ class NVLinkOneSided(Communication):
             )
             mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            comm_handle = _mpi_comm_fortran_handle(_workspace_allocation_comm(mnnvl_mem))
+            if comm_handle is not None:
+                torch.ops.trtllm.moe_a2a_initialize(
+                    workspace, metainfo, self.ep_rank, self.ep_size, comm_handle
+                )
+            else:
+                torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
@@ -688,6 +715,35 @@ class NVLinkOneSided(Communication):
             watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
             watchdog_on_timeout=alltoall_watchdog_on_timeout,
         )
+        # Initialize CFT Logical Endpoints by binding the LE to the workspace
+        # before publishing the workspace to process-wide caches, so a failed
+        # endpoint exchange cannot leave an uninitialized workspace cached.
+        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
+            try:
+                comm_handle = _mpi_comm_fortran_handle(_workspace_allocation_comm(self.mnnvl_mem))
+                if comm_handle is not None:
+                    torch.ops.trtllm.moe_a2a_cft_initialize(
+                        self.workspace,
+                        self.mnnvl_mem.local_mem_handle,
+                        int(self.workspace.size(1)),
+                        self.ep_rank,
+                        self.ep_size,
+                        comm_handle,
+                    )
+                else:
+                    torch.ops.trtllm.moe_a2a_cft_initialize(
+                        self.workspace,
+                        self.mnnvl_mem.local_mem_handle,
+                        int(self.workspace.size(1)),
+                        self.ep_rank,
+                        self.ep_size,
+                    )
+            except Exception:
+                self._workspace_lifecycle.unregister(self)
+                raise
+            workspace_state["cft_initialized"] = True
+            NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
+
         if workspace_created:
             NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         NVLinkOneSided._WORKSPACE = workspace_state
@@ -695,19 +751,6 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
         )
         self._workspace_registered = True
-
-        # Initialize CFT Logical Endpoints by binding the LE to the workspace.
-        # The LE IS the workspace — no separate allocation or payload layout needed.
-        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
-            torch.ops.trtllm.moe_a2a_cft_initialize(
-                self.workspace,
-                self.mnnvl_mem.local_mem_handle,
-                int(self.workspace.size(1)),
-                self.ep_rank,
-                self.ep_size,
-            )
-            workspace_state["cft_initialized"] = True
-            NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -907,9 +950,15 @@ class NVLinkOneSided(Communication):
         # The native op re-validates the planned layout and resets control state;
         # the layout itself is unchanged by a restore.
         def reinitialize_frontend() -> torch.Tensor:
-            torch.ops.trtllm.moe_a2a_initialize(
-                self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
-            )
+            comm_handle = _mpi_comm_fortran_handle(comm)
+            if comm_handle is not None:
+                torch.ops.trtllm.moe_a2a_initialize(
+                    self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size, comm_handle
+                )
+            else:
+                torch.ops.trtllm.moe_a2a_initialize(
+                    self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
+                )
             return self.moe_a2a_metainfo
 
         self._require_workspace_lifecycle().checkpoint_restore(comm, reinitialize_frontend)

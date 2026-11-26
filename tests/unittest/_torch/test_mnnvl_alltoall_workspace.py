@@ -1054,3 +1054,224 @@ def test_destroy_releases_only_its_own_cft_workspace(
     assert kept_state["cft_initialized"] is True
     assert NVLinkOneSided._WORKSPACE is kept_state
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {kept_key: 1}
+
+
+def test_nvlink_one_sided_passes_allocation_ep_comm_handle_to_init_and_cft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both moe_a2a_initialize and moe_a2a_cft_initialize must receive the allocation's EP comm.
+
+    In a multi-server MPI world (e.g. disaggregated_mpi_worker splitting 12 ranks into
+    a 4-rank CTX subgroup and an 8-rank GEN subgroup), each server's workspace is mapped
+    over its split EP communicator. Passing that allocation's Fortran handle keeps C++
+    workspace init and CFT LE exchange scoped to the exact EP subgroup rather than
+    MPI_COMM_WORLD or a mutated class-level communicator.
+    """
+
+    class _SubgroupComm(_FakeComm):
+        def __init__(self, handle: int) -> None:
+            super().__init__()
+            self._handle = handle
+
+        def py2f(self) -> int:
+            return self._handle
+
+    alloc_comm = _SubgroupComm(handle=4242)
+    stale_class_comm = _SubgroupComm(handle=9999)
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.comm = stale_class_comm
+            self.allocation_comm = alloc_comm
+            self.local_mem_handle = 12345
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(4, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    init_mock = Mock()
+    cft_init_mock = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", init_mock)
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_initialize", cft_init_mock)
+
+    mapping = SimpleNamespace(
+        world_size=4,
+        moe_ep_size=4,
+        moe_ep_rank=2,
+        has_cp_helix=Mock(return_value=False),
+    )
+    comm = NVLinkOneSided(mapping=mapping, num_slots=16, top_k=4, max_num_tokens_per_rank=1)
+
+    assert init_mock.call_count == 1
+    assert init_mock.call_args.args[2:5] == (2, 4, 4242)
+    assert cft_init_mock.call_count == 1
+    assert cft_init_mock.call_args.args[1:6] == (12345, 64, 2, 4, 4242)
+    assert comm._workspace_state["cft_initialized"] is True
+
+
+def test_nvlink_one_sided_omits_mpi_handle_when_mpi_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When TLLM_DISABLE_MPI=1 (Ray/ProcessGroup path), no MPI Fortran handle is passed."""
+
+    class _MpiShapedComm(_FakeComm):
+        def py2f(self) -> int:
+            pytest.fail("py2f() must not be queried when MPI is disabled")
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.allocation_comm = _MpiShapedComm()
+            self.local_mem_handle = 77
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(2, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    init_mock = Mock()
+    cft_init_mock = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", init_mock)
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_initialize", cft_init_mock)
+
+    mapping = SimpleNamespace(
+        world_size=2,
+        moe_ep_size=2,
+        moe_ep_rank=0,
+        has_cp_helix=Mock(return_value=False),
+    )
+    NVLinkOneSided(mapping=mapping, num_slots=8, top_k=2, max_num_tokens_per_rank=1)
+
+    assert len(init_mock.call_args.args) == 4
+    assert len(cft_init_mock.call_args.args) == 5
+
+
+def test_nvlink_one_sided_cft_init_failure_does_not_publish_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed moe_a2a_cft_initialize must unregister lifecycle and leave caches clean."""
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.allocation_comm = _FakeComm()
+            self.local_mem_handle = 11
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(4, 64, dtype=torch.uint8)
+
+    lifecycle = Mock()
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=lifecycle)
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", Mock())
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "moe_a2a_cft_initialize",
+        Mock(side_effect=RuntimeError("comm size mismatch")),
+    )
+
+    mapping = SimpleNamespace(
+        world_size=4,
+        moe_ep_size=4,
+        moe_ep_rank=0,
+        has_cp_helix=Mock(return_value=False),
+    )
+    with pytest.raises(RuntimeError, match="comm size mismatch"):
+        NVLinkOneSided(mapping=mapping, num_slots=16, top_k=4, max_num_tokens_per_rank=1)
+
+    lifecycle.unregister.assert_called_once()
+    assert NVLinkOneSided._WORKSPACES == {}
+    assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
+    assert NVLinkOneSided._WORKSPACE is None
+    assert NVLinkOneSided._CFT_OWNER_SHAPE is None
+
+
+def test_nvlink_one_sided_checkpoint_restore_passes_comm_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """checkpoint_restore must forward the restored communicator's Fortran handle."""
+
+    class _RestoredComm(_FakeComm):
+        def py2f(self) -> int:
+            return 7777
+
+    init_mock = Mock()
+    monkeypatch.setattr(one_sided_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", init_mock)
+
+    workspace = torch.zeros(4, 64, dtype=torch.uint8)
+    metainfo = torch.zeros(4, dtype=torch.int64)
+    lifecycle = Mock()
+    lifecycle.checkpoint_restore.side_effect = lambda comm, reinit: reinit()
+
+    nvlink = NVLinkOneSided.__new__(NVLinkOneSided)
+    nvlink.workspace = workspace
+    nvlink._workspace_lifecycle = lifecycle
+    nvlink.ep_rank = 1
+    nvlink.ep_size = 4
+    nvlink.mnnvl_mem = SimpleNamespace(comm=None)
+    lifecycle.metainfo = metainfo
+
+    restored_comm = _RestoredComm()
+    nvlink.checkpoint_restore(restored_comm)
+
+    init_mock.assert_called_once_with(workspace, metainfo, 1, 4, 7777)

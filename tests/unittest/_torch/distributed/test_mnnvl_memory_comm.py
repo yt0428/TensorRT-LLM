@@ -274,3 +274,36 @@ def test_process_group_comm_barrier_uses_cpu_backend(
 
     assert pg.requested_devices == [torch.device("cpu")]
     assert waited == [True]
+
+
+def test_get_comm_rebuilds_when_parent_mpi_comm_changes_with_same_layout(
+    mpi_mode: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching set_mpi_comm() to a new subgroup with the same shape must rebuild cls.comm."""
+
+    class _FakeParentComm:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+            self.split_calls = 0
+
+        def Split(self, color: int, key: int) -> str:
+            self.split_calls += 1
+            return f"{self.tag}:{color}:{key}"
+
+    parent_a = _FakeParentComm("subA")
+    parent_b = _FakeParentComm("subB")
+    active = {"comm": parent_a}
+    monkeypatch.setattr(_mnnvl_utils, "mpi_comm", lambda: active["comm"])
+
+    mapping = _FakeMapping()
+    first = MnnvlMemory.get_comm(mapping)
+    second = MnnvlMemory.get_comm(mapping)
+    assert first == "subA:0:1"
+    assert second is first
+    assert parent_a.split_calls == 1
+
+    active["comm"] = parent_b
+    rebuilt = MnnvlMemory.get_comm(mapping)
+    assert rebuilt == "subB:0:1"
+    assert rebuilt is not first
+    assert parent_b.split_calls == 1

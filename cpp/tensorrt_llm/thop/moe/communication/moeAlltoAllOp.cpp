@@ -29,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <unordered_map>
@@ -70,61 +71,131 @@ int64_t moeA2AGetTimeoutOp()
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
 
 // ---------------------------------------------------------------------------
-// Communication shims.
+// Communication scope for MoE all-to-all workspace and CFT setup.
 //
-// The MoE all-to-all workspace setup used tensorrt_llm::mpi::MpiComm directly.
-// mpiUtils.h throws "MPI is disabled, DON'T USE MPI" whenever TLLM_DISABLE_MPI=1,
-// which the Ray executor sets for every worker (executor/ray_executor.py), so the
-// NVLinkOneSided strategy always failed there and silently degraded to
-// NVLinkTwoSided. Route through the Torch process group in that case; the same
-// pattern is already used by cacheTransceiver / allreduceOp via pg_utils.
+// On the MPI path:
+//   - If the caller supplies an explicit Fortran MPI_Comm handle (from the
+//     MNNVL allocation's EP communicator), borrow it via MPI_Comm_f2c without
+//     taking ownership.
+//   - Otherwise use MpiComm::session() (never MpiComm::world()): in standalone
+//     launches session() equals world(), while in split-session launches
+//     (disaggregated_mpi_worker or multi-server MPI worlds) session() is the
+//     server's sub-communicator rather than the global world.
+//
+// On the non-MPI path (TLLM_DISABLE_MPI=1, e.g. Ray), route through the Torch
+// world ProcessGroup, matching pg_utils elsewhere.
 // ---------------------------------------------------------------------------
 
-inline void moeA2ABarrier()
+class MoeA2AComm
 {
-    if (useMPI())
-    {
-        tensorrt_llm::mpi::MpiComm::session().barrier();
-        return;
-    }
-    auto const pg = tensorrt_llm::pg_utils::get_world_pg();
-    TORCH_CHECK(pg,
-        "MoE all-to-all needs either MPI or an initialised Torch process group; neither is available. "
-        "Initialise the Torch process group before building the MoE workspace, or unset TLLM_DISABLE_MPI.");
-    PGCHECK_THROW(pg->barrier());
-}
+public:
+    MoeA2AComm() = default;
+    MoeA2AComm(MoeA2AComm const&) = delete;
+    MoeA2AComm& operator=(MoeA2AComm const&) = delete;
+    MoeA2AComm(MoeA2AComm&&) noexcept = default;
+    MoeA2AComm& operator=(MoeA2AComm&&) noexcept = default;
 
-// Byte allgather over `bytesPerRank` from every rank, matching the MPI
-// signature the CFT endpoint exchange expects.
-inline void moeA2AAllgatherBytes(void const* sendBuf, void* recvBuf, size_t bytesPerRank)
-{
-    if (useMPI())
+    static MoeA2AComm resolve(
+        torch::optional<int64_t> mpiCommFortranHandle, int64_t epRank, int64_t epSize, bool requireExactTopology)
     {
-        tensorrt_llm::mpi::MpiComm::world().allgather(
-            sendBuf, recvBuf, bytesPerRank, tensorrt_llm::mpi::MpiType::kBYTE);
-        return;
-    }
-    auto const pg = tensorrt_llm::pg_utils::get_world_pg();
-    TORCH_CHECK(pg,
-        "MoE all-to-all needs either MPI or an initialised Torch process group; neither is available. "
-        "Initialise the Torch process group before building the MoE workspace, or unset TLLM_DISABLE_MPI.");
+        MoeA2AComm comm;
+        if (useMPI())
+        {
+            if (mpiCommFortranHandle.has_value())
+            {
+#if ENABLE_MULTI_DEVICE
+                MPI_Comm const rawComm = MPI_Comm_f2c(static_cast<MPI_Fint>(mpiCommFortranHandle.value()));
+                TORCH_CHECK(rawComm != MPI_COMM_NULL,
+                    "MoE all-to-all received an invalid MPI communicator handle (MPI_COMM_NULL).");
+                comm.mBorrowedMpiComm.emplace(rawComm, /*freeComm=*/false);
+#else
+                TORCH_CHECK(false, "Multi-device MPI support is disabled.");
+#endif
+            }
+            else
+            {
+                comm.mSessionComm = &tensorrt_llm::mpi::MpiComm::session();
+            }
+            auto const* activeMpi = comm.mpiComm();
+            comm.mSize = static_cast<int64_t>(activeMpi->getSize());
+            comm.mRank = static_cast<int64_t>(activeMpi->getRank());
+        }
+        else
+        {
+            TORCH_CHECK(!mpiCommFortranHandle.has_value(),
+                "MoE all-to-all cannot accept an MPI communicator handle when TLLM_DISABLE_MPI=1.");
+            comm.mPg = tensorrt_llm::pg_utils::get_world_pg();
+            TORCH_CHECK(comm.mPg,
+                "MoE all-to-all needs either MPI or an initialised Torch process group; neither is available. "
+                "Initialise the Torch process group before building the MoE workspace, or unset TLLM_DISABLE_MPI.");
+            comm.mSize = static_cast<int64_t>(comm.mPg->getSize());
+            comm.mRank = static_cast<int64_t>(comm.mPg->getRank());
+        }
 
-    // ProcessGroup::allgather works on tensors, so view both buffers as CPU
-    // uint8 tensors without copying. wrap_tensor keeps the caller's memory.
-    auto const worldSize = pg->getSize();
-    auto sendTensor
-        = tensorrt_llm::pg_utils::wrap_tensor(const_cast<uint8_t*>(static_cast<uint8_t const*>(sendBuf)), bytesPerRank);
-    std::vector<torch::Tensor> recvTensors;
-    recvTensors.reserve(worldSize);
-    for (int r = 0; r < worldSize; r++)
-    {
-        recvTensors.push_back(
-            tensorrt_llm::pg_utils::wrap_tensor(static_cast<uint8_t*>(recvBuf) + r * bytesPerRank, bytesPerRank));
+        if (requireExactTopology)
+        {
+            TORCH_CHECK(comm.mSize == epSize, "MoE all-to-all communicator size (", comm.mSize, ") must equal epSize (",
+                epSize, "). Provide the EP communicator handle or configure MpiComm::session() to match the EP group.");
+            TORCH_CHECK(comm.mRank == epRank, "MoE all-to-all communicator rank (", comm.mRank, ") must equal epRank (",
+                epRank,
+                "). Communicator rank ordering must match epRank so peer handles map to the corresponding peers.");
+        }
+        return comm;
     }
-    std::vector<std::vector<torch::Tensor>> outputs{std::move(recvTensors)};
-    std::vector<torch::Tensor> inputs{sendTensor};
-    PGCHECK_THROW(pg->allgather(outputs, inputs, {}));
-}
+
+    void barrier() const
+    {
+        if (auto const* activeMpi = mpiComm(); activeMpi != nullptr)
+        {
+            activeMpi->barrier();
+            return;
+        }
+        PGCHECK_THROW(mPg->barrier());
+    }
+
+    // Byte allgather over `bytesPerRank` from every rank in the resolved EP
+    // communicator, matching the signature expected by CftLeManager.
+    void allgatherBytes(void const* sendBuf, void* recvBuf, size_t bytesPerRank) const
+    {
+        if (auto const* activeMpi = mpiComm(); activeMpi != nullptr)
+        {
+            activeMpi->allgather(sendBuf, recvBuf, bytesPerRank, tensorrt_llm::mpi::MpiType::kBYTE);
+            return;
+        }
+
+        // ProcessGroup::allgather works on tensors, so view both buffers as CPU
+        // uint8 tensors without copying. wrap_tensor keeps the caller's memory.
+        auto const pgSize = mPg->getSize();
+        auto sendTensor = tensorrt_llm::pg_utils::wrap_tensor(
+            const_cast<uint8_t*>(static_cast<uint8_t const*>(sendBuf)), bytesPerRank);
+        std::vector<torch::Tensor> recvTensors;
+        recvTensors.reserve(pgSize);
+        for (int r = 0; r < pgSize; r++)
+        {
+            recvTensors.push_back(
+                tensorrt_llm::pg_utils::wrap_tensor(static_cast<uint8_t*>(recvBuf) + r * bytesPerRank, bytesPerRank));
+        }
+        std::vector<std::vector<torch::Tensor>> outputs{std::move(recvTensors)};
+        std::vector<torch::Tensor> inputs{sendTensor};
+        PGCHECK_THROW(mPg->allgather(outputs, inputs, {}));
+    }
+
+private:
+    tensorrt_llm::mpi::MpiComm const* mpiComm() const
+    {
+        if (mBorrowedMpiComm.has_value())
+        {
+            return &mBorrowedMpiComm.value();
+        }
+        return mSessionComm;
+    }
+
+    std::optional<tensorrt_llm::mpi::MpiComm> mBorrowedMpiComm;
+    tensorrt_llm::mpi::MpiComm const* mSessionComm{nullptr};
+    c10::intrusive_ptr<c10d::ProcessGroup> mPg;
+    int64_t mSize{0};
+    int64_t mRank{-1};
+};
 
 // TODO: Is Alignment necessary?
 // Helper function to align offset to specified byte boundary
@@ -270,7 +341,8 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
 }
 
 // Initialize control state after allocation; layout construction itself is CPU-only.
-void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
+void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize,
+    torch::optional<int64_t> mpiCommFortranHandle)
 {
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
@@ -290,16 +362,15 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     TORCH_CHECK(workspace.size(1) >= layout[WORKSPACE_SIZE_INDEX], "Workspace needs ", layout[WORKSPACE_SIZE_INDEX],
         " bytes per rank, got ", workspace.size(1));
 
+    auto const comm = MoeA2AComm::resolve(
+        mpiCommFortranHandle, epRank, epSize, /*requireExactTopology=*/mpiCommFortranHandle.has_value());
+
     workspace[epRank].narrow(0, 0, layout[WORKSPACE_SIZE_INDEX]).zero_();
     uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
         2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
-    // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
-    // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
-    // NVLinkOneSided strategy unusable there; fall back to the Torch process
-    // group the Ray workers already initialise, as pg_utils does elsewhere.
     cudaDeviceSynchronize();
-    moeA2ABarrier();
+    comm.barrier();
 }
 
 // ============================================================================
@@ -367,7 +438,7 @@ static bool copyCftPeerLeIds(CUdeviceptr workspaceRankPtr, int64_t epSize, LeId*
 //   workspaceSizePerRank: size of the workspace per rank in bytes
 //   epRank, epSize: EP topology
 void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemHandle, int64_t workspaceSizePerRank,
-    int64_t epRank, int64_t epSize)
+    int64_t epRank, int64_t epSize, torch::optional<int64_t> mpiCommFortranHandle)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
@@ -381,24 +452,10 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     TORCH_CHECK(workspaceSizePerRank > 0 && workspaceSizePerRank <= workspace.stride(0),
         "workspaceSizePerRank must be in the range (0, workspace.stride(0)]");
 
-    // Size check through the same MPI-or-ProcessGroup selection as the
-    // endpoint allgather below (world scope on the MPI path): MpiComm under
-    // TLLM_DISABLE_MPI=1 is a singleton whose size can never match epSize.
-    int64_t cftCommSize = 0;
-    if (useMPI())
-    {
-        cftCommSize = static_cast<int64_t>(tensorrt_llm::mpi::MpiComm::world().getSize());
-    }
-    else
-    {
-        auto const pg = tensorrt_llm::pg_utils::get_world_pg();
-        TORCH_CHECK(pg,
-            "MoE all-to-all needs either MPI or an initialised Torch process group; neither is available. "
-            "Initialise the Torch process group before building the MoE workspace, or unset TLLM_DISABLE_MPI.");
-        cftCommSize = static_cast<int64_t>(pg->getSize());
-    }
-    TORCH_CHECK(cftCommSize == epSize, "CFT endpoint exchange requires the communicator size (", cftCommSize,
-        ") to equal epSize (", epSize, "). MoE all-to-all with CFT counted writes must run as pure EP.");
+    // Resolve the EP communicator and verify both size and rank match (epSize,
+    // epRank) before exchanging LE handles: CftLeManager::exchangeEndpoints
+    // indexes the allgather buffer directly by rank in this communicator.
+    auto const comm = MoeA2AComm::resolve(mpiCommFortranHandle, epRank, epSize, /*requireExactTopology=*/true);
 
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
@@ -421,8 +478,8 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
                     static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
         "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
 
-    auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank)
-    { moeA2AAllgatherBytes(sendBuf, recvBuf, bytesPerRank); };
+    auto allgatherFn = [&comm](void const* sendBuf, void* recvBuf, size_t bytesPerRank)
+    { comm.allgatherBytes(sendBuf, recvBuf, bytesPerRank); };
 
     TORCH_CHECK(manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
 
@@ -432,19 +489,9 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
         fprintf(stderr, "CftLeManager[rank%d]: cudaDeviceSynchronize after init FAILED: %s\n", (int) epRank,
             cudaGetErrorString(initErr));
     }
-    // The endpoint exchange above is world-scoped, so the barrier closing it
-    // must be too. moeA2ABarrier() uses session() on the MPI path, which can
-    // be a subset of world once MpiComm::setSession() has run
-    // (orchestrator/leader mode); a rank released by a session barrier could
-    // proceed before every world peer has imported its endpoints.
-    if (useMPI())
-    {
-        tensorrt_llm::mpi::MpiComm::world().barrier();
-    }
-    else
-    {
-        moeA2ABarrier();
-    }
+    // Synchronize the same EP communicator used for the handle exchange above
+    // so every peer has imported all endpoints before counted writes begin.
+    comm.barrier();
     std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
     bool const inserted = g_cft_managers.try_emplace(workspaceRankPtr, std::move(manager)).second;
     TORCH_CHECK(inserted, "CFT logical endpoints were initialized concurrently for the same workspace");
@@ -1108,9 +1155,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor? active_rank_mask=None) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
-        "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
+        "int workspace_size_per_rank, int ep_rank, int ep_size, "
+        "int? mpi_comm_fortran_handle=None) -> ()");
     module.def("moe_a2a_cft_release(Tensor(a!) workspace, int ep_rank) -> ()");
-    module.def("moe_a2a_initialize(Tensor(a!) workspace, Tensor metainfo, int ep_rank, int ep_size) -> ()");
+    module.def(
+        "moe_a2a_initialize(Tensor(a!) workspace, Tensor metainfo, int ep_rank, int ep_size, "
+        "int? mpi_comm_fortran_handle=None) -> ()");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
