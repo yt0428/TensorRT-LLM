@@ -202,6 +202,85 @@ class TestLocalityMapContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             _LOCALITY.build_logical_map_host(harvested_doms, harvested_rem, 212, 94, 24)
 
+    def test_ugpu_high_batch_and_non_graph_guard(self) -> None:
+        # Low-concurrency ULL (c=1 mbs=2 or mbs=8, c=4 mbs=8, CUDA graphs on) keeps n_split.
+        self.assertEqual(_LOCALITY.DEFAULT_UGPU_MOE_MAX_BATCH_SIZE, 8)
+        for inter in (768, 1536):
+            for mbs in (None, 1, 2, 4, 8):
+                self.assertEqual(
+                    _LOCALITY.recommend_moe_locality_mode(
+                        inter, max_batch_size=mbs, use_cuda_graph=True
+                    ),
+                    "n_split",
+                )
+                self.assertEqual(
+                    _LOCALITY.resolve_moe_locality_mode(
+                        "auto", inter, max_batch_size=mbs, use_cuda_graph=True
+                    ),
+                    ("n_split", None),
+                )
+
+            # High-batch serving (e.g. Disagg TP8/TP4 GEN mbs=16/24/32) skips 70-140 GiB uGPU
+            # weight duplication so HBM4 capacity remains available for KV cache.
+            for mbs in (9, 16, 24, 32, 128):
+                self.assertEqual(
+                    _LOCALITY.recommend_moe_locality_mode(
+                        inter, max_batch_size=mbs, use_cuda_graph=True
+                    ),
+                    "none",
+                )
+                mode, reason = _LOCALITY.resolve_moe_locality_mode(
+                    "auto", inter, max_batch_size=mbs, use_cuda_graph=True
+                )
+                self.assertEqual(mode, "none")
+                self.assertIsNotNone(reason)
+                assert reason is not None
+                self.assertIn(f"max_batch_size={mbs}", reason)
+
+            # Eager/context workers (use_cuda_graph=False) also skip uGPU weight duplication.
+            self.assertEqual(
+                _LOCALITY.recommend_moe_locality_mode(
+                    inter, max_batch_size=4, use_cuda_graph=False
+                ),
+                "none",
+            )
+            mode, reason = _LOCALITY.resolve_moe_locality_mode(
+                "auto", inter, max_batch_size=4, use_cuda_graph=False
+            )
+            self.assertEqual(mode, "none")
+            self.assertIsNotNone(reason)
+            assert reason is not None
+            self.assertIn("use_cuda_graph=False", reason)
+
+            # Explicit non-auto requests stay honored on full-SM GPUs (for targeted tests).
+            self.assertEqual(
+                _LOCALITY.resolve_moe_locality_mode(
+                    "n_split", inter, sms_per_domain=100, max_batch_size=32, use_cuda_graph=False
+                ),
+                ("n_split", None),
+            )
+
+        # TP16 (I=384) auto -> 'none' emits no high-batch/graph skip reason.
+        self.assertEqual(
+            _LOCALITY.resolve_moe_locality_mode(
+                "auto", 384, max_batch_size=32, use_cuda_graph=False
+            ),
+            ("none", None),
+        )
+
+        # Source wiring contract: model_loader publishes max_batch_size and tp4 DecodeTarget
+        # forwards max_batch_size + use_cuda_graph without temporary A/B env switches.
+        modeling_src = (_TARGET_DIR / "modeling.py").read_text()
+        weights_src = (_TARGET_DIR / "weights.py").read_text()
+        loader_src = (
+            _REPO_ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "model_loader.py"
+        ).read_text()
+        self.assertIn('config.extra_attrs["max_batch_size"]', loader_src)
+        self.assertIn('extra_attrs.get("max_batch_size")', modeling_src)
+        self.assertIn("max_batch_size=max_batch_size", weights_src)
+        self.assertNotIn("TRTLLM_ML4_MOE_LOCALITY", modeling_src)
+        self.assertNotIn("TRTLLM_ML4_MOE_LOCALITY", weights_src)
+
     def test_fp8_linear_and_lm_head_granule_splits(self) -> None:
         # ix_wq_b [4096, 6144] FP8 = 24 MiB -> 12+12 MiB exact.
         hb, phb, exact = _LOCALITY.plan_n_split_bytes((4096, 6144), 1, dim=0, granule=self.gran)

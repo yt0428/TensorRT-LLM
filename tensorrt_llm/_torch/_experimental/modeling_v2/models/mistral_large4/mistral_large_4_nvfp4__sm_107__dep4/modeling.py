@@ -170,6 +170,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
     triton_draft_attention,
+    triton_embed_draft_block,
     triton_latent_tail,
     triton_markov_gate,
     triton_markov_input,
@@ -232,6 +233,7 @@ from .ops.comm.lamport_moe_dispatch import build_moe_comm_workspace, lamport_moe
 from .ops.gemm.layer_norm_fp8_block_scale_linear import layer_norm_fp8_block_scale_linear
 from .ops.gemm.mla_v_up_fp8_block_scale_linear import mla_v_up_fp8_block_scale_linear
 from .ops.moe.moe_finalize import moe_finalize
+from .runtime_hooks import make_ml4_dep_runtime_hooks
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
 _VISION_EPS = 1e-5
@@ -2335,11 +2337,10 @@ class DraftModel(nn.Module):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
         weight = self.core.w["embed"]
-        valid = (anchors >= 0) & (anchors < weight.shape[0])
-        embedded = nn.functional.embedding(anchors.clamp(0, weight.shape[0] - 1), weight)
-        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
-        masks = self.core.w["draft_mask"].unsqueeze(0).expand(anchors.shape[0], -1, -1)
-        return torch.cat((embedded.unsqueeze(1), masks), dim=1)
+        masks = self.core.w["draft_mask"]
+        if anchors.is_cuda or os.environ.get("TRITON_INTERPRET") == "1":
+            return triton_embed_draft_block(anchors, weight, masks, block_size)
+        return triton_embed_draft_block.reference(anchors, weight, masks, block_size)
 
     def project_target_hidden(self, hidden):
         w = self.core.w
@@ -2729,6 +2730,11 @@ class ModelingV2MistralLarge4Nvfp4Sm107Dep4(
             vocab_size=cfg.vocab_size,
         )
         self.softcap = float(cfg.softmax_tanh_gating)
+        self.runtime_hooks = make_ml4_dep_runtime_hooks(
+            model_config.mapping,
+            use_cuda_graph=model_config.use_cuda_graph,
+            enable_attention_dp=model_config.mapping.enable_attention_dp,
+        )
         self._vision: Optional[VisionTower] = None
         vis = getattr(cfg, "vision_config", None)
         self._image_token_ids = (

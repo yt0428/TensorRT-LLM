@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - allows CPU contract helpers without to
     torch = None  # type: ignore[assignment]
 
 __all__ = [
+    "DEFAULT_UGPU_MOE_MAX_BATCH_SIZE",
     "DEFAULT_VMM_GRANULARITY",
     "DomainSlabAllocator",
     "LocalityMap",
@@ -50,6 +51,12 @@ __all__ = [
 ]
 
 DEFAULT_VMM_GRANULARITY = 2 * 1024 * 1024  # 2 MiB on Rubin VR200
+# Maximum configured batch size for automatic Paradigm-B MoE uGPU duplication.
+# The persistent CuTe DSL MoE engine serves M <= 8 tokens (low-concurrency ULL),
+# whereas duplicating routed MoE weights into dual-domain VMM consumes ~70 GiB at TP8
+# (~140 GiB at TP4) of HBM4 that high-concurrency disaggregated GEN/CTX workers need
+# for KV cache capacity.
+DEFAULT_UGPU_MOE_MAX_BATCH_SIZE = 8
 _SLAB_ALIGN = 256  # TMA base-pointer alignment
 
 _PROBE_SRC = r"""
@@ -251,16 +258,25 @@ def recommend_moe_locality_mode(
     *,
     sms_per_domain: int | None = None,
     required_per_domain: int = 94,
+    max_batch_size: int | None = None,
+    use_cuda_graph: bool = True,
 ) -> Literal["n_split", "none"]:
     """Choose the default Paradigm-B MoE locality mode for a per-rank intermediate width.
 
     * For ``moe_inter >= 512`` with 128-aligned half-width (TP4 ``I=1536``, TP8 ``I=768``),
       ``n_split`` places FC1 and FC2 halves in die-local HBM4 with deterministic 50/50 balance,
-      provided the GPU has at least ``required_per_domain`` SMs per locality domain.
-    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``) or harvested-SM GPUs with
-      ``sms_per_domain < required_per_domain``, falls back to ``none``.
+      provided the GPU has at least ``required_per_domain`` SMs per locality domain, CUDA graphs
+      are enabled, and ``max_batch_size`` does not exceed :data:`DEFAULT_UGPU_MOE_MAX_BATCH_SIZE`.
+    * For narrow widths ``moe_inter < 512`` (TP16 ``I=384``), harvested-SM GPUs with
+      ``sms_per_domain < required_per_domain``, eager non-CUDA-graph workers (e.g. disaggregated
+      context prefill), or high-batch serving (``max_batch_size > DEFAULT_UGPU_MOE_MAX_BATCH_SIZE``)
+      where KV-cache HBM4 capacity dominates, falls back to ``none``.
     """
     del num_experts
+    if not use_cuda_graph:
+        return "none"
+    if max_batch_size is not None and max_batch_size > DEFAULT_UGPU_MOE_MAX_BATCH_SIZE:
+        return "none"
     if sms_per_domain is not None and sms_per_domain < required_per_domain:
         return "none"
     if moe_inter >= 512 and (moe_inter // 2) % 128 == 0:
@@ -275,13 +291,31 @@ def resolve_moe_locality_mode(
     *,
     sms_per_domain: int | None = None,
     required_per_domain: int = 94,
+    max_batch_size: int | None = None,
+    use_cuda_graph: bool = True,
 ) -> tuple[Literal["none", "n_split", "expert_half"], str | None]:
-    """Resolve ``requested_mode`` against hardware ``sms_per_domain``, falling back to ``'none'``
-    with a diagnostic reason string when a GPU lacks enough per-domain SMs."""
+    """Resolve ``requested_mode`` against batch/graph serving configuration and hardware
+    ``sms_per_domain``, falling back to ``'none'`` with a diagnostic reason string when uGPU
+    weight duplication should be skipped or a GPU lacks enough per-domain SMs."""
     if requested_mode == "auto":
-        mode: Literal["none", "n_split", "expert_half"] = recommend_moe_locality_mode(
-            moe_inter, num_experts
-        )
+        base_mode = recommend_moe_locality_mode(moe_inter, num_experts)
+        if base_mode != "none" and not use_cuda_graph:
+            reason = (
+                f"auto locality mode {base_mode!r} skipped with use_cuda_graph=False "
+                "(eager/context worker); preserving HBM4 for KV cache ('none')"
+            )
+            return "none", reason
+        if (
+            base_mode != "none"
+            and max_batch_size is not None
+            and max_batch_size > DEFAULT_UGPU_MOE_MAX_BATCH_SIZE
+        ):
+            reason = (
+                f"auto locality mode {base_mode!r} skipped for max_batch_size={max_batch_size} "
+                f"(> {DEFAULT_UGPU_MOE_MAX_BATCH_SIZE}); preserving HBM4 for KV cache ('none')"
+            )
+            return "none", reason
+        mode: Literal["none", "n_split", "expert_half"] = base_mode
     elif requested_mode in ("none", "n_split", "expert_half"):
         mode = requested_mode  # type: ignore[assignment]
     else:
