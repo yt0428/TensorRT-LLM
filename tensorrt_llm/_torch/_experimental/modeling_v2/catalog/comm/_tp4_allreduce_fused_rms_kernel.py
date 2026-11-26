@@ -4238,7 +4238,7 @@ def compile_pure_for_rank(
         assumed_align=_ALIGNMENT_BYTES,
     )
 
-    workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
+    workspace_numel = cute.sym_int64(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
     fake_buffers = []
     fake_ready_flags = []
@@ -4411,7 +4411,7 @@ def compile_fused_for_rank(
         assumed_align=_ALIGNMENT_BYTES,
     )
 
-    workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
+    workspace_numel = cute.sym_int64(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
     fake_buffers = []
     fake_ready_flags = []
@@ -4606,7 +4606,7 @@ def compile_fused_out_quant_for_rank(
         assumed_align=_ALIGNMENT_BYTES,
     )
 
-    workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
+    workspace_numel = cute.sym_int64(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
     fake_buffers = []
     fake_ready_flags = []
@@ -4760,7 +4760,7 @@ def _compile_twoshot_common(
         stride_order=(1, 0),
         assumed_align=_ALIGNMENT_BYTES,
     )
-    workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
+    workspace_numel = cute.sym_int64(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
     fake_buffers = []
     fake_ready_flags = []

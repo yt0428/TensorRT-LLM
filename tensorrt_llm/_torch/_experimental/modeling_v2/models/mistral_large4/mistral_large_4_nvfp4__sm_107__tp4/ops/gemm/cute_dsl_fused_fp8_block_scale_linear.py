@@ -10,11 +10,39 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
 )
 
 # (M, N, K) -> (Split-K slices, warps per CTA) for the decode target's per-rank FP8 projections
-# at TP8 and TP4, M = 1, 2, 4, 8, 12 and 16. Each cell holds the fastest tactic at the kernel's
-# default prefetch depth on VR200. A shape is absent at an M where no tactic beat the MXFP8
-# kernel by 3% with both L2-resident and streamed weights, and runs that kernel there: wq_b,
+# at TP16, TP8 and TP4, M = 1, 2, 4, 8, 12 and 16. Each cell holds a wave-filling tactic at the
+# kernel's default prefetch depth on VR200. A shape is absent at an M where no tactic beat the
+# MXFP8 kernel by 3% with both L2-resident and streamed weights, and runs that kernel there: wq_b,
 # dense down and 6144x6144 above M=8, and TP4 dense gate/up from M=4.
 _TACTICS = {
+    # TP16 wq (4 heads x 128 = 512; dense0 gu (3072, 6144) and dn (6144, 1536) match TP4 shared)
+    (1, 512, 6144): (12, 4),
+    (2, 512, 6144): (12, 4),
+    (4, 512, 6144): (12, 4),
+    (8, 512, 6144): (12, 4),
+    (12, 512, 6144): (16, 4),
+    (16, 512, 6144): (16, 4),
+    # TP16 shared-expert gate/up (2 x 384 = 768)
+    (1, 768, 6144): (8, 4),
+    (2, 768, 6144): (8, 4),
+    (4, 768, 6144): (8, 4),
+    (8, 768, 6144): (8, 4),
+    (12, 768, 6144): (16, 8),
+    (16, 768, 6144): (16, 8),
+    # TP16 shared-expert down (I = 384 = 3 x 128; split_k=1 -> 192 CTAs, single launch)
+    (1, 6144, 384): (1, 4),
+    (2, 6144, 384): (1, 4),
+    (4, 6144, 384): (1, 4),
+    (8, 6144, 384): (1, 4),
+    (12, 6144, 384): (1, 4),
+    (16, 6144, 384): (1, 4),
+    # TP16 wo (4 heads x 128 = 512 = 4 x 128; split_k=1 -> 192 CTAs, single launch for M <= 8)
+    (1, 6144, 512): (1, 4),
+    (2, 6144, 512): (1, 4),
+    (4, 6144, 512): (1, 4),
+    (8, 6144, 512): (1, 4),
+    (12, 6144, 512): (2, 4),
+    (16, 6144, 512): (2, 4),
     # TP8 wq
     (1, 1024, 6144): (12, 8),
     (2, 1024, 6144): (12, 8),

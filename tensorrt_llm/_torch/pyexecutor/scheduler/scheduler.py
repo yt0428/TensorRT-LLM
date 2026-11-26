@@ -312,6 +312,10 @@ class RequestScheduler(ABC):
         """Return whether request state permits admission to a forward batch."""
         if is_decoder_context_request_waiting_for_encoder_output(request):
             return False
+        # Compared with `is True` so that a stand-in object answering every attribute name stays
+        # schedulable.
+        if getattr(request, "py_kv_onboard_pending", False) is True:
+            return False
         if request.state in (
             LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
             LlmRequestState.DISAGG_GENERATION_INIT,

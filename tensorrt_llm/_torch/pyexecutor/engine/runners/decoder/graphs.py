@@ -487,6 +487,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        static_inputs_staged: int = 0,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -509,6 +510,7 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
+                static_inputs_staged=static_inputs_staged,
             )
 
     def _run(
@@ -524,6 +526,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        static_inputs_staged: int = 0,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -565,7 +568,10 @@ class DecoderCudaGraphs:
                 )
                 try:
                     outputs = self.cuda_graph_runner.replay(
-                        key, inputs, position_id_offsets=position_id_offsets
+                        key,
+                        inputs,
+                        position_id_offsets=position_id_offsets,
+                        static_inputs_staged=static_inputs_staged,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -576,7 +582,10 @@ class DecoderCudaGraphs:
                 try:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
-                            key, inputs, position_id_offsets=position_id_offsets
+                            key,
+                            inputs,
+                            position_id_offsets=position_id_offsets,
+                            static_inputs_staged=static_inputs_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)

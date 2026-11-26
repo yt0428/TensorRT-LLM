@@ -40,16 +40,23 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
     while (count < size)
     {
         ssize_t bytes = func(count);
-        if (bytes <= 0)
+        if (bytes > 0)
         {
-            if (errno == EINTR)
-            {
-                continue; // Retry on interrupt
-            }
-            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
+            count += bytes;
+            continue;
+        }
+        if (bytes == 0)
+        {
+            // errno is not set by a zero-byte transfer: for a read it is end of file.
+            TLLM_LOG_ERROR("Disk read/write failed: transferred 0 of %zd remaining bytes\n", size - count);
             return false;
         }
-        count += bytes;
+        if (errno == EINTR)
+        {
+            continue; // Retry on interrupt
+        }
+        TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
+        return false;
     }
     assert(count == size);
     return true;

@@ -57,6 +57,7 @@ from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .runtime_hooks import runtime_hooks_of
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -1380,7 +1381,9 @@ def _create_py_executor(
                 max_num_sequences=max_num_seq_slots,
             )
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        runtime_hooks_of(getattr(model_engine, "model",
+                                 None)).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

@@ -27,7 +27,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""The CuTe DSL kernel behind `cute_dsl_ds_mla_sparse_decode`: sparse MLA decode of 8 or 16
+"""The CuTe DSL kernel behind `cute_dsl_ds_mla_sparse_decode`: sparse MLA decode of 4, 8 or 16
 query heads over the fp8_ds_mla latent pool (sm_100f).
 
 One query row per sequence, top-k 2048 selected pool rows. A 656-byte pool row holds 512 e4m3
@@ -109,7 +109,7 @@ BAR_SOFTMAX = 1
 BAR_CORR = 2
 MAX_INIT = -1.0e30
 LOG2_E_F32 = 1.44269504  # FlashMLA's `LOG_2_E`, a float constant
-SUPPORTED_HEADS = (8, 16)
+SUPPORTED_HEADS = (4, 8, 16)
 SUPPORTED_SPLITS = (1, 2, 4, 8)
 SW128 = prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 
@@ -503,7 +503,7 @@ def _dsmla_decode_kernel(
     # =====================================================================================
     if warp == W_IDX:
         if cutlass.const_expr(num_heads < N_MMA):
-            # Rows num_heads..15 of every query chunk are zero (8-head mode runs N = 16).
+            # Rows num_heads..15 of every query chunk are zero (4/8-head modes run N = 16).
             zero = cutlass.Vector.from_elements(
                 tuple(cutlass.Int32(0) for _ in range(4)), dtype=cutlass.Int32
             )

@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/introspection.h"
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/diskIoChannel.h"
 
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
@@ -113,6 +114,13 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(K
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse)
 {
     return manager.storage().computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
+}
+
+void KvCacheIntrospection::injectDiskIoFaults(KvCacheManager& manager, bool reads, int count, int errnoValue)
+{
+    auto const* diskIo = manager.storage().diskIo();
+    TLLM_CHECK_WITH_INFO(diskIo != nullptr, "The manager has no disk tier");
+    diskIo->engine().injectFaults(reads ? DiskIoKind::kRead : DiskIoKind::kWrite, count, errnoValue);
 }
 
 bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)

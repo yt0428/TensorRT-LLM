@@ -55,6 +55,8 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/evictionController.cpp
     kv_cache_manager_v2/stagingBuffer.cpp
     kv_cache_manager_v2/copyEngine.cpp
+    kv_cache_manager_v2/diskIoEngine.cpp
+    kv_cache_manager_v2/diskIoChannel.cpp
     kv_cache_manager_v2/tokenIdExt.cpp
     kv_cache_manager_v2/blockRadixTree.cpp
     kv_cache_manager_v2/batchedPageCopy.cu

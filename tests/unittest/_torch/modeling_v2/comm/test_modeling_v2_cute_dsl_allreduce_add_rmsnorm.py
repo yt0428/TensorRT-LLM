@@ -34,8 +34,9 @@ assert torch.cuda.is_available(), "the Lamport all-reduce entry requires CUDA de
 
 _HERE = Path(__file__).resolve().parent
 _MATRIX = _HERE / "_cute_dsl_allreduce_add_rmsnorm_op_matrix.py"
-#: Names the launcher that starts the world-8 cells' ranks.
+#: Names the launcher that starts the world-8 / world-16 cells' ranks.
 _LAUNCH_ENV = "MODELING_V2_MPI_LAUNCH"
+_LAUNCH_ENV_16 = "MODELING_V2_MPI_LAUNCH_16"
 #: Headroom over the ranks' own deadline, so their faulthandler dump wins the race.
 _LAUNCHER_GRACE_S = 300
 # The engine's ranks run with MPI on; and the launcher must not join an enclosing
@@ -53,14 +54,12 @@ def test_cute_dsl_allreduce_add_rmsnorm_op_matrix() -> None:
     _rank_job.run("cute_dsl_allreduce_add_rmsnorm")
 
 
-@pytest.mark.no_xdist
-def test_cute_dsl_allreduce_add_rmsnorm_world8_mpi_ranks() -> None:
-    """The world-8 cells: the matrix's MPI job, under the environment's launcher."""
-    launch = os.environ.get(_LAUNCH_ENV, "").strip()
+def _run_mpi_world(env_var: str, label: str) -> None:
+    launch = os.environ.get(env_var, "").strip()
     if not launch:
         pytest.skip(
-            f"the world-8 cells need 8 ranks over two nodes, which this process cannot "
-            f"start; set {_LAUNCH_ENV} to a launcher that starts them"
+            f"the {label} cells need a multi-node MPI launch, which this process cannot "
+            f"start; set {env_var} to a launcher that starts them"
         )
     constants = _rank_job._load_launcher_constants(_MATRIX)
     # tests/unittest/_torch/modeling_v2/comm -> repo root.
@@ -87,7 +86,19 @@ def test_cute_dsl_allreduce_add_rmsnorm_world8_mpi_ranks() -> None:
             os.killpg(job.pid, signal.SIGKILL)
             job.wait()
         raise AssertionError(
-            f"the world-8 job did not finish in "
+            f"the {label} job did not finish in "
             f"{constants.MPI_DEADLINE_S + _LAUNCHER_GRACE_S}s (wedged)"
         ) from None
-    assert code == 0, f"the world-8 job exited {code}: {shlex.join(command)}"
+    assert code == 0, f"the {label} job exited {code}: {shlex.join(command)}"
+
+
+@pytest.mark.no_xdist
+def test_cute_dsl_allreduce_add_rmsnorm_world8_mpi_ranks() -> None:
+    """The world-8 cells: the matrix's MPI job, under the environment's launcher."""
+    _run_mpi_world(_LAUNCH_ENV, "world-8")
+
+
+@pytest.mark.no_xdist
+def test_cute_dsl_allreduce_add_rmsnorm_world16_mpi_ranks() -> None:
+    """The world-16 cells: 16 ranks over four SM107 nodes."""
+    _run_mpi_world(_LAUNCH_ENV_16, "world-16")
