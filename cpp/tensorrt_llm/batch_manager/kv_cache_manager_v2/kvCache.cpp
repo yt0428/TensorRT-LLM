@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/diskIoChannel.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
@@ -796,6 +797,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
 
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
+            storageMgr.waitForPageIo(*lock->page());
+            mDeferredCopySourceFailed = mDeferredCopySourceFailed || lock->page()->ioFailed;
             storageMgr.copySlotData(lcIdx, kHotLevel, sourceLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
@@ -949,6 +952,68 @@ bool KvCache::prefetch(CacheLevel target)
         return false;
     }
     return true;
+}
+
+DiskIoStatus KvCache::pollDiskReads(bool wait)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    auto& storageMgr = mManager->storage();
+    DiskIoChannel const* const diskIo = storageMgr.diskIo();
+    if (diskIo == nullptr)
+    {
+        return DiskIoStatus::kOk;
+    }
+    if (mDeferredCopySourceFailed)
+    {
+        return DiskIoStatus::kFailed;
+    }
+    auto& engine = diskIo->engine();
+    std::vector<SharedPtr<Page>> pages;
+    for (auto const& activePage : _activePages())
+    {
+        if (auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId))
+        {
+            pages.push_back(std::move(page));
+        }
+    }
+    bool pending = false;
+    for (auto const& page : pages)
+    {
+        if (page->ioFailed)
+        {
+            return DiskIoStatus::kFailed;
+        }
+        DiskIoTicket const ticket = page->diskIoTicket;
+        if (ticket == kNoDiskIoTicket)
+        {
+            continue;
+        }
+        DiskIoStatus const status = wait ? engine.wait(ticket) : engine.query(ticket);
+        if (status == DiskIoStatus::kPending)
+        {
+            pending = true;
+        }
+        else if (status == DiskIoStatus::kOk)
+        {
+            page->diskIoTicket = kNoDiskIoTicket;
+        }
+        else
+        {
+            storageMgr.reapDiskIo();
+            return DiskIoStatus::kFailed;
+        }
+    }
+    if (pending)
+    {
+        return DiskIoStatus::kPending;
+    }
+    // A completed read implies that every earlier transfer of the same data completed too, since each
+    // waited for the previous one on the GPU. Settling them now surfaces a failed earlier write.
+    storageMgr.reapDiskIo();
+    bool const anyFailed
+        = std::any_of(pages.begin(), pages.end(), [](SharedPtr<Page> const& page) { return page->ioFailed; });
+    return anyFailed ? DiskIoStatus::kFailed : DiskIoStatus::kOk;
 }
 
 void KvCache::suspend()
@@ -1293,6 +1358,12 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
     }
 
     auto& storageMgr = mManager->storage();
+    // A page whose disk transfer failed holds garbage, which must not reach the tree.
+    storageMgr.waitForPageIo(*srcPage);
+    if (srcPage->ioFailed)
+    {
+        return nullptr;
+    }
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {

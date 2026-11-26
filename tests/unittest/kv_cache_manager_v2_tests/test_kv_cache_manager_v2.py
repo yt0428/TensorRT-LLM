@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import array
+import errno
 import functools
 import gc
 import hashlib
@@ -47,6 +48,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
+        DiskIoStatus,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
@@ -101,6 +103,7 @@ else:
         CudaStream,
         DataRole,
         DiskCacheTierConfig,
+        DiskIoStatus,
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
@@ -2401,6 +2404,131 @@ class TestResizeQuota(TestKVCacheManagerV2):
         for kv_cache in kv_cache_lst:
             kv_cache.close()
         self.manager.shutdown()
+
+
+class TestDiskTier(TestKVCacheManagerV2):
+    """Disk tier transfers through the I/O engine: asynchronous prefetch, failures and counters."""
+
+    HOST_LEVEL = CacheLevel(1)
+    DISK_LEVEL = CacheLevel(2)
+    TOKENS_PER_BLOCK = 4
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.prepare(
+            8 << 20,
+            8 << 20,
+            64 << 20,
+            2,
+            None,
+            0,
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            kv_buf_size=1024,
+        )
+
+    def _commit(self, stream: CudaStream, tokens: list[TokenIdExt]) -> None:
+        kv_cache = self.manager.create_kv_cache()
+        try:
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(len(tokens), len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+        finally:
+            kv_cache.close()
+
+    def _push_prefix_to_disk(self, stream: CudaStream, prompt: list[TokenIdExt]) -> None:
+        """Commit ``prompt``, then commit unrelated sequences until its blocks live only on disk."""
+        self._commit(stream, prompt)
+        for _ in range(64):
+            probe = self.manager.create_kv_cache(input_tokens=prompt)
+            counts, _ = _introspection.active_page_stats(probe)
+            probe.close()
+            if (
+                counts[GPU_LEVEL] == 0
+                and counts[self.HOST_LEVEL] == 0
+                and counts[self.DISK_LEVEL] > 0
+            ):
+                return
+            filler = [self.next_token() for _ in range(1024 * self.TOKENS_PER_BLOCK)]
+            self._commit(stream, filler)
+        self.fail("the prefix never reached the disk tier")
+
+    def test_config_defaults(self) -> None:
+        config = DiskCacheTierConfig(quota=1 << 20, path="/tmp")
+        self.assertTrue(config.direct_io)
+        self.assertEqual(config.num_io_threads, 8)
+        self.assertAlmostEqual(config.host_reserve_fraction, 0.1)
+        self.assertEqual(config.max_pending_write_bytes, 8 << 30)
+
+    def test_prefetch_is_polled_until_the_reads_land(self) -> None:
+        prompt = [self.next_token() for _ in range(64)]
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self._push_prefix_to_disk(stream, prompt)
+            reader = self.manager.create_kv_cache(input_tokens=prompt)
+            try:
+                num_reused = reader.num_committed_tokens
+                self.assertGreater(num_reused, 0)
+                self.assertTrue(reader.prefetch(self.HOST_LEVEL))
+                self.assertNotEqual(reader.poll_disk_reads(), DiskIoStatus.FAILED)
+                self.assertEqual(reader.poll_disk_reads(wait=True), DiskIoStatus.OK)
+                counts, _ = _introspection.active_page_stats(reader)
+                self.assertEqual(counts[self.DISK_LEVEL], 0)
+                self.assertTrue(reader.resume(stream))
+                self.assertEqual(reader.num_committed_tokens, num_reused)
+            finally:
+                reader.close()
+        s.take_finish_event()
+        stats = self.manager.get_and_reset_disk_io_stats()
+        self.assertGreater(stats.write_bytes, 0)
+        self.assertGreater(stats.read_bytes, 0)
+        self.assertEqual(stats.read_errors + stats.write_errors, 0)
+        self.assertEqual(stats.failed_pages, 0)
+        self.assertIsInstance(stats.stream_mem_ops, bool)
+        self.assertEqual(self.manager.get_and_reset_disk_io_stats().read_bytes, 0)
+
+    def test_failed_read_drops_blocks_from_reuse(self) -> None:
+        prompt = [self.next_token() for _ in range(64)]
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self._push_prefix_to_disk(stream, prompt)
+            _introspection.inject_disk_io_faults(self.manager, True, 1 << 20, errno.EIO)
+            reader = self.manager.create_kv_cache(input_tokens=prompt)
+            try:
+                self.assertGreater(reader.num_committed_tokens, 0)
+                self.assertTrue(reader.prefetch(self.HOST_LEVEL))
+                self.assertEqual(reader.poll_disk_reads(wait=True), DiskIoStatus.FAILED)
+            finally:
+                reader.close()
+            _introspection.inject_disk_io_faults(self.manager, True, 0, 0)
+            # Every block was on disk and every read failed, so nothing is reusable any more.
+            fresh = self.manager.create_kv_cache(input_tokens=prompt)
+            try:
+                self.assertEqual(fresh.num_committed_tokens, 0)
+            finally:
+                fresh.close()
+        s.take_finish_event()
+        stats = self.manager.get_and_reset_disk_io_stats()
+        self.assertGreater(stats.failed_pages, 0)
+        self.assertGreater(stats.read_errors, 0)
+
+    def test_maintain_host_reserve_keeps_reuse_intact(self) -> None:
+        prompt = [self.next_token() for _ in range(64)]
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self._commit(stream, prompt)
+            for _ in range(3):
+                self._commit(
+                    stream, [self.next_token() for _ in range(1024 * self.TOKENS_PER_BLOCK)]
+                )
+            self.manager.maintain_host_reserve()
+            probe = self.manager.create_kv_cache(input_tokens=prompt)
+            try:
+                self.assertGreater(probe.num_committed_tokens, 0)
+                self.assertEqual(probe.poll_disk_reads(wait=True), DiskIoStatus.OK)
+            finally:
+                probe.close()
+        s.take_finish_event()
 
 
 class TestHeteroTokensPerBlock(TestKVCacheManagerV2):

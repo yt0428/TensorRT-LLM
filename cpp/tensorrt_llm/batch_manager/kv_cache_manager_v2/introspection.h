@@ -61,6 +61,10 @@ public:
     static std::optional<bool> committedPageIsLinked(KvCache const& kvCache, int ordinal, int lcId);
     static bool allTreePagesDroppable(KvCacheManager& manager);
 
+    //! Makes the next `count` disk reads (or writes) of the manager's disk tier fail with errnoValue,
+    //! without touching the file; a count of 0 stops it. Throws without a disk tier.
+    static void injectDiskIoFaults(KvCacheManager& manager, bool reads, int count, int errnoValue);
+
     // White-box hook: minimum per-pool-group slot counts to support a BatchDesc.
     // Reaches StorageManager::computePoolGroupSlotsForBatch() (private) via friendship.
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,

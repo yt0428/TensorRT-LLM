@@ -186,6 +186,11 @@ def all_tree_pages_droppable(manager: Any) -> bool:
     return bool(_cpp().all_tree_pages_droppable(manager))
 
 
+def inject_disk_io_faults(manager: Any, reads: bool, count: int, errno_value: int) -> None:
+    """Fail the next ``count`` disk reads (or writes) with ``errno_value``; 0 stops it."""
+    _cpp().inject_disk_io_faults(manager, reads, count, errno_value)
+
+
 def is_commit_allowed(kv_cache: Any) -> bool:
     """Return whether the KV cache still allows token commits."""
     return bool(_cpp().is_commit_allowed(kv_cache))

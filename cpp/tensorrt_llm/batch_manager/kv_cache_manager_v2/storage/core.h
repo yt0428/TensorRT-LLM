@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/cudaVirtMem.h"
+#include "kv_cache_manager_v2/diskIoEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
@@ -321,8 +322,9 @@ private:
 class DiskSlotPool : public SlotPoolBase
 {
 public:
-    // directory: path under which to create the temp file.
-    DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
+    // directory: path under which to create the temp file. directIo asks for O_DIRECT, which is used only
+    // when slotSize is a multiple of kDiskIoAlignment and the filesystem accepts it.
+    DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots, bool directIo = false);
     ~DiskSlotPool() override;
 
     SlotCount numSlots() const noexcept override;
@@ -335,8 +337,16 @@ public:
         return mFd;
     }
 
+    //! Whether the file is open with O_DIRECT: every transfer must then use kDiskIoAlignment-aligned
+    //! buffers, which slot addresses and the page staging ring satisfy.
+    [[nodiscard]] bool directIo() const noexcept
+    {
+        return mDirectIo;
+    }
+
 private:
     int mFd = kBadFileDescriptor;
+    bool mDirectIo = false;
     // Tracks the file size, which only resize() changes: the file is created unlinked and owned
     // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
     // slotAddress() bounds-checks against it on every call, and querying the file would make that
@@ -455,7 +465,8 @@ private:
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
-    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory,
+        bool directIo = false);
 };
 
 // ---------------------------------------------------------------------------
@@ -664,7 +675,7 @@ class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
     DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory, bool directIo = false);
 
     CacheTier cacheTier() const noexcept override
     {

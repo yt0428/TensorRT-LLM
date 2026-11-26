@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
+#include "kv_cache_manager_v2/diskIoChannel.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -124,6 +126,26 @@ namespace
 bool isGpuAccessibleMemory(CacheTier tier) noexcept
 {
     return tier == CacheTier::GPU_MEM || tier == CacheTier::HOST_MEM;
+}
+
+DiskCacheTierConfig const* findDiskTierConfig(StorageConfig const& config) noexcept
+{
+    for (auto const& tierConfig : config.cacheTiers)
+    {
+        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tierConfig))
+        {
+            return disk;
+        }
+    }
+    return nullptr;
+}
+
+// With a disk tier, cold pages are padded to the O_DIRECT alignment so that host slots and the page
+// staging ring can be read and written without a bounce copy.
+std::unique_ptr<IKvCacheColdPageCodec> createStorageColdPageCodec(StorageConfig const& config)
+{
+    return findDiskTierConfig(config) != nullptr ? createAlignedDefaultKvCacheColdPageCodec(kDiskIoAlignment)
+                                                 : createDefaultKvCacheColdPageCodec();
 }
 
 // Compute the slot-to-page-indices scale factors.
@@ -219,7 +241,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     , mEventSink(std::move(eventSink))
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
     , mSwaScratchReuse(std::move(swaScratchReuse))
-    , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
+    , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createStorageColdPageCodec(config))
 {
     IKvCacheColdPageCodec& codec = *mColdPageCodec;
     mLayerToLifeCycleIds = config.layerToLifeCycleIds();
@@ -463,7 +485,18 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             = std::make_unique<StagingBufferManager>(pageStagingBytes, StagingBufferMemory::kPinnedHost);
     }
 
-    mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
+    if (auto const* diskConfig = findDiskTierConfig(config))
+    {
+        DiskIoEngine::Options options;
+        options.numThreads = diskConfig->numIoThreads;
+        // One worker favors writes so that queued evictions keep moving under a stream of reads.
+        options.numWritePreferringThreads = diskConfig->numIoThreads > 1 ? 1 : 0;
+        mDiskIo = std::make_unique<DiskIoChannel>(options);
+        mHostReserveFraction = diskConfig->hostReserveFraction;
+        mMaxPendingWriteBytes = diskConfig->maxPendingWriteBytes;
+    }
+
+    mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get(), mDiskIo.get());
 }
 
 StorageManager::~StorageManager()
@@ -473,6 +506,21 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    // Queued disk transfers still use the pool files and host slots released below.
+    if (mDiskIo)
+    {
+        mDiskIo->destroy();
+    }
+    mInflightDiskBatches.clear();
+    for (auto& release : mDeferredReleases)
+    {
+        poolGroup(release.level, release.poolGroup).release(std::move(release.slot));
+    }
+    mDeferredReleases.clear();
+    // Gone before the levels: a page destroyed with them must find no I/O to wait for. CopyEngine
+    // borrows the channel.
+    mCopyEngine.reset();
+    mDiskIo.reset();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -482,7 +530,6 @@ void StorageManager::destroy()
     mGpuPhysMemAllocator.reset();
 
     mIndexStagingManager.reset();
-    mCopyEngine.reset();
     mPageStagingManager.reset();
 }
 
@@ -587,7 +634,8 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
 }
 
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-    PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+    PageIndexPair const* pageIndices, size_t numPages, CUstream stream, std::vector<DiskIoTicket>* pageTickets,
+    bool fenceDisk)
 {
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
@@ -618,7 +666,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[index].dst)).at(poolIdx),
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[index].src)).at(poolIdx)});
             }
-            mCopyEngine->transfer(dstTier, srcTier, srcSizes.at(poolIdx), tasks, stream);
+            mCopyEngine->transfer(dstTier, srcTier, srcSizes.at(poolIdx), tasks, stream, pageTickets, fenceDisk);
         }
         return;
     }
@@ -670,10 +718,13 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
             : coldPageBytes * remaining;
-        // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
-        // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
-        // this is a floor rather than a computed requirement.
-        auto const staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
+        // The cold-page codec's copy path needs a 16-byte-aligned base. A disk file opened with O_DIRECT
+        // also needs kDiskIoAlignment, which it is only when coldPageBytes is a multiple of it; the size
+        // granularity must be a multiple of the alignment, so smaller pages stay at the 16-byte floor.
+        static_assert(kDiskIoAlignment % 16 == 0);
+        size_t const stagingAlignment = coldPageBytes % kDiskIoAlignment == 0 ? kDiskIoAlignment : 16;
+        auto const staging
+            = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, stagingAlignment, stream);
         size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 
@@ -694,7 +745,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(PoolIndex{0}),
                     Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes}});
             }
-            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, stream, pageTickets);
         }
         else
         {
@@ -705,7 +756,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes},
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(PoolIndex{0})});
             }
-            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, stream, pageTickets);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 stagingPageIndices[index] = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
@@ -742,6 +793,17 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
+    mLevels.at(level).storage->release(pg, std::move(slot));
+}
+
+void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot, DiskIoTicket ticket)
+{
+    PoolGroupIndex const pg = getPoolGroupIndex(level, lc);
+    if (ticket != kNoDiskIoTicket && mDiskIo && mDiskIo->engine().query(ticket) == DiskIoStatus::kPending)
+    {
+        mDeferredReleases.push_back(DeferredRelease{level, pg, std::move(slot), ticket});
+        return;
+    }
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
@@ -810,6 +872,7 @@ void StorageManager::excludeFromEviction(Page& page)
 void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
+    reapDiskIo();
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
     for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
     {
@@ -839,6 +902,7 @@ void StorageManager::forceEvict(
             {
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
             }
+            mLastLevelDroppedPages += pages.size();
         }
         if (dropRecorder)
         {
@@ -1021,6 +1085,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 dropRecorder(ev, lvlId);
             }
+            mLastLevelDroppedPages += ev.size();
             ev.clear();
 
             freeAfterEviction = storage.numFreeSlots(pgIdx);
@@ -1049,6 +1114,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 accepted.insert(
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
+                // Fallen pages the last level has no room for are dropped.
+                mLastLevelDroppedPages += fallenPages.at(lifeCycle).size();
                 fallenPages.at(lifeCycle).clear();
             }
         }
@@ -1143,6 +1210,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             srcPages.begin(), srcPages.end(), [](auto const& page) { return page->status() == PageStatus::LOCKED; }))
         throw LogicError("Cannot migrate a locked page between storage levels");
 
+    // The source data must be complete before anything reads it, and a fenced migration has no GPU
+    // event to wait on for an unfenced transfer.
+    waitForPageIo(srcPages);
+
     SlotCount const numSlots = slotCountValueFromSize(srcPages.size());
     LifeCycleId const firstLifeCycle = srcPages.front()->lifeCycle;
     LayerGroupId const batchingLayerGroupId = getMigrationBatchingLayerGroupId(dstLevel, srcLevel, firstLifeCycle);
@@ -1184,6 +1255,15 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             priorEvents.push_back(dstSlots.at(i).readyEvent.handle());
         }
 
+        bool const srcIsDisk = cacheTier(srcLevel) == CacheTier::DISK;
+        bool const dstIsDisk = cacheTier(dstLevel) == CacheTier::DISK;
+        bool const touchesDisk = srcIsDisk || dstIsDisk;
+        // Host/disk transfers in the background scopes leave every stream free to run ahead: a stream
+        // parked on disk I/O would stall the streams sharing its hardware connection.
+        bool const unfenced = updateSrc && !defrag
+            && ((srcIsDisk && cacheTier(dstLevel) == CacheTier::HOST_MEM && mUnfencedDiskReads)
+                || (dstIsDisk && cacheTier(srcLevel) == CacheTier::HOST_MEM && mUnfencedDiskWrites));
+        std::vector<DiskIoTicket> pageTickets;
         TemporaryCudaStream tempStream(std::move(priorEvents));
         auto updateReadyEvents = FuncGuard(
             [&]()
@@ -1198,10 +1278,11 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         {
             auto scope = tempStream.enter();
             CUstream const stream = tempStream.get();
-            submitMigrationBatch(
-                dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+            submitMigrationBatch(dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(),
+                stream, touchesDisk ? &pageTickets : nullptr, !unfenced);
         }
         updateReadyEvents.run();
+        TLLM_CHECK_DEBUG(pageTickets.empty() || pageTickets.size() == srcPages.size());
 
         constexpr size_t kMaxRetainedPageIndexPairs = (1u << 20u) / sizeof(PageIndexPair);
         if (pageIndices.capacity() > kMaxRetainedPageIndexPairs)
@@ -1224,8 +1305,22 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     excludeFromEviction(*srcPages.at(i));
                 // Replace the page's source slot with its destination and release the source slot back to the pool.
                 Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
-                srcPoolGroup.release(std::move(srcSlot));
+                if (unfenced)
+                {
+                    mDeferredReleases.push_back(
+                        DeferredRelease{srcLevel, srcPgIdx, std::move(srcSlot), pageTickets.at(i)});
+                }
+                else
+                {
+                    srcPoolGroup.release(std::move(srcSlot));
+                }
                 srcPages.at(i)->cacheLevel = dstLevel;
+                if (!pageTickets.empty())
+                {
+                    // A fenced write needs no ticket: readyEvent covers it and its batch record reports a
+                    // failure. A read keeps one either way, so that pollDiskReads() can report success.
+                    srcPages.at(i)->diskIoTicket = srcIsDisk || unfenced ? pageTickets.at(i) : kNoDiskIoTicket;
+                }
                 if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
                 {
                     auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
@@ -1242,6 +1337,10 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 if (wasScheduled)
                     scheduleForEviction(*srcPages.at(i));
             }
+        }
+        if (updateSrc && !pageTickets.empty())
+        {
+            recordDiskBatch(srcPages, pageTickets, srcIsDisk);
         }
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};
     }
@@ -1260,6 +1359,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
 void StorageManager::batchedMigrate(
     CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder)
 {
+    reapDiskIo();
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> groups;
     std::set<Page*> seen;
     for (auto const& page : pages)
@@ -1298,6 +1398,7 @@ void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLe
     std::vector<SharedPtr<Page>> const& pages, KvCache const* offloadingCache,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
+    waitForPageIo(pages);
     CacheLevel const srcLevel = dstLevel == kHotLevel ? kSparseHistoryLevel : kHotLevel;
 
     struct MigrationBatch
@@ -1470,6 +1571,7 @@ void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLe
 int64_t StorageManager::prefetch(
     CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
+    reapDiskIo();
     TypedVec<PoolGroupIndex, SlotCount> numSlotsToMigrate(numPoolGroups(dstLevel), 0);
     int64_t diskBlocksMigrated = 0;
     std::vector<SharedPtr<Page>> scheduled;
@@ -1514,6 +1616,10 @@ int64_t StorageManager::prefetch(
     }
 
     prepareFreeSlots(dstLevel, numSlotsToMigrate);
+    // Reads into host memory run unfenced; whoever uses a page later waits for its ticket. The room made
+    // above stays fenced: its slots must be reusable at once.
+    auto restoreUnfencedReads = FuncGuard([this, previous = mUnfencedDiskReads]() { mUnfencedDiskReads = previous; });
+    mUnfencedDiskReads = cacheTier(dstLevel) == CacheTier::HOST_MEM;
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> migrationGroups;
     for (LifeCycleId lifeCycle{0}; lifeCycle < pages.size(); ++lifeCycle)
     {
@@ -1560,6 +1666,299 @@ int64_t StorageManager::prefetch(
     }
     reschedulePagesGuard.run();
     return diskBlocksMigrated;
+}
+
+// ---------------------------------------------------------------------------
+// Disk tier
+// ---------------------------------------------------------------------------
+
+void StorageManager::recordDiskBatch(
+    std::vector<SharedPtr<Page>> const& pages, std::vector<DiskIoTicket> const& pageTickets, bool isRead)
+{
+    DiskBatchRecord record;
+    record.isRead = isRead;
+    record.pageTickets = pageTickets;
+    record.uniqueTickets = pageTickets;
+    std::sort(record.uniqueTickets.begin(), record.uniqueTickets.end());
+    record.uniqueTickets.erase(
+        std::unique(record.uniqueTickets.begin(), record.uniqueTickets.end()), record.uniqueTickets.end());
+    record.pages.reserve(pages.size());
+    for (auto const& page : pages)
+    {
+        record.pages.emplace_back(page);
+    }
+    mInflightDiskBatches.push_back(std::move(record));
+}
+
+void StorageManager::detachFailedPage(SharedPtr<Page> const& page)
+{
+    if (page->ioFailed)
+    {
+        return;
+    }
+    page->ioFailed = true;
+    ++mFailedPages;
+    if (!page->isCommitted())
+    {
+        // Private to one request, which learns about it from pollDiskReads().
+        return;
+    }
+    auto& committed = static_cast<CommittedPage&>(*page);
+    if (page->scheduledForEviction() && page->status() == PageStatus::DROPPABLE)
+    {
+        // The eviction queue may be the only other owner; the caller's reference keeps the page alive
+        // until it lets go.
+        excludeFromEviction(*page);
+    }
+    if (Block* const block = committed.block; block != nullptr)
+    {
+        // Same sequence as ~CommittedPage, done early so no later match can reach the page. Without a
+        // block, a droppable page is no longer evictable, so it is freed when its last owner releases it.
+        if (block->unlinkPage(page->lifeCycle, &committed) != nullptr)
+        {
+            Block::clearStaleBlocksAfterPageUnlink(*block, page->lifeCycle, getLifeCycle(page->lifeCycle));
+        }
+    }
+}
+
+void StorageManager::waitForPageIo(Page& page)
+{
+    if (!mDiskIo || page.diskIoTicket == kNoDiskIoTicket)
+    {
+        return;
+    }
+    if (mDiskIo->engine().wait(page.diskIoTicket) == DiskIoStatus::kOk)
+    {
+        page.diskIoTicket = kNoDiskIoTicket;
+    }
+    else
+    {
+        // Keep the ticket; settling the batch marks the page ioFailed and takes it out of reuse.
+        reapDiskIo();
+    }
+}
+
+void StorageManager::waitForPageIo(std::vector<SharedPtr<Page>> const& pages)
+{
+    if (!mDiskIo)
+    {
+        return;
+    }
+    for (auto const& page : pages)
+    {
+        waitForPageIo(*page);
+    }
+}
+
+void StorageManager::flushDiskIo()
+{
+    if (!mDiskIo)
+    {
+        return;
+    }
+    mDiskIo->engine().drain();
+    reapDiskIo();
+    TLLM_CHECK_DEBUG(mDeferredReleases.empty() && mInflightDiskBatches.empty());
+}
+
+void StorageManager::reapDiskIo()
+{
+    if (!mDiskIo)
+    {
+        return;
+    }
+    auto& engine = mDiskIo->engine();
+    // Slots that unfenced transfers no longer use go back to their pools.
+    auto const stillInUse = std::stable_partition(mDeferredReleases.begin(), mDeferredReleases.end(),
+        [&engine](DeferredRelease const& release) { return engine.query(release.ticket) == DiskIoStatus::kPending; });
+    for (auto it = stillInUse; it != mDeferredReleases.end(); ++it)
+    {
+        poolGroup(it->level, it->poolGroup).release(std::move(it->slot));
+    }
+    mDeferredReleases.erase(stillInUse, mDeferredReleases.end());
+    if (mInflightDiskBatches.empty())
+    {
+        return;
+    }
+    auto settled = std::stable_partition(mInflightDiskBatches.begin(), mInflightDiskBatches.end(),
+        [&engine](DiskBatchRecord const& record)
+        {
+            return std::any_of(record.uniqueTickets.begin(), record.uniqueTickets.end(),
+                [&engine](DiskIoTicket ticket) { return engine.query(ticket) == DiskIoStatus::kPending; });
+        });
+    // Settle outside the partition: detaching a page can destroy it, and nothing here may run while
+    // the record vector is being rearranged.
+    std::vector<DiskBatchRecord> done(
+        std::make_move_iterator(settled), std::make_move_iterator(mInflightDiskBatches.end()));
+    mInflightDiskBatches.erase(settled, mInflightDiskBatches.end());
+    for (auto const& record : done)
+    {
+        std::vector<DiskIoTicket> failed;
+        for (DiskIoTicket const ticket : record.uniqueTickets)
+        {
+            if (engine.query(ticket) == DiskIoStatus::kFailed)
+            {
+                failed.push_back(ticket);
+            }
+        }
+        if (failed.empty())
+        {
+            continue;
+        }
+        size_t numFailedPages = 0;
+        for (size_t i = 0; i < record.pages.size(); ++i)
+        {
+            if (std::find(failed.begin(), failed.end(), record.pageTickets[i]) == failed.end())
+            {
+                continue;
+            }
+            ++numFailedPages;
+            if (auto page = record.pages[i].lock())
+            {
+                detachFailedPage(page);
+            }
+        }
+        int const err = engine.error(failed.front());
+        TLLM_LOG_ERROR(
+            "KV cache manager v2: a disk %s failed (%s) for %zu pages; they are dropped from prefix reuse, and a "
+            "request that already holds one fails rather than use it.",
+            record.isRead ? "read" : "write", std::strerror(err), numFailedPages);
+    }
+}
+
+void StorageManager::evictForHostReserve(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& numPages)
+{
+    TLLM_CHECK_DEBUG(!isLastLevel(level));
+    auto evicted = mLevels.at(level).controller.evict(numPages);
+    // On failure every evicted page goes back to the front of its queue.
+    auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
+    PagesByLifeCycle fallen(numLifeCycles());
+    uint64_t numMoved = 0;
+    for (auto const& pages : evicted)
+    {
+        for (auto const& page : pages)
+        {
+            fallen.at(page->lifeCycle).push_back(page);
+            ++numMoved;
+        }
+    }
+    sortFallenPagesByPriority(fallen);
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
+    for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
+    {
+        goals[lvl].resize(numPoolGroups(lvl), 0);
+    }
+    {
+        // The freed host slots return to their pool only once each write lands (reapDiskIo), so no GPU
+        // work ever waits for these writes.
+        auto restoreUnfencedWrites
+            = FuncGuard([this, previous = mUnfencedDiskWrites]() { mUnfencedDiskWrites = previous; });
+        mUnfencedDiskWrites = true;
+        _prepareFreeSlots(goals, level + 1, fallen);
+    }
+    rescheduleEvictedPagesOnFailure.cancel();
+    mReserveEvictedPages += numMoved;
+}
+
+void StorageManager::maintainHostReserve()
+{
+    if (!mDiskIo)
+    {
+        return;
+    }
+    reapDiskIo();
+    if (mHostReserveFraction <= 0.0)
+    {
+        return;
+    }
+    for (CacheLevel level{1}; level + 1 < numCacheLevels(); ++level)
+    {
+        if (cacheTier(level) != CacheTier::HOST_MEM || cacheTier(level + 1) != CacheTier::DISK)
+        {
+            continue;
+        }
+        auto& levelManager = mLevels.at(level);
+        TypedVec<PoolGroupIndex, SlotCount> shortfall(numPoolGroups(level), 0);
+        bool anyShortfall = false;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < shortfall.size(); ++pgIdx)
+        {
+            auto const total = static_cast<double>(levelManager.storage->numSlots(pgIdx));
+            auto const reserve = static_cast<SlotCount>(std::ceil(total * mHostReserveFraction));
+            // Slots whose reserve writes are still running count as free: they are on their way back.
+            SlotCount const deferred
+                = slotCountValueFromSize(std::count_if(mDeferredReleases.begin(), mDeferredReleases.end(),
+                    [level, pgIdx](DeferredRelease const& release)
+                    { return release.level == level && release.poolGroup == pgIdx; }));
+            SlotCount const free = levelManager.storage->numFreeSlots(pgIdx) + deferred;
+            if (free < reserve)
+            {
+                shortfall[pgIdx] = std::min(reserve - free, levelManager.controller.numEvictablePages(pgIdx));
+                anyShortfall = anyShortfall || shortfall[pgIdx] > 0;
+            }
+        }
+        if (!anyShortfall)
+        {
+            continue;
+        }
+        // Queued writes stay within maxPendingWriteBytes. The rest of the shortfall waits for a later call
+        // rather than being dropped: a dropped page is lost to every later request that would reuse it,
+        // while a GPU eviction that finds no free host slot before then only writes inside its own step.
+        uint64_t const pendingBytes = mDiskIo->engine().pendingWriteBytes();
+        uint64_t const budget = mMaxPendingWriteBytes > pendingBytes ? mMaxPendingWriteBytes - pendingBytes : 0;
+        uint64_t shortfallBytes = 0;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < shortfall.size(); ++pgIdx)
+        {
+            auto const& sizes = slotSize(level, pgIdx);
+            shortfallBytes
+                += static_cast<uint64_t>(shortfall[pgIdx]) * std::accumulate(sizes.begin(), sizes.end(), uint64_t{0});
+        }
+        if (shortfallBytes > budget)
+        {
+            anyShortfall = false;
+            for (PoolGroupIndex pgIdx{0}; pgIdx < shortfall.size(); ++pgIdx)
+            {
+                // Each group gets the same share of its shortfall.
+                auto allowed = static_cast<SlotCount>(std::floor(static_cast<double>(shortfall[pgIdx])
+                    * static_cast<double>(budget) / static_cast<double>(shortfallBytes)));
+                if (pendingBytes == 0 && shortfall[pgIdx] > 0)
+                {
+                    // With nothing queued, a cap smaller than a page still lets one page per group go.
+                    allowed = std::max(allowed, SlotCount{1});
+                }
+                mReserveDeferredPages += static_cast<uint64_t>(shortfall[pgIdx] - allowed);
+                shortfall[pgIdx] = allowed;
+                anyShortfall = anyShortfall || allowed > 0;
+            }
+        }
+        if (anyShortfall)
+        {
+            try
+            {
+                evictForHostReserve(level, shortfall);
+            }
+            catch (OutOfPagesError const&)
+            {
+                // The level below cannot take the pages, e.g. held pages that a full disk tier has no
+                // room for. The eviction was rolled back; the reserve is best effort.
+            }
+        }
+    }
+}
+
+DiskIoIterationStats StorageManager::getAndResetDiskIoStats()
+{
+    DiskIoIterationStats stats;
+    if (!mDiskIo)
+    {
+        return stats;
+    }
+    stats.io = mDiskIo->engine().takeStats();
+    stats.reserveEvictedPages = std::exchange(mReserveEvictedPages, 0);
+    stats.reserveDeferredPages = std::exchange(mReserveDeferredPages, 0);
+    stats.lastLevelDroppedPages = std::exchange(mLastLevelDroppedPages, 0);
+    stats.failedPages = std::exchange(mFailedPages, 0);
+    stats.streamMemOps = mDiskIo->usesStreamMemOps();
+    return stats;
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,6 +2118,8 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::shrinkPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
+    // A slot still in use by disk I/O is neither free nor owned by a page that defrag would move.
+    flushDiskIo();
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;
@@ -1831,6 +2232,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, float> const& ratioList,
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
+    flushDiskIo();
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()

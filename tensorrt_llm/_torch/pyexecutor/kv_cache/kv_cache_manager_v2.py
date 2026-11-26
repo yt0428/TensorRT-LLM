@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -76,6 +77,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CacheTierConfig,
     DataRole,
     DiskCacheTierConfig,
+    DiskIoStatus,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -182,6 +184,27 @@ _GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVE
 # Caches the manager holds for itself rather than for a request. Anything that
 # reasons about "no request is active" has to exclude these.
 _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
+
+# How a disk tier counter combines over a window of drains: these keep their latest value, these their
+# maximum, and every other counter is summed.
+_DISK_IO_GAUGE_KEYS = frozenset(
+    {"queuedReadOps", "queuedWriteOps", "pendingWriteBytes", "onboardsInFlight"}
+)
+_DISK_IO_PEAK_KEYS = frozenset(
+    {"readBatchLatencyMsMax", "peakQueuedReadOps", "peakQueuedWriteOps", "peakPendingWriteBytes"}
+)
+# Seconds between a rank's disk tier activity log lines.
+_DISK_IO_LOG_INTERVAL_S = 60.0
+
+
+def _merge_disk_io_sample(window: dict[str, float], sample: dict[str, float]) -> None:
+    for key, value in sample.items():
+        if key not in window or key in _DISK_IO_GAUGE_KEYS:
+            window[key] = value
+        elif key in _DISK_IO_PEAK_KEYS:
+            window[key] = max(window[key], value)
+        else:
+            window[key] += value
 
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
@@ -301,6 +324,15 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
         return None
     conversation_id = conversation_params.conversation_id.strip()
     return conversation_id or None
+
+
+@dataclass(slots=True)
+class _ContextOnboard:
+    """A context request whose reusable prefix is being read from disk into host memory."""
+
+    request: LlmRequest
+    kv_cache: _KVCache
+    start_time: float
 
 
 @dataclass(slots=True)
@@ -1257,6 +1289,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # The lender sharing.attach_lender installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
     _sharing = None
+    # Whether a disk tier is configured. Resume, preparation and request release read it, so it is on
+    # the class for instances built without running __init__; context onboarding exists only with it.
+    _disk_tier_enabled: bool = False
 
     def __init__(
         self,
@@ -1692,7 +1727,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
         disk_cache_size = kv_cache_config.disk_cache_size
-        if disk_cache_size is not None and disk_cache_size > 0:
+        self._disk_tier_enabled = disk_cache_size is not None and disk_cache_size > 0
+        if self._disk_tier_enabled:
             disk_cache_path = kv_cache_config.disk_cache_path
             assert disk_cache_path is not None
             cache_tiers.append(
@@ -1800,6 +1836,17 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
+        # Context requests whose reusable prefix is being read from disk into host memory, each with
+        # the transient cache that holds the matched blocks until the reads land.
+        self._context_onboards: dict[int, _ContextOnboard] = {}
+        self._iter_onboarded_requests = 0
+        self._iter_onboard_failures = 0
+        self._iter_onboard_wait_s = 0.0
+        # Disk tier counters drained from the native manager but not yet reported, one window for the
+        # iteration stats and one for the periodic log line.
+        self._disk_io_stats_window: dict[str, float] = {}
+        self._disk_io_log_window: dict[str, float] = {}
+        self._disk_io_log_start = time.monotonic()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
         # to groups that are actually windowed. Only used by the debug-level
@@ -3714,8 +3761,26 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         ):
             return False
+        if self._disk_tier_enabled:
+            self._check_resumed_disk_reads(req_id, kv_cache)
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
+
+    @staticmethod
+    def _check_resumed_disk_reads(req_id: int, kv_cache: _KVCache) -> None:
+        """Make sure no page this cache just locked came from a failed disk read.
+
+        A page still on disk at resume is read on the way to the GPU, and the forward pass would
+        consume whatever the read left behind. Context onboarding normally moves those pages to
+        host first, so the wait here is rare. A failed read raises rather than serve wrong KV.
+        """
+        status = kv_cache.poll_disk_reads()
+        if status == DiskIoStatus.PENDING:
+            status = kv_cache.poll_disk_reads(wait=True)
+        if status == DiskIoStatus.FAILED:
+            raise RuntimeError(
+                f"KV cache disk read failed for request {req_id}; its reused KV cannot be used"
+            )
 
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
@@ -4278,6 +4343,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.kv_connector_manager is not None and not self.kv_connector_manager.capacity_only:
             self._run_kv_connector_hooks(scheduled_batch)
         self._publish_sparse_metadata()
+        if self._disk_tier_enabled:
+            # After this iteration's allocations, so the next one finds host slots whose disk
+            # writes already ran.
+            self.impl.maintain_host_reserve()
+            self._maybe_log_disk_io()
 
     def _publish_sparse_metadata(self) -> None:
         """Refresh stable GPU rows on the execution stream before model work.
@@ -5304,6 +5374,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
 
         disk_prefetch_blocks = self.impl.get_and_reset_iteration_disk_prefetch_blocks()
+        disk_io = self._drain_disk_io_stats() if self._disk_tier_enabled else {}
         cached_tokens_by_level = self.impl.get_and_reset_iteration_cached_tokens_by_level()
         reused_blocks_by_level = self.impl.get_and_reset_iteration_reused_blocks_by_level()
 
@@ -5404,8 +5475,73 @@ class KVCacheManagerV2(BaseResourceManager):
             suspended_requests=suspended_requests,
             resumed_requests=resumed_requests,
             disk_prefetch_blocks=disk_prefetch_blocks,
+            disk_io=disk_io,
             cached_tokens_by_level=list(cached_tokens_by_level),
             cache_level_tiers=self._stats_cache_level_tier_names(),
+        )
+
+    def _drain_disk_io_stats(self) -> dict[str, float]:
+        """Disk tier counters for this iteration window; busy times are summed over I/O workers."""
+        self._collect_disk_io_stats()
+        stats, self._disk_io_stats_window = self._disk_io_stats_window, {}
+        return stats
+
+    def _collect_disk_io_stats(self) -> None:
+        """Move the native disk tier counters into both reporting windows."""
+        io = self.impl.get_and_reset_disk_io_stats()
+        sample = {
+            "readBytes": io.read_bytes,
+            "writeBytes": io.write_bytes,
+            "readOps": io.read_ops,
+            "writeOps": io.write_ops,
+            "readBusyMs": io.read_busy_ns / 1e6,
+            "writeBusyMs": io.write_busy_ns / 1e6,
+            "readErrors": io.read_errors,
+            "writeErrors": io.write_errors,
+            "readBatches": io.read_batches,
+            "readBatchLatencyMsSum": io.read_batch_latency_ns_sum / 1e6,
+            "readBatchLatencyMsMax": io.read_batch_latency_ns_max / 1e6,
+            "queuedReadOps": io.queued_read_ops,
+            "queuedWriteOps": io.queued_write_ops,
+            "peakQueuedReadOps": io.peak_queued_read_ops,
+            "peakQueuedWriteOps": io.peak_queued_write_ops,
+            "pendingWriteBytes": io.pending_write_bytes,
+            "peakPendingWriteBytes": io.peak_pending_write_bytes,
+            "reserveEvictedPages": io.reserve_evicted_pages,
+            "reserveDeferredPages": io.reserve_deferred_pages,
+            "lastLevelDroppedPages": io.last_level_dropped_pages,
+            "failedPages": io.failed_pages,
+            "onboardedRequests": self._iter_onboarded_requests,
+            "onboardFailures": self._iter_onboard_failures,
+            "onboardWaitMsSum": self._iter_onboard_wait_s * 1e3,
+            "onboardsInFlight": len(self._context_onboards),
+        }
+        self._iter_onboarded_requests = 0
+        self._iter_onboard_failures = 0
+        self._iter_onboard_wait_s = 0.0
+        _merge_disk_io_sample(self._disk_io_stats_window, sample)
+        _merge_disk_io_sample(self._disk_io_log_window, sample)
+
+    def _maybe_log_disk_io(self) -> None:
+        """Log this rank's disk tier activity once per ``_DISK_IO_LOG_INTERVAL_S``."""
+        now = time.monotonic()
+        elapsed = now - self._disk_io_log_start
+        if elapsed < _DISK_IO_LOG_INTERVAL_S:
+            return
+        self._collect_disk_io_stats()
+        window, self._disk_io_log_window = self._disk_io_log_window, {}
+        self._disk_io_log_start = now
+        gib = float(1 << 30)
+        logger.info(
+            f"KV cache manager v2 disk tier, last {elapsed:.0f} s: "
+            f"wrote {window['writeBytes'] / gib:.2f} GiB, read {window['readBytes'] / gib:.2f} GiB; "
+            f"host reserve wrote {window['reserveEvictedPages']} pages "
+            f"and deferred {window['reserveDeferredPages']} (summed over steps); "
+            f"pending writes {window['pendingWriteBytes'] / gib:.2f} GiB, "
+            f"peak {window['peakPendingWriteBytes'] / gib:.2f} GiB; "
+            f"dropped from the last tier {window['lastLevelDroppedPages']} pages; "
+            f"failed {window['failedPages']} pages; "
+            f"onboarded {window['onboardedRequests']} requests, {window['onboardFailures']} failed"
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -5668,6 +5804,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its saves drain, and a dead entry here would block every later
         # preemption through has_pending_preemption.
         self._pending_preemption.pop(request.py_request_id, None)
+        if self._disk_tier_enabled:
+            self.cancel_context_onboard(request.py_request_id)
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
             if self.kv_connector_manager.has_pending_load(request):
@@ -5969,6 +6107,10 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        if self._disk_tier_enabled:
+            for onboard in self._context_onboards.values():
+                onboard.kv_cache.close()
+            self._context_onboards.clear()
         self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
@@ -6674,36 +6816,81 @@ class KVCacheManagerV2(BaseResourceManager):
         scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
         return self.impl.probe_first_new_block_key(scope, tokens)
 
-    def prefetch_for_context_tokens(self, requests: list) -> bool:
-        """Prefetch radix-tree blocks from disk→host for upcoming context requests.
+    @property
+    def can_gate_context_onboards(self) -> bool:
+        """Whether a request may wait outside the batch for its onboarding.
 
-        Returns True if all prefetches succeeded, False if any failed.
+        Holding a request back is a local scheduling decision. That is only safe where each rank
+        schedules its own requests: attention TP of 1, no PP, no CP. Elsewhere onboarding still
+        runs, but without the gate.
         """
-        if not self.enable_block_reuse:
+        attention_tp_size = 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
+        return attention_tp_size == 1 and self.mapping.pp_size == 1 and self.mapping.cp_size == 1
+
+    @property
+    def num_context_onboards(self) -> int:
+        return len(self._context_onboards)
+
+    def start_context_onboard(self, req: LlmRequest) -> bool:
+        """Start reading the disk-resident blocks of ``req``'s reusable prefix into host memory.
+
+        A transient cache holds the matched blocks, so they cannot be dropped while the reads run.
+        It never resumes, so it costs no GPU pages. Returns True while reads are in flight; the
+        request then appears in a later poll_context_onboards(). Returns False when no matched
+        block is on disk, or the host tier cannot take them. In that case the request reads at
+        resume, as without onboarding.
+        """
+        if not self.enable_block_reuse or req.py_request_id in self._context_onboards:
             return False
-        # Prefetch via a transient KV cache that holds the reuse-matched blocks,
-        # prefetches disk->host, then closes. Holding blocks costs no GPU space
-        # (never resumed) and close() needs no stream sync. The transient cache
-        # is NOT registered in kv_cache_map / IndexMapper.
-        success = True
-        for req in requests:
-            tokens = self._context_reuse_tokens(req)
-            # Use the same salt derivation as _create_kv_cache so the transient
-            # cache hits the same radix-tree blocks.
-            salt_int = self._derive_reuse_salt(req.cache_salt)
-            kv_cache = self.impl.create_kv_cache(
-                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
-            )
-            try:
-                # Prefetch to the first tier below GPU (host if present,
-                # otherwise disk). prefetch() is a best-effort hint.
-                prefetched = kv_cache.prefetch(CACHE_LEVEL1)
-                if not prefetched:
-                    logger.warning("prefetch failed for request %s", req.py_request_id)
-                    success = False
-            finally:
+        tokens = self._context_reuse_tokens(req)
+        # Same salt derivation as _create_kv_cache, so the transient cache matches the same blocks.
+        salt_int = self._derive_reuse_salt(req.cache_salt)
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+        )
+        try:
+            if (
+                kv_cache.prefetch(CACHE_LEVEL1)
+                and kv_cache.poll_disk_reads() == DiskIoStatus.PENDING
+            ):
+                self._context_onboards[req.py_request_id] = _ContextOnboard(
+                    request=req, kv_cache=kv_cache, start_time=time.monotonic()
+                )
+                kv_cache = None
+                return True
+            return False
+        finally:
+            if kv_cache is not None:
                 kv_cache.close()
-        return success
+
+    def poll_context_onboards(self) -> list[LlmRequest]:
+        """Return the requests whose onboarding finished since the last call, without blocking.
+
+        A failed read leaves the affected blocks out of the radix tree, so the request recomputes
+        them like any other miss.
+        """
+        finished = []
+        for request_id, onboard in list(self._context_onboards.items()):
+            status = onboard.kv_cache.poll_disk_reads()
+            if status == DiskIoStatus.PENDING:
+                continue
+            onboard.kv_cache.close()
+            del self._context_onboards[request_id]
+            self._iter_onboarded_requests += 1
+            self._iter_onboard_wait_s += time.monotonic() - onboard.start_time
+            if status == DiskIoStatus.FAILED:
+                self._iter_onboard_failures += 1
+                logger.warning(
+                    f"KV cache disk onboarding failed for request {request_id}; "
+                    "its unreadable blocks will be recomputed"
+                )
+            finished.append(onboard.request)
+        return finished
+
+    def cancel_context_onboard(self, request_id: int) -> None:
+        onboard = self._context_onboards.pop(request_id, None)
+        if onboard is not None:
+            onboard.kv_cache.close()
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

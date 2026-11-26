@@ -904,6 +904,41 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("DISK", kv::CacheTier::DISK)
         .export_values();
 
+    nb::enum_<kv::DiskIoStatus>(m, "DiskIoStatus")
+        .value("PENDING", kv::DiskIoStatus::kPending)
+        .value("OK", kv::DiskIoStatus::kOk)
+        .value("FAILED", kv::DiskIoStatus::kFailed);
+
+    nb::class_<kv::DiskIoIterationStats>(m, "DiskIoIterationStats")
+        .def_prop_ro("read_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.readBytes; })
+        .def_prop_ro("write_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.writeBytes; })
+        .def_prop_ro("read_ops", [](kv::DiskIoIterationStats const& self) { return self.io.readOps; })
+        .def_prop_ro("write_ops", [](kv::DiskIoIterationStats const& self) { return self.io.writeOps; })
+        .def_prop_ro("read_busy_ns", [](kv::DiskIoIterationStats const& self) { return self.io.readBusyNs; })
+        .def_prop_ro("write_busy_ns", [](kv::DiskIoIterationStats const& self) { return self.io.writeBusyNs; })
+        .def_prop_ro("read_errors", [](kv::DiskIoIterationStats const& self) { return self.io.readErrors; })
+        .def_prop_ro("write_errors", [](kv::DiskIoIterationStats const& self) { return self.io.writeErrors; })
+        .def_prop_ro("read_batches", [](kv::DiskIoIterationStats const& self) { return self.io.readBatches; })
+        .def_prop_ro("read_batch_latency_ns_sum",
+            [](kv::DiskIoIterationStats const& self) { return self.io.readBatchLatencyNsSum; })
+        .def_prop_ro("read_batch_latency_ns_max",
+            [](kv::DiskIoIterationStats const& self) { return self.io.readBatchLatencyNsMax; })
+        .def_prop_ro("queued_read_ops", [](kv::DiskIoIterationStats const& self) { return self.io.queuedReadOps; })
+        .def_prop_ro("queued_write_ops", [](kv::DiskIoIterationStats const& self) { return self.io.queuedWriteOps; })
+        .def_prop_ro(
+            "peak_queued_read_ops", [](kv::DiskIoIterationStats const& self) { return self.io.peakQueuedReadOps; })
+        .def_prop_ro(
+            "peak_queued_write_ops", [](kv::DiskIoIterationStats const& self) { return self.io.peakQueuedWriteOps; })
+        .def_prop_ro(
+            "pending_write_bytes", [](kv::DiskIoIterationStats const& self) { return self.io.pendingWriteBytes; })
+        .def_prop_ro("peak_pending_write_bytes",
+            [](kv::DiskIoIterationStats const& self) { return self.io.peakPendingWriteBytes; })
+        .def_ro("reserve_evicted_pages", &kv::DiskIoIterationStats::reserveEvictedPages)
+        .def_ro("reserve_deferred_pages", &kv::DiskIoIterationStats::reserveDeferredPages)
+        .def_ro("last_level_dropped_pages", &kv::DiskIoIterationStats::lastLevelDroppedPages)
+        .def_ro("failed_pages", &kv::DiskIoIterationStats::failedPages)
+        .def_ro("stream_mem_ops", &kv::DiskIoIterationStats::streamMemOps);
+
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
@@ -1604,6 +1639,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("direct_io", &kv::DiskCacheTierConfig::directIo)
+        .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
+        .def_rw("host_reserve_fraction", &kv::DiskCacheTierConfig::hostReserveFraction)
+        .def_rw("max_pending_write_bytes", &kv::DiskCacheTierConfig::maxPendingWriteBytes)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -1959,6 +1998,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
+        .def("poll_disk_reads", &kv::KvCache::pollDiskReads, nb::arg("wait") = false,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def("commit_pending_stats", &kv::KvCache::commitPendingStats, nb::call_guard<nb::gil_scoped_release>())
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats, nb::call_guard<nb::gil_scoped_release>())
@@ -2355,6 +2396,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("kv_cache"), nb::arg("end"), nb::arg("groups") = nb::none());
     mIntrospection.def("all_tree_pages_droppable", &kv::KvCacheIntrospection::allTreePagesDroppable, nb::arg("manager"),
         nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("inject_disk_io_faults", &kv::KvCacheIntrospection::injectDiskIoFaults, nb::arg("manager"),
+        nb::arg("reads"), nb::arg("count"), nb::arg("errno_value"), nb::call_guard<nb::gil_scoped_release>());
     nb::class_<kv::HostMemPlacement>(mIntrospection, "HostMemPlacement")
         .def_ro("gpu_numa_node", &kv::HostMemPlacement::gpuNumaNode)
         .def_ro("strict_binding", &kv::HostMemPlacement::strictBinding)
@@ -2744,6 +2787,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_disk_prefetch_blocks",
             &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "maintain_host_reserve", &kv::KvCacheManager::maintainHostReserve, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_and_reset_disk_io_stats", &kv::KvCacheManager::getAndResetDiskIoStats,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_life_cycle_pool_group_indices",
             [](kv::KvCacheManager const& self, int cacheLevel)
