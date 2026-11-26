@@ -601,8 +601,9 @@ def _split_call_runs(
     if logits.ndim != 2 or logits.dtype != torch.float32 or not logits.is_cuda:
         raise ValueError("logits must be a two-dimensional CUDA float32 tensor")
     rows, width = logits.shape
-    if not 4096 <= width <= 1048584 or rows > 64:
-        raise ValueError("split radix requires width 4096..1048584 and at most 64 rows")
+    max_rows = min(128, _cluster_kernel.MAX_REQUESTS * next_n)
+    if not 4096 <= width <= 1048584 or rows > max_rows:
+        raise ValueError(f"split radix requires width 4096..1048584 and at most {max_rows} rows")
     if logits.stride(1) != 1 or logits.stride(0) < width:
         raise ValueError("logits must have unit column stride and non-overlapping rows")
     if seq_lens.shape != (rows // next_n,) or rows % next_n:

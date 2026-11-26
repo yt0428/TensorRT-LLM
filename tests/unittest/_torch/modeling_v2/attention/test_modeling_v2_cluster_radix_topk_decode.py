@@ -250,13 +250,14 @@ def test_cluster_radix_selector_contract():
             assert sorted(valid.tolist()) == list(range(row % 4 + 1))
 
 
-def test_cluster_radix_graph_replay():
-    """dep4's largest graph batch, 16 requests (64 rows) at 1048584 columns, captured once and
+@pytest.mark.parametrize("batch", [16, 20, 24, 32])
+def test_cluster_radix_graph_replay(batch):
+    """dep4 graph batches 16..32 (64..128 rows) at 1048584 columns, captured once and
     replayed over new lengths and scores."""
     compiled = build_cluster(torch.cuda.current_device())
     width = 1048584
-    logits, output, aux_i, aux_l = _buffers(16, width)
-    edges = _dep4_lengths(width)
+    logits, output, aux_i, aux_l = _buffers(batch, width)
+    edges = (_dep4_lengths(width) * 2)[:batch]
     lens = torch.tensor(edges, dtype=torch.int32, device="cuda")
     _fill(logits, edges, 4, 0, "ordinary")
     graph = torch.cuda.CUDAGraph()
@@ -269,6 +270,24 @@ def test_cluster_radix_graph_replay():
         output.fill_(-7)
         graph.replay()
         _check(logits, lengths, output)
+
+
+def test_cluster_radix_empty_slice_pass2_skip():
+    """Long row whose top-2048 values all live in the first CTA slice so all other slices
+    have my_above == 0 and my_eq == 0 and skip Pass 2."""
+    compiled = build_cluster(torch.cuda.current_device())
+    width = 1048584
+    logits, output, aux_i, aux_l = _buffers(2, width)
+    lengths = [524288, 4]
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    logits.fill_(-10.0)
+    for row in range(4):
+        logits[row, :TOP_K] = torch.arange(TOP_K, 0, -1, dtype=torch.float32, device="cuda")
+    for row in range(4, 8):
+        logits[row, :4] = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+    output.fill_(-7)
+    cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)
+    _check(logits, lengths, output)
 
 
 @pytest.mark.parametrize("layout", ["unaligned_rows", "unaligned_width", "eight_blocks"])
@@ -317,7 +336,7 @@ def test_cluster_radix_rejects_invalid_inputs():
         cluster_radix_topk_decode(
             logits, lens, output, aux_i.flatten()[: 4 * 8 * TOP_K - 1], aux_l, compiled=compiled
         )
-    logits, output, aux_i, aux_l = _buffers(17, 16384)
-    lens = torch.full((17,), 16384, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="at most 64 rows"):
+    logits, output, aux_i, aux_l = _buffers(33, 16384)
+    lens = torch.full((33,), 16384, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="at most 128 rows"):
         cluster_radix_topk_decode(logits, lens, output, aux_i, aux_l, compiled=compiled)

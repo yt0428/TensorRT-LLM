@@ -859,22 +859,28 @@ class ClusterRadixTopkDecodeKernel(SplitRadixTopkDecodeKernel):
             else:
                 gather = mode == cutlass.Int32(_GATHER)
                 if tid == zero:
-                    s_scal[_S_BASE_A] = _atom_add_cluster(
-                        _mapa(_saddr(s_cnt, _C_ABOVE), zero), my_above
-                    )
-                    slot = cutlass.Int32(_C_TIE)
-                    if gather:
-                        slot = cutlass.Int32(_C_LIST)
-                    s_scal[_S_BASE_E] = _atom_add_cluster(_mapa(_saddr(s_cnt, slot), zero), my_eq)
+                    if my_above > zero:
+                        s_scal[_S_BASE_A] = _atom_add_cluster(
+                            _mapa(_saddr(s_cnt, _C_ABOVE), zero), my_above
+                        )
+                    if my_eq > zero:
+                        slot = cutlass.Int32(_C_TIE)
+                        if gather:
+                            slot = cutlass.Int32(_C_LIST)
+                        s_scal[_S_BASE_E] = _atom_add_cluster(
+                            _mapa(_saddr(s_cnt, slot), zero), my_eq
+                        )
                 cute.arch.barrier()
                 take = need
                 if count_cols < take:
                     take = count_cols
                 self._stamp(aux_indices, trace_base, bid, 4, tid)
-                self._emit_slice(
-                    row_addr, lo, hi, prefix, shift, gather, take, a_total, dst, s_lkey, s_lcol,
-                    s_scal, tid,
-                )  # fmt: skip
+                emit_eq = (my_eq > zero) & (gather | (s_scal[_S_BASE_E] < take))
+                if (my_above > zero) | emit_eq:
+                    self._emit_slice(
+                        row_addr, lo, hi, prefix, shift, gather, take, a_total, dst, s_lkey, s_lcol,
+                        s_scal, tid,
+                    )  # fmt: skip
                 self._stamp(aux_indices, trace_base, bid, 5, tid)
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()

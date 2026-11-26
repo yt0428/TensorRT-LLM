@@ -94,7 +94,9 @@ def draft_attention_partial_kernel(
         table_row = tl.load(row_ptr + b)
         start = tl.maximum(length - WINDOW, 0)
         keys: tl.constexpr = WINDOW // NSPLIT
-        for t0 in range(split * keys, split * keys + keys, BLOCK_T):
+        split_start = split * keys
+        split_end = tl.minimum(split_start + keys, tl.maximum(length - start, 0))
+        for t0 in range(split_start, split_end, BLOCK_T):
             pos = start + t0 + t
             valid = pos < length
             safe = tl.minimum(pos, max_pos)
