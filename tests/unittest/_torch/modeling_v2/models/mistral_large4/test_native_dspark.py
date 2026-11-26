@@ -555,14 +555,14 @@ def test_native_draft_manifest_matches_checkpoint_headers(modeling, native_check
         for name, rows in manifest.items():
             if not name.startswith("draft_") and "_draft_" not in name:
                 continue
-            assert len(rows) == 1
-            key, index, transform, *sharding = rows[0]
-            assert index is None and transform is None
-            assert headers[key]["dtype"] == "BF16"
-            source = torch.empty(headers[key]["shape"], device="meta", dtype=torch.bfloat16)
-            if sharding and sharding[0] is not None:
-                source = sharding[0](source)
-            assert source.shape == declared[name].shape, (rank, name, key)
-            consumed.add(key)
+            for key, index, transform, *sharding in rows:
+                assert transform is None
+                assert headers[key]["dtype"] == "BF16"
+                source = torch.empty(headers[key]["shape"], device="meta", dtype=torch.bfloat16)
+                if sharding and sharding[0] is not None:
+                    source = sharding[0](source)
+                dst = declared[name] if index is None else declared[name][index]
+                assert source.shape == dst.shape, (rank, name, key)
+                consumed.add(key)
         assert consumed == headers.keys()
         assert len(consumed) == 38

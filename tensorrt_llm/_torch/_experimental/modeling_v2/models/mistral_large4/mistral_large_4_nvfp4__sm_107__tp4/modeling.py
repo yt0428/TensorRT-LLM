@@ -169,10 +169,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
     triton_draft_attention,
+    triton_embed_draft_block,
     triton_latent_tail,
     triton_markov_gate,
     triton_markov_input,
     triton_markov_logits,
+    triton_query_rope_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
@@ -203,6 +205,7 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
     get_indexer_mqa_logits_workspace_bytes,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed import allgather as tp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds,
@@ -216,6 +219,10 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabParallelHead,
+    rnn_markov_chain_tokens,
+)
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.flash_mla import get_mla_metadata
@@ -407,6 +414,12 @@ _TARGET_LOGITS_SLOT = 0
 _DRAFT_LOGITS_SLOT = 1
 # Maximum decode tokens per step served by the persistent CuTe DSL MoE kernel.
 _ML4_MOE_ENGINE_MAX_TOKENS = 8
+
+
+def _cublas_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    return cublas_mm(x, weight.t(), bias, None)
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -1194,25 +1207,61 @@ def _dspark_block(
     residual = noise_embedding.reshape(rows, hidden).clone()
     normalized = torch.empty_like(residual)
     x = flashinfer_rmsnorm(residual, draft._layers[0].attn_norm, core.eps)
+    flat_positions = query_positions.reshape(rows)
+    split_qkv = noise_embedding.is_cuda
+    if split_qkv:
+        draft._ensure_kv_stream(noise_embedding.device)
     for i, layer in enumerate(draft._layers):
-        q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
-        bmm_out(
-            q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
-            layer.k_b,
-            query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
-        )
-        kv = cublas_mm(x, layer.kv_a, None, None)
-        block_kv = triton_latent_tail(
-            kv,
-            layer.kv_norm.view(1, core.kv_lora),
-            core.eps,
-            query_positions.reshape(rows),
-            draft._rope.indexer,
-            kv.new_empty((batch, block, core.lat_dim)),
-            q=q.view(rows, core.heads * core.qk_dim),
-            query=query,
-            nope=core.nope,
-        )
+        if split_qkv:
+
+            def _q_path():
+                q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
+                bmm_out(
+                    q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
+                    layer.k_b,
+                    query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
+                )
+                triton_query_rope_tail(
+                    q.view(rows, core.heads * core.qk_dim),
+                    flat_positions,
+                    draft._rope.indexer,
+                    query,
+                    nope=core.nope,
+                )
+
+            def _kv_path():
+                kv = cublas_mm(x, layer.kv_a, None, None)
+                return triton_latent_tail(
+                    kv,
+                    layer.kv_norm.view(1, core.kv_lora),
+                    core.eps,
+                    flat_positions,
+                    draft._rope.indexer,
+                    kv.new_empty((batch, block, core.lat_dim)),
+                )
+
+            _, block_kv = maybe_execute_in_parallel(
+                _q_path, _kv_path, draft._kv_fork, draft._kv_join, draft._kv_stream
+            )
+        else:
+            q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
+            bmm_out(
+                q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
+                layer.k_b,
+                query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
+            )
+            kv = cublas_mm(x, layer.kv_a, None, None)
+            block_kv = triton_latent_tail(
+                kv,
+                layer.kv_norm.view(1, core.kv_lora),
+                core.eps,
+                flat_positions,
+                draft._rope.indexer,
+                kv.new_empty((batch, block, core.lat_dim)),
+                q=q.view(rows, core.heads * core.qk_dim),
+                query=query,
+                nope=core.nope,
+            )
         latent = triton_draft_attention(
             query,
             ctx_kv_cache[i][:, 0, 0],
@@ -1232,9 +1281,13 @@ def _dspark_block(
         o = cute_dsl_allreduce_add_rmsnorm(
             partial, residual, layer.ffn_norm, normalized, core._lamport
         )
-        gate = cublas_mm(o, layer.gate, None, None)
-        up = cublas_mm(o, layer.up, None, None)
-        activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
+        gate_up = getattr(layer, "gate_up", None)
+        if gate_up is not None:
+            activated = flashinfer_silu_and_mul(cublas_mm(o, gate_up, None, None))
+        else:
+            gate = cublas_mm(o, layer.gate, None, None)
+            up = cublas_mm(o, layer.up, None, None)
+            activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
         mlp = cublas_mm(activated, layer.down, None, None)
         x = cute_dsl_allreduce_add_rmsnorm(
             mlp, residual, layer.next_norm, normalized, core._lamport
@@ -2379,6 +2432,11 @@ class DraftModel(nn.Module):
         self._runtime_position_ceiling = None
         self._rope = None
         self._layers = None
+        self._fused_kv_a = None
+        self._fused_kv_norm = None
+        self._kv_stream = None
+        self._kv_fork = None
+        self._kv_join = None
 
     @property
     def core(self):
@@ -2392,6 +2450,24 @@ class DraftModel(nn.Module):
     def markov_w2(self):
         return self.core.w["draft_markov_output"]
 
+    @property
+    def markov_vocab_size(self) -> int:
+        return self.core.w["draft_markov_embedding"].shape[0]
+
+    @property
+    def markov_output_is_sharded(self) -> bool:
+        tp_size = getattr(self.core, "tp_size", 1)
+        return (
+            tp_size > 1
+            and self.core.w["draft_markov_output"].shape[0] * tp_size == self.markov_vocab_size
+        )
+
+    def _ensure_kv_stream(self, device: torch.device) -> None:
+        if self._kv_stream is None or self._kv_stream.device != device:
+            self._kv_stream = torch.cuda.Stream(device=device)
+            self._kv_fork = torch.cuda.Event()
+            self._kv_join = torch.cuda.Event()
+
     def logits_processor(self, hidden, lm_head, attn_metadata, gather):
         # The shared-head logits are soft-capped before the RNN bias is added.
         if gather and lm_head is self._shell.lm_head:
@@ -2401,14 +2477,24 @@ class DraftModel(nn.Module):
 
     def _build_fused_kv_buffers(self):
         # The worker calls this before sizing its cache. Take views once after
-        # materialization; context projection is explicit per layer here.
+        # materialization; also pack per-layer wkv_a and kv_a_norm for a single
+        # stacked context-KV projection.
         if self._layers is not None:
             return
         w, core = self.core.w, self.core
         self._layers = []
+        kv_a_rows = []
+        kv_norms = []
         for i in range(self._num_attn_layers):
             prefix = f"l{i}_draft_"
             kv_b = w[prefix + "wkv_b"].view(core.heads, core.nope + core.v_dim, core.kv_lora)
+            kv_a_rows.append(w[prefix + "wkv_a"])
+            kv_norms.append(w[prefix + "kv_a_norm"])
+            mlp_weights = (
+                {"gate_up": w[prefix + "w13"].t()}
+                if prefix + "w13" in w
+                else {"gate": w[prefix + "w1"].t(), "up": w[prefix + "w3"].t()}
+            )
             self._layers.append(
                 SimpleNamespace(
                     attn_norm=w[prefix + "attn_norm"],
@@ -2419,16 +2505,18 @@ class DraftModel(nn.Module):
                     v_b=kv_b[:, core.nope :].contiguous(),
                     out=w[prefix + "wo"].t(),
                     ffn_norm=w[prefix + "ffn_norm"],
-                    gate=w[prefix + "w1"].t(),
-                    up=w[prefix + "w3"].t(),
                     down=w[prefix + "w2"].t(),
                     next_norm=(
                         w[f"l{i + 1}_draft_attn_norm"]
                         if i + 1 < self._num_attn_layers
                         else w["draft_final_norm"]
                     ),
+                    **mlp_weights,
                 )
             )
+        if kv_a_rows:
+            self._fused_kv_a = torch.cat(kv_a_rows, dim=0).contiguous().t()
+            self._fused_kv_norm = torch.stack(kv_norms, dim=0).contiguous()
 
     def _ensure_rope(self):
         cap = self._runtime_position_ceiling or self.core.rope_rows
@@ -2447,16 +2535,30 @@ class DraftModel(nn.Module):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
         weight = self.core.w["embed"]
-        valid = (anchors >= 0) & (anchors < weight.shape[0])
-        embedded = nn.functional.embedding(anchors.clamp(0, weight.shape[0] - 1), weight)
-        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
-        masks = self.core.w["draft_mask"].unsqueeze(0).expand(anchors.shape[0], -1, -1)
-        return torch.cat((embedded.unsqueeze(1), masks), dim=1)
+        masks = self.core.w["draft_mask"]
+        if anchors.is_cuda or os.environ.get("TRITON_INTERPRET") == "1":
+            return triton_embed_draft_block(anchors, weight, masks, block_size)
+        return triton_embed_draft_block.reference(anchors, weight, masks, block_size)
 
     def project_target_hidden(self, hidden):
         w = self.core.w
-        projected = cublas_mm(hidden, w["draft_target_projection"].t(), None, None)
-        return flashinfer_rmsnorm(projected, w["draft_target_norm"], self.core.eps)
+        w_proj = w["draft_target_projection"]
+        if w_proj.shape[1] == hidden.shape[1]:
+            projected = cublas_mm(hidden, w_proj.t(), None, None)
+            return flashinfer_rmsnorm(projected, w["draft_target_norm"], self.core.eps)
+        k_shard = w_proj.shape[1]
+        k_start = self.core.tp_rank * k_shard
+        hidden_shard = hidden[:, k_start : k_start + k_shard].contiguous()
+        partial = cublas_mm(hidden_shard, w_proj.t(), None, None)
+        lamport = getattr(self.core, "_lamport", None)
+        if lamport is not None:
+            out = torch.empty_like(partial)
+            return cute_dsl_allreduce_add_rmsnorm(
+                partial, torch.zeros_like(partial), w["draft_target_norm"], out, lamport
+            )
+        if torch.distributed.is_initialized() and getattr(self.core, "tp_size", 1) > 1:
+            torch.distributed.all_reduce(partial)
+        return flashinfer_rmsnorm(partial, w["draft_target_norm"], self.core.eps)
 
     def precompute_context_kv(self, projected_hidden, positions):
         self._build_fused_kv_buffers()
@@ -2465,21 +2567,78 @@ class DraftModel(nn.Module):
         rows = projected_hidden.shape[0]
         out = projected_hidden.new_empty((rows, len(self._layers), 1, core.lat_dim))
         positions = positions.reshape(-1)
-        for i, layer in enumerate(self._layers):
-            kv = cublas_mm(projected_hidden, layer.kv_a, None, None)
+        if self._fused_kv_a is not None and self._fused_kv_norm is not None:
+            kv = cublas_mm(projected_hidden, self._fused_kv_a, None, None)
             triton_latent_tail(
                 kv,
-                layer.kv_norm.view(1, core.kv_lora),
+                self._fused_kv_norm,
                 core.eps,
                 positions,
                 self._rope.indexer,
-                out[:, i],
+                out,
             )
         return out, None
 
     def dflash_forward_with_metadata(self, *, attn_metadata, **kwargs):
         # The phase belongs to this engine step, including mixed batches.
         return self.core._select_target(attn_metadata).dspark_forward(self, **kwargs)
+
+    def vocab_parallel_markov_tokens(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        vp_head: VocabParallelHead,
+    ) -> torch.Tensor:
+        """Vocab-parallel greedy RNN-Markov chain directly from shard block logits."""
+        w = self.core.w
+        return vp_head.rnn_markov_tokens(
+            local_block,
+            first_prev_tokens,
+            hidden_states,
+            w["draft_markov_embedding"],
+            w["draft_joint"],
+            w["draft_joint_bias"],
+            w["draft_markov_output"],
+            linear_fn=_cublas_linear,
+            gate_fn=triton_markov_gate,
+        )
+
+    def vocab_parallel_markov_logits(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        vp_head: VocabParallelHead,
+    ) -> torch.Tensor:
+        """Full-vocab float32 biased RNN-Markov logits via sharded compute + single gather."""
+        w = self.core.w
+        w_out = w["draft_markov_output"]
+        w_out_rows = (
+            w_out
+            if w_out.shape[0] == vp_head.shard_width
+            else w_out[vp_head.col_base : vp_head.col_base + vp_head.shard_width]
+        )
+        local_biased = torch.empty(
+            local_block.shape, dtype=torch.float32, device=local_block.device
+        )
+        rnn_markov_chain_tokens(
+            local_block,
+            first_prev_tokens,
+            hidden_states,
+            w["draft_markov_embedding"],
+            w["draft_joint"],
+            w["draft_joint_bias"],
+            w_out_rows,
+            vp_head.col_base,
+            vp_head.exchange,
+            softcap=vp_head.softcap,
+            biased_out=local_biased,
+            need_final_tokens=False,
+            linear_fn=_cublas_linear,
+            gate_fn=triton_markov_gate,
+        )
+        return tp_allgather(local_biased, self.core.model_config.mapping, dim=-1)
 
     def apply_markov_chain_logits(
         self,
@@ -2489,16 +2648,38 @@ class DraftModel(nn.Module):
         argmax_fn,
         vocab_slice=None,
         hidden_states,
+        tp_exchange=None,
     ):
-        # The shell's lm_head gathers the whole vocabulary, so the worker never slices it and
-        # its argmax_fn is a plain argmax: the chain's own argmax stands in for it, fused with
-        # the bias add.
-        assert vocab_slice is None, vocab_slice
         w = self.core.w
-        output = w["draft_markov_output"]
+        output = (
+            w["draft_markov_output"]
+            if vocab_slice is None
+            else w["draft_markov_output"][vocab_slice]
+        )
+        if tp_exchange is not None and base_logits.is_cuda:
+            col_base = tp_exchange.tp_rank * base_logits.shape[-1]
+            refined = torch.empty(base_logits.shape, dtype=torch.float32, device=base_logits.device)
+            rnn_markov_chain_tokens(
+                base_logits,
+                first_prev_tokens,
+                hidden_states,
+                w["draft_markov_embedding"],
+                w["draft_joint"],
+                w["draft_joint_bias"],
+                output,
+                col_base,
+                tp_exchange,
+                softcap=None,
+                biased_out=refined,
+                need_final_tokens=False,
+                linear_fn=_cublas_linear,
+                gate_fn=triton_markov_gate,
+            )
+            return refined
         previous = first_prev_tokens.long()
         state = None
         refined = torch.empty_like(base_logits)
+        sharded_fallback = vocab_slice is not None or self.markov_output_is_sharded
         for i in range(base_logits.shape[1]):
             joint = cublas_mm(
                 triton_markov_input(
@@ -2510,7 +2691,11 @@ class DraftModel(nn.Module):
             )
             state, emitted = triton_markov_gate(joint, state)
             bias = cublas_mm(emitted, output.t(), None, None)
-            previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
+            if sharded_fallback:
+                refined[:, i].copy_(base_logits[:, i] + bias)
+                previous = argmax_fn(refined[:, i]).long()
+            else:
+                previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
         return refined
 
 
@@ -2858,6 +3043,7 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
                 model_config.mapping,
                 use_separate_draft_kv_cache=True,
             )
+            self.spec_worker.set_target_model(self)
             self.spec_worker.set_draft_model(self.draft_model)
             self.epilogue.append(self.spec_worker)
 
@@ -2912,11 +3098,16 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             lora_params=lora_params,
             **kwargs,
         )
-        logits = self.capped_logits(
-            nn.functional.embedding(spec_metadata.gather_ids, hidden),
-            attn_metadata,
-            _TARGET_LOGITS_SLOT,
-        )
+        gathered_hidden = nn.functional.embedding(spec_metadata.gather_ids, hidden)
+        vp_head = getattr(self.spec_worker, "target_vocab_parallel_head", None)
+        if isinstance(vp_head, VocabParallelHead):
+            logits = vp_head.shard_logits(gathered_hidden)
+        else:
+            logits = self.capped_logits(
+                gathered_hidden,
+                attn_metadata,
+                _TARGET_LOGITS_SLOT,
+            )
         return self.spec_worker(
             input_ids=worker_input_ids,
             position_ids=position_ids,
@@ -2927,6 +3118,14 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             draft_model=self.draft_model,
             resource_manager=kwargs.get("resource_manager"),
         )
+
+    def _gather_capped_local_logits(self, local: torch.Tensor) -> torch.Tensor:
+        """Materialize full-vocab soft-capped fp32 logits from this rank's bf16 shard."""
+        gather = self._logits_gather
+        if gather is not None and local.shape[0] <= gather.rows:
+            return symm_logits_gather_softcap(local, gather, _TARGET_LOGITS_SLOT, self.softcap)
+        logits = tp_allgather(local, self.model_config.mapping, dim=-1).float()
+        return tanh_softcap(logits, self.softcap)
 
     def capped_logits(self, hidden: torch.Tensor, attn_metadata, slot: int) -> torch.Tensor:
         """The soft-capped full-vocabulary fp32 logits of every row of `hidden`, through the
@@ -2959,10 +3158,10 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
         if self.draft_model is not None:
             self.draft_model._build_fused_kv_buffers()
         if self.spec_worker is not None:
-            # The route fixes the lm_head the gather is written for: a bf16 column shard of the
-            # whole vocabulary on every rank of the TP group, gathered, no padding.
-            # symm_logits_gather serves 4- and 8-rank TP groups; larger groups fall back to
-            # logits_processor + tanh_softcap in capped_logits.
+            # The route fixes the lm_head: a bf16 column shard of the whole vocabulary on every
+            # rank of the 4-, 8- or 16-rank TP group, gathered, no padding. Above TP8, decode
+            # selects tokens vocab-parallel without full-vocab gather and any gathered fallback
+            # uses NCCL allgather instead of allocating a 16-rank symmetric gather workspace.
             mapping = self.model_config.mapping
             lm_head = self.lm_head
             assert lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.gather_output
@@ -2978,3 +3177,5 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
                 )
             else:
                 self._logits_gather = None
+            if callable(getattr(self.spec_worker, "post_load_weights", None)):
+                self.spec_worker.post_load_weights()

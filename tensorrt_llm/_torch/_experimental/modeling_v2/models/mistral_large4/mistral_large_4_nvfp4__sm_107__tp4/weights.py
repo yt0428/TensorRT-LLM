@@ -983,7 +983,10 @@ class MistralLarge4Tp4Weights:
     )
 
     # BF16 draft weights use the same attention and dense-MLP partition as
-    # this target. The RNN and target-feature projection are replicated.
+    # this target (w1 and w3 fused as [w1 ; w3] for flashinfer_silu_and_mul).
+    # draft_target_projection is sharded along its input K dimension (30720 / tp)
+    # and draft_markov_output along its vocabulary rows (204800 / tp); the tiny
+    # rank-512 RNN recurrence weights remain replicated.
     DRAFT_WEIGHTS: tuple[W, ...] = (
         W(
             "draft_attn_norm",
@@ -1036,16 +1039,16 @@ class MistralLarge4Tp4Weights:
             layers=_draft_layers,
         ),
         W(
-            "draft_w1",
-            lambda d: (d.dense_inter, d.hidden),
-            _draft_source("feed_forward.w1.weight"),
-            layers=_draft_layers,
-            shard=_rows(lambda d: d.draft_tp_rank * d.dense_inter, lambda d: d.dense_inter),
-        ),
-        W(
-            "draft_w3",
-            lambda d: (d.dense_inter, d.hidden),
-            _draft_source("feed_forward.w3.weight"),
+            "draft_w13",
+            lambda d: (2 * d.dense_inter, d.hidden),
+            _stack(
+                ("{p}.feed_forward.w1.weight", lambda d: (slice(0, d.dense_inter),)),
+                (
+                    "{p}.feed_forward.w3.weight",
+                    lambda d: (slice(d.dense_inter, 2 * d.dense_inter),),
+                ),
+                prefix="mtp_dspark.backbone.layers",
+            ),
             layers=_draft_layers,
             shard=_rows(lambda d: d.draft_tp_rank * d.dense_inter, lambda d: d.dense_inter),
         ),
@@ -1070,9 +1073,20 @@ class MistralLarge4Tp4Weights:
         ),
         W(
             "draft_target_projection",
-            lambda d: (d.hidden, d.hidden * d.draft_capture_layers),
+            lambda d: (d.hidden, d.draft_target_proj_k),
             "mtp_dspark.backbone.target_projection.weight",
             layers=None,
+            shard=lambda d: (
+                (
+                    lambda e: e[
+                        :,
+                        d.draft_tp_rank * d.draft_target_proj_k : (d.draft_tp_rank + 1)
+                        * d.draft_target_proj_k,
+                    ]
+                )
+                if d.draft_split_target_proj
+                else None
+            ),
         ),
         W(
             "draft_mask",
@@ -1088,9 +1102,19 @@ class MistralLarge4Tp4Weights:
         ),
         W(
             "draft_markov_output",
-            lambda d: (d.vocab, d.draft_rank),
+            lambda d: (d.draft_markov_out_vocab, d.draft_rank),
             "mtp_dspark.autoregressive_head.output.weight",
             layers=None,
+            shard=lambda d: (
+                (
+                    lambda e: e[
+                        d.draft_tp_rank * d.draft_markov_out_vocab : (d.draft_tp_rank + 1)
+                        * d.draft_markov_out_vocab
+                    ]
+                )
+                if d.draft_shard_markov_out
+                else None
+            ),
         ),
         W(
             "draft_joint",
@@ -1306,12 +1330,22 @@ class MistralLarge4Tp4Weights:
         draft = getattr(spec, "_draft_model_config", None) or {}
         tp = mapping.tp_size
         local_experts = cfg.n_routed_experts // mapping.moe_ep_size
+        draft_capture_layers = len(spec.target_layer_ids) if draft else 0
+        draft_k_total = cfg.hidden_size * draft_capture_layers
+        draft_split_target_proj = tp > 1 and draft_k_total > 0 and draft_k_total % tp == 0
+        draft_target_proj_k = draft_k_total // tp if draft_split_target_proj else draft_k_total
+        draft_shard_markov_out = tp > 1 and cfg.vocab_size % tp == 0
+        draft_markov_out_vocab = cfg.vocab_size // tp if draft_shard_markov_out else cfg.vocab_size
         return SimpleNamespace(
             draft_layers=int(draft.get("n_layers", 0)),
             draft_rank=int((draft.get("dspark") or {}).get("markov_rank", 0)),
             draft_depth=int(draft.get("depth", 0)),
-            draft_capture_layers=len(spec.target_layer_ids) if draft else 0,
+            draft_capture_layers=draft_capture_layers,
             draft_tp_rank=mapping.tp_rank,
+            draft_split_target_proj=draft_split_target_proj,
+            draft_target_proj_k=draft_target_proj_k,
+            draft_shard_markov_out=draft_shard_markov_out,
+            draft_markov_out_vocab=draft_markov_out_vocab,
             num_layers=cfg.num_hidden_layers,
             hidden=cfg.hidden_size,
             heads=cfg.num_attention_heads // tp,
