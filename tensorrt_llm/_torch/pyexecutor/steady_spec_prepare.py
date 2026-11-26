@@ -24,6 +24,7 @@ also writes the step's Philox state for sampling (``SpecMetadata.request_seeds``
 from __future__ import annotations
 
 import types
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,11 +33,13 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from . import step_inputs
+from .numa_pinned import numa_pinned_zeros
 
 if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
@@ -270,6 +273,14 @@ class SteadyMtpRecord:
     seq_lens_kv: list[int]
     # Whether attn_metadata.prepare_steady_decode_step replaces its prepare().
     attn_steady: bool
+    # Whether the pure-decode DSA steady fast path replaces attn_metadata.prepare().
+    attn_dsa_steady: bool
+    # Snapshot of raw block-offset rows [B, max_blocks_per_seq] and per-seq block counts for DSA.
+    dsa_raw_blocks: np.ndarray | None
+    dsa_num_blocks: list[int] | None
+    dsa_max_blocks: int
+    # Recorded DSpark rolling-window slot list matching request_ids (or None).
+    dspark_slots: list[int] | None
     # The CUDA graph's static input ids / positions the staging kernel writes, or None.
     static_ids: torch.Tensor | None
     static_pos: torch.Tensor | None
@@ -281,6 +292,7 @@ class SteadyMtpPrepare:
     rng_span: int = 0
     host_rng_slabs: tuple[torch.Tensor, ...] = ()
     host_rng_views: tuple[np.ndarray, ...] = ()
+    DSA_BLOCK_PATCH_MAX_SPAN: int = 256
 
     def __init__(
         self,
@@ -291,16 +303,20 @@ class SteadyMtpPrepare:
         use_mrope: bool,
         has_static_inputs: bool,
         stage_rng: bool = False,
+        steady_dsa: bool = False,
+        defer_dsa_derived: bool = False,
     ) -> None:
         self.record: SteadyMtpRecord | None = None
         self.use_mrope = use_mrope
+        self.steady_dsa = bool(steady_dsa)
+        self.defer_dsa_derived = bool(defer_dsa_derived)
         max_requests = max(1, int(max_batch_size))
         self.slab_capacity = 3 * max_requests + int(max_num_tokens)
         # With pinned memory the kernel reads the host slab through its device mapping (no H2D copy);
         # otherwise the slab goes through a device copy.
         self.zero_copy = prefer_pinned()
         self.host_slabs = [
-            torch.zeros(self.slab_capacity, dtype=torch.int32, pin_memory=self.zero_copy)
+            numa_pinned_zeros(self.slab_capacity, dtype=torch.int32, pin_memory=self.zero_copy)
             for _ in range(_RING)
         ]
         self.host_views = [slab.numpy() for slab in self.host_slabs]
@@ -316,7 +332,7 @@ class SteadyMtpPrepare:
 
             self.rng_span = int(_RNG_SLOT_SPAN)
             self.host_rng_slabs = tuple(
-                torch.zeros(2 * max_requests, dtype=torch.int64, pin_memory=self.zero_copy)
+                numa_pinned_zeros(2 * max_requests, dtype=torch.int64, pin_memory=self.zero_copy)
                 for _ in range(_RING)
             )
             self.host_rng_views = tuple(slab.numpy() for slab in self.host_rng_slabs)
@@ -404,6 +420,27 @@ class SteadyMtpPrepare:
             and getattr(attn_metadata, "supports_steady_decode_step", False)
             and attn_metadata.num_seqs == b
         )
+        attn_dsa_steady = False
+        dsa_raw_blocks: np.ndarray | None = None
+        dsa_num_blocks: list[int] | None = None
+        dsa_max_blocks = 0
+        if self.steady_dsa and not attn_steady and self._qualifies_dsa_steady(attn_metadata, b):
+            cache_mgr = attn_metadata.kv_cache_manager
+            req_ids = [request.py_request_id for request in requests]
+            copy_idx = cache_mgr.index_mapper.get_copy_index(req_ids, 0, 1)
+            slots = copy_idx.tolist()
+            src_np = cache_mgr.host_kv_cache_block_offsets.numpy()
+            dsa_raw_blocks = np.stack([src_np[0, sl, 0, :] for sl in slots], axis=0).copy()
+            tpb = int(cache_mgr.tokens_per_block)
+            kv_list = attn_metadata.kv_lens[:b].tolist()
+            dsa_num_blocks = [
+                max(1, (int(kl) - int(num_extra_kv_tokens) + tpb - 1) // tpb) for kl in kv_list
+            ]
+            dsa_max_blocks = max(dsa_num_blocks) if dsa_num_blocks else 1
+            attn_dsa_steady = True
+        dspark_slots = self._snapshot_dspark_slots(
+            spec_metadata, [r.py_request_id for r in requests]
+        )
         static_ids = static_pos = None
         static = static_tensors or {}
         if (
@@ -431,9 +468,66 @@ class SteadyMtpPrepare:
             spec_metadata=spec_metadata,
             seq_lens_kv=attn_metadata.seq_lens_kv[:b].tolist(),
             attn_steady=attn_steady,
+            attn_dsa_steady=attn_dsa_steady,
+            dsa_raw_blocks=dsa_raw_blocks,
+            dsa_num_blocks=dsa_num_blocks,
+            dsa_max_blocks=dsa_max_blocks,
+            dspark_slots=dspark_slots,
             static_ids=static_ids,
             static_pos=static_pos,
         )
+
+    @staticmethod
+    def _qualifies_dsa_steady(attn_metadata: AttentionMetadata, b: int) -> bool:
+        """Whether ``attn_metadata`` is a pure-decode DSA metadata eligible for steady updates."""
+        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+            return False
+        cache_mgr = attn_metadata.kv_cache_manager
+        if (
+            cache_mgr is None
+            or attn_metadata.num_contexts != 0
+            or attn_metadata.num_generations != b
+            or attn_metadata.num_seqs != b
+            or attn_metadata.beam_width != 1
+            or getattr(attn_metadata, "enable_helix", False)
+            or getattr(attn_metadata, "enable_flash_mla", False)
+            or getattr(attn_metadata, "is_ragged_verify", False)
+            or getattr(attn_metadata, "use_expanded_buffers_for_mtp", False)
+            or getattr(attn_metadata, "expand_for_dsl", False)
+            or getattr(attn_metadata, "use_fp8_ds_mla", False)
+            or getattr(attn_metadata, "fp4_mla_state", None) is not None
+            or getattr(attn_metadata, "device_windows_mode", False)
+            or getattr(attn_metadata, "skip_indexer_for_gen_reqs", False)
+        ):
+            return False
+        return (
+            hasattr(attn_metadata, "indexer_k_cache_block_offsets")
+            and hasattr(attn_metadata, "host_indexer_k_cache_block_offsets")
+            and hasattr(attn_metadata, "block_table")
+            and hasattr(cache_mgr, "host_kv_cache_block_offsets")
+            and hasattr(cache_mgr, "index_mapper")
+            and hasattr(cache_mgr, "indexer_k_cache_page_scale")
+            and hasattr(cache_mgr, "num_blocks")
+            and bool(getattr(cache_mgr, "tokens_per_block", 0))
+            and not getattr(cache_mgr, "_use_per_layer_page_tables", False)
+        )
+
+    @staticmethod
+    def _snapshot_dspark_slots(
+        spec_metadata: "SpecMetadata", request_ids: list[int]
+    ) -> list[int] | None:
+        worker = getattr(spec_metadata, "_dspark_worker", None)
+        if (
+            worker is None
+            or not getattr(worker, "_win_inited", False)
+            or not hasattr(spec_metadata, "batch_indices_cuda")
+            or not hasattr(worker, "_req_to_slot")
+            or not hasattr(worker, "_batch_to_slot")
+        ):
+            return None
+        if not all(rid in worker._req_to_slot for rid in request_ids):
+            return None
+        return [int(worker._req_to_slot[rid]) for rid in request_ids]
 
     def matches(
         self,
@@ -509,7 +603,8 @@ class SteadyMtpPrepare:
             num_cached.append(past_seen + t - request.py_num_compressed_tokens)
             kv_lens.append(num_cached[-1] + rec.seq_lens_kv[i])
         used = b + n
-        if rec.attn_steady:
+        stage_kv = rec.attn_steady or rec.attn_dsa_steady
+        if stage_kv:
             view[used : used + b] = kv_lens
             used += b
         if self.zero_copy:
@@ -543,7 +638,7 @@ class SteadyMtpPrepare:
             positions=buffers.position_ids_cuda,
             mrope_positions=buffers.mrope_position_ids_cuda if self.use_mrope else None,
             gather_ids=buffers.gather_ids_cuda,
-            kv_lens_cuda=attn_metadata.kv_lens_cuda if rec.attn_steady else None,
+            kv_lens_cuda=attn_metadata.kv_lens_cuda if stage_kv else None,
             static_input_ids=rec.static_ids,
             static_position_ids=rec.static_pos,
             block=self.block,
@@ -555,10 +650,227 @@ class SteadyMtpPrepare:
         event.record()
         return num_cached, kv_lens, n if rec.static_ids is not None else 0
 
+    def try_take_steady_rng_state(
+        self, requests: list["LlmRequest"], spec_metadata: "SpecMetadata"
+    ) -> tuple[list[int], list[int]] | None:
+        """Advance Philox RNG offsets for a steady decode batch so ``_steady_stage_kernel`` writes
+        all four RNG device buffers in the same launch. Returns None to fall back to the full
+        ``populate_sampling_params_for_one_model`` call."""
+        rec = self.record
+        if (
+            rec is None
+            or not self.rng_span
+            or getattr(spec_metadata, "enable_penalty", False)
+            or getattr(spec_metadata, "temperatures", None) is None
+            or getattr(spec_metadata, "request_seeds", None) is None
+            or getattr(spec_metadata, "request_offsets", None) is None
+            or getattr(spec_metadata, "seeds", None) is None
+            or getattr(spec_metadata, "offsets", None) is None
+            or not hasattr(spec_metadata, "_take_rng_window_offsets")
+        ):
+            return None
+        b = len(requests)
+        n_rows = b * rec.tokens_per_step
+        if (
+            spec_metadata.request_seeds.numel() < b
+            or spec_metadata.request_offsets.numel() < b
+            or spec_metadata.seeds.numel() < n_rows
+            or spec_metadata.offsets.numel() < n_rows
+        ):
+            return None
+        from ..speculative.interface import DEFAULT_SAMPLING_SEED
+        from .sampler.sampler_common import request_random_seed
+
+        user_seeds = [request_random_seed(req) for req in requests]
+        req_seeds = [DEFAULT_SAMPLING_SEED if s is None else s for s in user_seeds]
+        req_offsets = spec_metadata._take_rng_window_offsets(
+            requests, [s is not None for s in user_seeds]
+        )
+        return req_seeds, req_offsets
+
+    def try_prepare_steady_spec(
+        self, requests: list["LlmRequest"], spec_metadata: "SpecMetadata"
+    ) -> bool:
+        """Fast-path steady ``DSparkSpecMetadata.prepare()`` when batch & slot mapping match."""
+        rec = self.record
+        if rec is None or not self.steady_dsa or rec.dspark_slots is None:
+            return False
+        worker = getattr(spec_metadata, "_dspark_worker", None)
+        if worker is None or not getattr(worker, "_win_inited", False):
+            return False
+        if len(worker._req_to_slot) != len(rec.request_ids):
+            return False
+        cur_slots = [worker._req_to_slot.get(rid, -1) for rid in rec.request_ids]
+        if cur_slots != rec.dspark_slots:
+            return False
+        spec_metadata.context_capture_lens = None
+        scratch = worker._scratch_slot
+        worker._ctx_len[scratch] = 0
+        worker._valid_len[scratch] = 0
+        worker._position_initialized[scratch] = False
+        return True
+
     def prepare_attention(self, attn_metadata: AttentionMetadata, kv_lens: list[int]) -> None:
         """The attention metadata's prepare() of a staged steady step."""
         assert self.record is not None
         if self.record.attn_steady:
             attn_metadata.prepare_steady_decode_step(kv_lens)
-        else:
-            attn_metadata.prepare()
+            return
+        if self.record.attn_dsa_steady and self._prepare_dsa_steady_decode_step(
+            attn_metadata, kv_lens
+        ):
+            return
+        if self.record.attn_dsa_steady:
+            # Fallback occurred (e.g. large block-table change): run full prepare and drop stale snapshot.
+            self.record.attn_dsa_steady = False
+        attn_metadata.prepare()
+
+    def _prepare_dsa_steady_decode_step(
+        self, attn_metadata: AttentionMetadata, kv_lens: list[int]
+    ) -> bool:
+        """Steady pure-decode update for ``DSATrtllmAttentionMetadata``: skips unchanged block
+        tables / host-to-device metadata copies and packs tiny page-boundary patches into
+        ``step_inputs``."""
+        rec = self.record
+        assert rec is not None and rec.dsa_raw_blocks is not None and rec.dsa_num_blocks is not None
+        cache_mgr = attn_metadata.kv_cache_manager
+        if cache_mgr is None:
+            return False
+        b = len(kv_lens)
+        max_kv_len = max(kv_lens) if b > 0 else 0
+        if max_kv_len + rec.num_extra_kv_tokens > cache_mgr.max_seq_len:
+            return False
+        if getattr(attn_metadata, "enable_indexer_skip", False):
+            if max_kv_len <= attn_metadata.num_sparse_topk - rec.num_extra_kv_tokens:
+                return False
+
+        from tensorrt_llm._torch.utils import get_global_attrs, get_model_extra_attrs
+
+        if get_model_extra_attrs() is None:
+            get_global_attrs().attention_metadata = weakref.ref(attn_metadata)
+        attn_metadata._invalidate_pool_view_cache()
+
+        kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+        attn_metadata.kv_lens[:b].copy_(kv_lens_t + rec.num_extra_kv_tokens)
+        attn_metadata.host_total_kv_lens[0] = 0
+        attn_metadata.host_total_kv_lens[1] = int(sum(kv_lens))
+        attn_metadata.host_request_types[:b].fill_(1)
+        if attn_metadata.enable_context_mla_with_cached_kv:
+            attn_metadata.num_ctx_cached_tokens = 0
+            attn_metadata.max_ctx_cached_token_len = 0
+            attn_metadata.max_ctx_kv_len = 0
+            attn_metadata.max_ctx_seq_len = 0
+
+        cache_mgr.copy_batch_block_offsets(
+            attn_metadata.kv_cache_block_offsets,
+            rec.request_ids,
+            1,
+            0,
+            b,
+            max_blocks=None,
+        )
+        if attn_metadata.draft_kv_cache_manager is not None:
+            attn_metadata.draft_kv_cache_manager.copy_batch_block_offsets(
+                attn_metadata.draft_kv_cache_block_offsets,
+                rec.request_ids,
+                1,
+                0,
+                b,
+                max_blocks=None,
+            )
+        attn_metadata._bind_runtime_views(
+            kv_lens_cuda=attn_metadata.kv_lens_cuda[:b],
+            kv_lens=kv_lens_t,
+            prompt_lens_cuda=attn_metadata.prompt_lens_cuda[:b],
+            prompt_lens_cpu=attn_metadata.prompt_lens_cpu[:b],
+            host_request_types=attn_metadata.host_request_types[:b],
+        )
+
+        attn_metadata.num_ctx_cached_tokens = 0
+        attn_metadata.num_ctx_mla_kv_tokens = 0
+        attn_metadata.max_ctx_kv_len = 0
+        attn_metadata.max_ctx_seq_len = 0
+        attn_metadata.max_gen_seq_len = rec.tokens_per_step
+        attn_metadata.skip_indexer_for_ctx_reqs = False
+        attn_metadata.skip_indexer_for_gen_reqs = False
+        attn_metadata.num_ctx_kv_tokens = 0
+
+        # Incremental indexer_k_cache_block_offsets + block_table update.
+        copy_idx = cache_mgr.index_mapper.get_copy_index(list(rec.request_ids), 0, 1)
+        slots = copy_idx.tolist()
+        src_np = cache_mgr.host_kv_cache_block_offsets.numpy()
+        tpb = int(cache_mgr.tokens_per_block)
+        cur_nb = [max(1, (int(kl) + tpb - 1) // tpb) for kl in kv_lens]
+        new_max_nb = max(cur_nb) if cur_nb else 1
+        old_max_nb = rec.dsa_max_blocks
+        max_blk_id = int(cache_mgr.num_blocks) - 1
+        page_scale = int(cache_mgr.indexer_k_cache_page_scale)
+
+        ix_patches: list[tuple[int, int, int, np.ndarray]] = []
+        bt_patches: list[tuple[int, int, int, np.ndarray]] = []
+        total_span = 0
+        for s in range(b):
+            cur_row = src_np[0, slots[s], 0, :]
+            prev_row = rec.dsa_raw_blocks[s, :]
+            changed = not np.array_equal(cur_row, prev_row)
+            old_nb_s = rec.dsa_num_blocks[s]
+            new_nb_s = cur_nb[s]
+            lo_chg = hi_chg = -1
+            if changed:
+                diff = np.flatnonzero(cur_row != prev_row)
+                lo_chg = int(diff[0])
+                hi_chg = int(diff[-1]) + 1
+                total_span += hi_chg - lo_chg
+                if total_span > self.DSA_BLOCK_PATCH_MAX_SPAN:
+                    return False
+                ix_patches.append((s, lo_chg, hi_chg, cur_row))
+            # Determine block_table columns requiring update (changed active cols or new tail cols).
+            bt_lo = new_max_nb
+            bt_hi = 0
+            if changed and lo_chg < new_nb_s:
+                bt_lo = min(bt_lo, lo_chg)
+                bt_hi = max(bt_hi, min(hi_chg, new_nb_s))
+            if new_nb_s != old_nb_s:
+                bt_lo = min(bt_lo, min(old_nb_s, new_nb_s))
+                bt_hi = max(bt_hi, max(old_nb_s, new_nb_s))
+            if new_max_nb > old_max_nb and new_nb_s < new_max_nb:
+                bt_lo = min(bt_lo, old_max_nb)
+                bt_hi = max(bt_hi, new_max_nb)
+            if bt_hi > bt_lo:
+                total_span += bt_hi - bt_lo
+                if total_span > self.DSA_BLOCK_PATCH_MAX_SPAN:
+                    return False
+                bt_patches.append((s, bt_lo, bt_hi, cur_row))
+
+        for s, lo, hi, cur_row in ix_patches:
+            clamped = np.clip(cur_row[lo:hi], 0, max_blk_id).astype(np.int32, copy=False)
+            page_vals = (clamped * page_scale).astype(np.int32, copy=False)
+            host_slice = attn_metadata.host_indexer_k_cache_block_offsets[s, lo:hi]
+            host_slice.copy_(torch.from_numpy(page_vals))
+            step_inputs.copy_(attn_metadata.indexer_k_cache_block_offsets[s, lo:hi], host_slice)
+            rec.dsa_raw_blocks[s, lo:hi] = cur_row[lo:hi]
+
+        for s, bt_lo, bt_hi, cur_row in bt_patches:
+            cols = np.arange(bt_lo, bt_hi, dtype=np.int32)
+            clamped = np.clip(cur_row[bt_lo:bt_hi], 0, max_blk_id).astype(np.int32, copy=False)
+            bt_vals = np.where(cols < cur_nb[s], clamped, -1).astype(np.int32, copy=False)
+            bt_src = torch.from_numpy(bt_vals)
+            if not step_inputs.is_open():
+                bt_src = maybe_pin_memory(bt_src)
+            step_inputs.copy_(attn_metadata.block_table[s, bt_lo:bt_hi], bt_src)
+
+        rec.dsa_num_blocks = cur_nb
+        rec.dsa_max_blocks = max(old_max_nb, new_max_nb)
+
+        if not self.defer_dsa_derived:
+            cached_t = torch.tensor(
+                attn_metadata.kv_cache_params.num_cached_tokens_per_seq,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            attn_metadata.prepare_for_mla_rope_append(cached_t, kv_lens_t)
+            attn_metadata.prepare_for_indices_conversion()
+            from ..attention.backends.sparse.dsa.indexer import Indexer
+
+            Indexer.prepare(metadata=attn_metadata)
+        return True

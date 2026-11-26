@@ -253,6 +253,9 @@ from .ops.dsa.hist_shard_meta import hist_shard_meta
 from .ops.dsa.hist_topk import hist_topk
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
+from .ops.gemm.ml4_ix_q_fused import ml4_ix_q_fused
+from .ops.gemm.ml4_ix_q_fused import precompile as precompile_ml4_ix_q_fused
+from .ops.gemm.ml4_ix_q_fused import serves as ml4_ix_q_fused_serves
 from .ops.gemm.ml4_mx_gemv import ml4_mx_gemv, ml4_mx_gemv_swiglu
 from .ops.gemm.ml4_mx_gemv import precompile as precompile_ml4_gemv
 from .ops.moe.ml4_moe_kernel import SUPPORTED_INTER as _ML4_MOE_SUPPORTED_INTER
@@ -698,6 +701,7 @@ def _layer_views(core: "MistralLarge4Tp4ModelingV2") -> list[SimpleNamespace]:
                 wq_b=w[p + "ix_wq_b"],
                 wq_b_s=prepare_weight_scale(w[p + "ix_wq_b_s"].t(), w[p + "ix_wq_b"].shape[1]),
                 wk_wp=w[p + "ix_wk_wp"].t(),
+                wp=w[p + "ix_wk_wp"][core.idx_dim :],
                 k_norm_w=w[p + "ix_k_norm_w"],
                 k_norm_b=w[p + "ix_k_norm_b"],
                 ssmax_s=w[p + "ix_ssmax_s"],
@@ -1902,6 +1906,15 @@ class DecodeTarget:
                 precompile_ml4_gemv(L0.mlp_dn, L0.mlp_dn_s, m, x_swiglu=True)
             if ix_layer is not None:
                 precompile_ml4_gemv(ix_layer.indexer.wq_b, ix_layer.indexer.wq_b_s, m)
+        if ix_layer is not None:
+            for m_ix in (4, 8):
+                if m_ix <= self.core.max_num_tokens:
+                    precompile_ml4_ix_q_fused(
+                        ix_layer.indexer.wq_b,
+                        ix_layer.indexer.wq_b_s,
+                        m_ix,
+                        inline_wp=True,
+                    )
 
     def _ensure_moe_engine(self, rows: int) -> bool:
         """Ensure the persistent ML4 MoE engine state and layer bindings exist for ``rows`` tokens.
@@ -2049,24 +2062,50 @@ class DecodeTarget:
         ix = L.indexer
         rows = x.shape[0]
         table = core._rope.indexer if ix.rope else core._rope.identity
-        qn = layer_norm(x, ix.q_norm_w, ix.q_norm_b, core.idx_eps)
-        q = torch.reshape(self._linear_fp8(qn, ix.wq_b, ix.wq_b_s), [rows, core.idx_heads, -1])
-        q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+        q_fp8 = torch.empty(
+            [rows, core.idx_heads, core.idx_dim], dtype=torch.float8_e4m3fn, device=x.device
+        )
         weights = torch.empty([rows, core.idx_heads], dtype=torch.float32, device=x.device)
-        if keys_ready is not None:
-            keys_ready.wait()
-        if core.unfused_glue:
-            q = ssmax_scaling(q, pos, ix.ssmax_s, ix.ssmax_b)
-            q_fp8, weights = cute_dsl_indexer_q_side_fused(
-                q, pos, table, kw[:, core.idx_dim :].float().contiguous(), core.idx_weight_scale,
-                q_fp8, weights, is_neox=False, compiled=core._ix_q,
-            )  # fmt: skip
+        fused_ok = False
+        if not core.unfused_glue and ml4_ix_q_fused_serves(rows):
+            wp_tensor = getattr(ix, "wp", None)
+            if wp_tensor is not None:
+                fused_ok = ml4_ix_q_fused(
+                    x,
+                    ix.q_norm_w,
+                    ix.q_norm_b,
+                    core.idx_eps,
+                    ix.wq_b,
+                    ix.wq_b_s,
+                    pos,
+                    ix.ssmax_s,
+                    ix.ssmax_b,
+                    table,
+                    core.idx_weight_scale,
+                    q_fp8,
+                    weights,
+                    wp=wp_tensor,
+                )
+        if fused_ok:
+            if keys_ready is not None:
+                keys_ready.wait()
         else:
-            # SSMax, rope, e4m3 and the head weights (read in place out of `kw`) in one launch.
-            q_fp8, weights = ssmax_indexer_q_side_fused(
-                q, pos, ix.ssmax_s, ix.ssmax_b, table, kw[:, core.idx_dim :],
-                core.idx_weight_scale, q_fp8, weights,
-            )  # fmt: skip
+            qn = layer_norm(x, ix.q_norm_w, ix.q_norm_b, core.idx_eps)
+            q = torch.reshape(self._linear_fp8(qn, ix.wq_b, ix.wq_b_s), [rows, core.idx_heads, -1])
+            if keys_ready is not None:
+                keys_ready.wait()
+            if core.unfused_glue:
+                q = ssmax_scaling(q, pos, ix.ssmax_s, ix.ssmax_b)
+                q_fp8, weights = cute_dsl_indexer_q_side_fused(
+                    q, pos, table, kw[:, core.idx_dim :].float().contiguous(),
+                    core.idx_weight_scale, q_fp8, weights, is_neox=False, compiled=core._ix_q,
+                )  # fmt: skip
+            else:
+                # SSMax, rope, e4m3 and the head weights (read in place out of `kw`) in one launch.
+                q_fp8, weights = ssmax_indexer_q_side_fused(
+                    q, pos, ix.ssmax_s, ix.ssmax_b, table, kw[:, core.idx_dim :],
+                    core.idx_weight_scale, q_fp8, weights,
+                )  # fmt: skip
         num_gens = step["num_seqs"]
         next_n = rows // num_gens
         kv_lens = step["kv_lens_cuda"][:num_gens]

@@ -51,6 +51,8 @@ import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 
+from .numa_pinned import numa_pinned_empty, numa_pinned_zeros
+
 __all__ = [
     "StepInputPack",
     "active",
@@ -227,13 +229,15 @@ class StepInputPack:
             self.staged_ready.record(self.copy_stream)
             self.prologue_done.record(self.copy_stream)
         if self.in_graph:
-            self.ghost = torch.zeros(
-                self.GRAPH_WINDOW, dtype=torch.uint8, pin_memory=prefer_pinned()
+            self.ghost = numa_pinned_zeros(
+                self.GRAPH_WINDOW, dtype=torch.uint8, device=device, pin_memory=prefer_pinned()
             )
             # Recorded by every replayed prologue or side upload right after reading ghost.
             self.ghost_free = torch.cuda.Event(external=True)
         self.host = [
-            torch.empty(self.CAPACITY, dtype=torch.uint8, pin_memory=prefer_pinned())
+            numa_pinned_empty(
+                self.CAPACITY, dtype=torch.uint8, device=device, pin_memory=prefer_pinned()
+            )
             for _ in range(self.RING)
         ]
         self.events: list[Optional[torch.cuda.Event]] = [None] * self.RING

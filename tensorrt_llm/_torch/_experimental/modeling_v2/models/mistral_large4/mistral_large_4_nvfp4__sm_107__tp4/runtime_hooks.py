@@ -446,10 +446,13 @@ def make_ml4_runtime_hooks(mapping: object = None) -> RuntimeHooks:
         executor_events=events,
         skip_unchanged_h2d=True,
         h2d_changed_span=True,
+        incremental_block_offsets=True,
+        steady_dsa_prepare=True,
         kv_lens_update_once=True,
         spec_offsets_op=fused_spec_offsets_op,
         loop_on_execution_stream=True,
         steady_spec_prepare=True,
+        pack_spec_rng_uploads=True,
         iteration_timing_one_event=True,
         perf_metrics_timing_side_stream=True,
     )

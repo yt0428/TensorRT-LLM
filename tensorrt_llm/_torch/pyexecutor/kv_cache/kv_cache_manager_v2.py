@@ -39,6 +39,8 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor import h2d_cache
+from tensorrt_llm._torch.pyexecutor.numa_pinned import numa_pinned_zeros
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -2467,19 +2469,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             else:
                 self.kv_offset[pool_id] = 0
-        # Plain-int mirror of index_scales so the per-step block-table build
-        # does not index a tensor per request (see get_batch_cache_indices*).
+        # Plain-int mirrors of index_scales and kv_offset so per-step block-table paths
+        # do not index tensors per request.
         self._index_scale_ints: List[int] = self.index_scales.tolist()
+        self._kv_offset_ints: List[int] = self.kv_offset.tolist()
+        self._uncached_block_offset_gen: int = 0
 
-        # Keep unused block offsets as safe block index 0.
-        self.host_kv_cache_block_offsets = torch.zeros(
+        # Keep unused block offsets as safe block index 0, pinned on the GPU's local NUMA node.
+        self.host_kv_cache_block_offsets = numa_pinned_zeros(
             self.num_pools,
             index_mapper_capacity * self.max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
-            device="cpu",
         )
         if self._use_per_layer_page_tables:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
@@ -6668,6 +6671,28 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        if h2d_cache.incremental_block_offsets_enabled():
+            h2d_cache.copy_block_offsets_if_changed(
+                dst_tensor,
+                self.host_kv_cache_block_offsets,
+                copy_idx.tolist(),
+                self._index_scale_ints,
+                self._kv_offset_ints,
+                BAD_PAGE_INDEX,
+                lambda: copy_batch_block_offsets_to_device(
+                    self.host_kv_cache_block_offsets,
+                    dst_tensor,
+                    copy_idx,
+                    self.index_scales,
+                    self.kv_offset,
+                    self._stream.cuda_stream,
+                ),
+                manager_id=(id(self), self._uncached_block_offset_gen),
+                stream=self._stream,
+            )
+            return
+
+        self._uncached_block_offset_gen += 1
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,

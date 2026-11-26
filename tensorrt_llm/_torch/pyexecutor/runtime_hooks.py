@@ -176,6 +176,13 @@ class RuntimeHooks:
     # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed
     # column span so the pack keeps fitting the in-graph window.
     h2d_changed_span: bool = False
+    # With skip_unchanged_h2d: skip unchanged KVCacheManagerV2 block-offset copies and
+    # incrementally patch small changed column spans instead of launching the full kernel.
+    incremental_block_offsets: bool = False
+    # With steady_spec_prepare: enable the steady pure-decode fast path for DSA attention
+    # metadata and DSpark speculative metadata (skips unchanged block tables and dead
+    # pre-graph derived metadata overwritten inside the captured graph).
+    steady_dsa_prepare: bool = False
     # A speculative step under the overlap scheduler re-derives its KV-length metadata
     # (on_update_kv_lens) once, after the forward's KV-length correction, instead of also
     # before it: the first pass's device writes are all rewritten by the second.

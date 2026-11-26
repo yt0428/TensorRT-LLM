@@ -188,7 +188,10 @@ class DecoderRunner(ScheduledModelRunner):
         self._config = config
         self.runtime_hooks = runtime_hooks_of(model)
         self._h2d_cache = (
-            H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
+            H2DSkipCache(
+                changed_span=self.runtime_hooks.h2d_changed_span,
+                incremental_block_offsets=self.runtime_hooks.incremental_block_offsets,
+            )
             if self.runtime_hooks.skip_unchanged_h2d
             else None
         )
