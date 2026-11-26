@@ -49,6 +49,8 @@ option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_NCCL_EXTENSIONS "Build the nccl-extensions Python wheel" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
+option(BUILD_ML4_MEGAKERNEL
+       "Build the Mistral Large 4 SM107 persistent megakernel module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -722,6 +724,18 @@ include_directories(${COMMON_HEADER_DIRS})
 include_directories(SYSTEM ${TORCH_INCLUDE_DIRS})
 
 add_subdirectory(tensorrt_llm)
+
+if(BUILD_PYT
+   AND ENABLE_MULTI_DEVICE
+   AND BUILD_ML4_MEGAKERNEL)
+  set(_ml4_megakernel_csrc
+      "${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/_experimental/modeling_v2/models/mistral_large4/csrc"
+  )
+  if(EXISTS "${_ml4_megakernel_csrc}/CMakeLists.txt")
+    add_subdirectory("${_ml4_megakernel_csrc}"
+                     "${CMAKE_BINARY_DIR}/ml4_megakernel")
+  endif()
+endif()
 
 if(BUILD_TESTS)
   enable_testing()
