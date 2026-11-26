@@ -139,10 +139,14 @@ class LayerNormFp8BlockScaleLinear(OpWrapper):
     # request with it, captured at batches 1..32 (rows 1..128).
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="dep4 decode graphs, rows 1/2/4/8/16/32/64/128: indexer q_input_norm into "
+            why="dep4 decode graphs, rows 1/2/4/8/16/32/64/80/96/128: indexer q_input_norm into "
             "wq_b, captured and replayed on new data bitwise equal to eager",
             spec=dict(
-                rows=128, n=HIDDEN, n_out=WQ_B, eps=1e-6, graph_rows=(1, 2, 4, 8, 16, 32, 64, 128)
+                rows=128,
+                n=HIDDEN,
+                n_out=WQ_B,
+                eps=1e-6,
+                graph_rows=(1, 2, 4, 8, 16, 32, 64, 80, 96, 128),
             ),
         ),
         Cell(
@@ -176,7 +180,9 @@ class LayerNormFp8BlockScaleLinear(OpWrapper):
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
         codes, scale = layer_norm_fp8_quantize(x, norm_weight, norm_bias, eps)
-        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(codes, weight, scale, weight_scale)
+        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            codes, weight, scale, weight_scale, fine_grained_m=True
+        )
 
     def reference(
         self,

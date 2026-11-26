@@ -113,12 +113,12 @@ def _v_up_fp8_quantize_kernel(
 def _launch_config(rows: int) -> tuple[int, int, int, int]:
     """(BLOCK_M, BLOCK_K, num_warps, num_stages) for `rows`. A program streams its head's
     [512, 128] block of V from HBM, so the time is set by the bytes each program keeps in
-    flight: 32 KB K-tiles four deep. Up to 64 rows, two programs per head (16 or 32 rows each)
-    beat one taller one; past that, 64-row programs with 8 warps and 16 KB tiles five deep.
-    Measured on VR200 over every config of 16..64 rows, 32..256 K, 4 or 8 warps, 2..5 stages."""
+    flight: 32 KB K-tiles four deep. Up to 96 rows, 16- or 32-row programs keep at most 192 live
+    CTAs (one wave on VR200's 212 SMs) with 128-wide K tiles; past 96 rows, 64-row programs with
+    8 warps and 16 KB tiles five deep avoid spilling 256 live CTAs into two waves."""
     if rows <= 32:
         return 16, 128, 4, 4
-    if rows <= 64:
+    if rows <= 96:
         return 32, 128, 4, 4
     return 64, 64, 8, 5
 
@@ -168,9 +168,9 @@ class MlaVUpFp8BlockScaleLinear(OpWrapper):
     # per request with it, captured at batches 1..32 (rows 1..128).
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="dep4 decode graphs, rows 1/2/4/8/16/32/64/128: the 64-head V up-projection "
+            why="dep4 decode graphs, rows 1/2/4/8/16/32/64/80/96/128: the 64-head V up-projection "
             "into wo, captured and replayed on new data bitwise equal to eager",
-            spec=dict(rows=128, graph_rows=(1, 2, 4, 8, 16, 32, 64, 128)),
+            spec=dict(rows=128, graph_rows=(1, 2, 4, 8, 16, 32, 64, 80, 96, 128)),
         ),
         Cell(
             why="dep4 decode, eager rows 1..129: every decode row count, past one scale tile",
@@ -203,7 +203,9 @@ class MlaVUpFp8BlockScaleLinear(OpWrapper):
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
         codes, scale = v_up_fp8_quantize(lat, v_b_t)
-        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(codes, weight, scale, weight_scale)
+        return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            codes, weight, scale, weight_scale, fine_grained_m=True
+        )
 
     def reference(
         self,

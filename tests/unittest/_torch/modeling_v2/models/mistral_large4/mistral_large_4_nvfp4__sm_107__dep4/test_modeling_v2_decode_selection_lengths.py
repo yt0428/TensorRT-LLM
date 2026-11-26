@@ -85,7 +85,7 @@ def test_selection_lengths_formula() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("width", [32768, 262144])
-@pytest.mark.parametrize("batch", [16, 24])
+@pytest.mark.parametrize("batch", [16, 24, 32])
 @pytest.mark.parametrize("next_n", [1, 4])
 def test_decode_selector_contract(next_n: int, batch: int, width: int) -> None:
     dev = torch.cuda.current_device()

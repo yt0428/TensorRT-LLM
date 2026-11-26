@@ -37,7 +37,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 
     from ..executor_request_queue import RequestQueueItem
 
-HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+HeapVal = namedtuple(
+    "HeapVal", ["graph_bucket", "num_tokens", "num_requests", "rank", "request_list"]
+)
 
 
 def _num_input_tokens(request) -> int:
@@ -306,6 +308,28 @@ class DefaultADPRouter(ADPRouter):
            (descending) for better load balancing.
     """
 
+    def __init__(
+        self,
+        dist: Distributed,
+        has_seq_slot_headroom: bool = False,
+        cuda_graph_batch_sizes: Optional[Sequence[int]] = None,
+    ):
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self._cuda_graph_batch_sizes: tuple[int, ...] = (
+            tuple(sorted({int(b) for b in cuda_graph_batch_sizes if int(b) > 0}))
+            if cuda_graph_batch_sizes
+            else ()
+        )
+
+    def _graph_bucket(self, num_requests: int) -> int:
+        """Smallest captured CUDA graph batch size >= ``num_requests`` (0 if disabled)."""
+        if not self._cuda_graph_batch_sizes:
+            return 0
+        for bucket in self._cuda_graph_batch_sizes:
+            if num_requests <= bucket:
+                return bucket
+        return num_requests
+
     def create_rank_state(
         self,
         active_requests: list[LlmRequest],
@@ -398,7 +422,13 @@ class DefaultADPRouter(ADPRouter):
             return all_ranks_new_requests
 
         all_ranks_new_requests_heap = [
-            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
+            HeapVal(
+                self._graph_bucket(val + 1),
+                all_ranks_num_active_tokens[tp_rank],
+                val,
+                tp_rank,
+                [],
+            )
             for tp_rank, val in enumerate(all_ranks_num_active_requests)
         ]
 
@@ -419,9 +449,11 @@ class DefaultADPRouter(ADPRouter):
 
         for token_count, req_item in counted:
             val = heapq.heappop(all_ranks_new_requests_heap)
+            next_num_requests = val.num_requests + 1
             val = val._replace(
+                graph_bucket=self._graph_bucket(next_num_requests + 1),
                 num_tokens=val.num_tokens + token_count,
-                num_requests=val.num_requests + 1,
+                num_requests=next_num_requests,
             )
 
             val.request_list.append(req_item)

@@ -2056,41 +2056,56 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    gen_logits = self._refine_block_logits(
-                        draft_model,
-                        gen_logits,
-                        inputs,
-                        spec_metadata,
-                        gen_hidden_block,
-                    )
-
-                    # DFlash 2: replace the independent per-position picks with one
-                    # coherent path through the block (absent for plain DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
+                    gen_draft_tokens = None
+                    if (
+                        not spec_metadata.wants_advanced_draft_sampling
+                        and getattr(draft_model, "lilicorr", None) is None
+                        and not getattr(draft_model, "has_candidate_selector", False)
+                    ):
+                        gen_draft_tokens = self._refine_and_greedy_sample_block(
                             draft_model,
                             gen_logits,
-                            gen_hidden_block,
-                            inputs["lilicorr_anchor"],
+                            inputs,
                             spec_metadata,
+                            gen_hidden_block,
                         )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
+
+                    if gen_draft_tokens is None:
+                        gen_logits = self._refine_block_logits(
                             draft_model,
                             gen_logits,
-                            gen_hidden_block,
-                            inputs["first_prev_tokens"],
+                            inputs,
                             spec_metadata,
+                            gen_hidden_block,
                         )
-                        vocab_size = gen_logits.shape[-1]
 
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
-                    )
+                        # DFlash 2: replace the independent per-position picks with one
+                        # coherent path through the block (absent for plain DFlash).
+                        if getattr(draft_model, "lilicorr", None) is not None:
+                            gen_logits = self._apply_lilicorr(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_block,
+                                inputs["lilicorr_anchor"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+                        elif getattr(draft_model, "has_candidate_selector", False):
+                            gen_logits = self._apply_dflash2_selector(
+                                draft_model,
+                                gen_logits,
+                                gen_hidden_block,
+                                inputs["first_prev_tokens"],
+                                spec_metadata,
+                            )
+                            vocab_size = gen_logits.shape[-1]
+
+                        gen_draft_tokens = self.sample_draft_tokens(
+                            gen_logits,
+                            spec_metadata,
+                            batch_size,
+                            num_contexts=num_contexts,
+                        )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2180,6 +2195,22 @@ class DFlashWorker(SpecWorkerBase):
         variant, which reads slots 0..K-1 instead.
         """
         return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
+
+    def _refine_and_greedy_sample_block(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Optional fused refine + greedy draft sampling fast path.
+
+        Returns ``int32[num_gens, K]`` target-vocab draft tokens when the drafter can emit
+        greedy chain tokens directly without materializing refined full-vocab logits, or ``None``
+        to fall through to :meth:`_refine_block_logits` + :meth:`sample_draft_tokens`.
+        """
+        return None
 
     def _refine_block_logits(
         self,

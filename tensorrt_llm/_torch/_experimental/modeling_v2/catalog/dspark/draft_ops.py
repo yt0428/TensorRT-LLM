@@ -460,9 +460,9 @@ class TritonMarkovGate(OpWrapper):
 
 
 class TritonMarkovLogits(OpWrapper):
-    """`out = base + bias` (fp32 base, bf16 bias) written in place into `out`, and the row's
-    argmax as int64 with torch.argmax's first-index tie-break. Bit-identical sums; the argmax
-    is exact for rows without NaN."""
+    """`out = base + bias` (fp32 base, bf16 bias) written in place into `out` (unless `out` is
+    None), and the row's argmax as int64 with torch.argmax's first-index tie-break. Bit-identical
+    sums; the argmax is exact for rows without NaN."""
 
     ARCHS = frozenset({Arch.SM_107})
     CELLS = tuple(
@@ -470,15 +470,19 @@ class TritonMarkovLogits(OpWrapper):
         for batch in (1, 4, 16, 32)
     )
 
-    def __call__(self, base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         batch, vocab = bias.shape
         chunks = triton.cdiv(vocab, _ARGMAX_BLOCK)
         part_max = bias.new_empty((batch, chunks), dtype=torch.float32)
         part_idx = bias.new_empty((batch, chunks), dtype=torch.int32)
         tokens = bias.new_empty((batch,), dtype=torch.int64)
+        write_out = out is not None
+        out_buf = out if write_out else base
         _kernels.markov_logits_kernel[(batch, chunks)](
-            base, base.stride(0), bias, out, out.stride(0), part_max, part_idx, vocab,
-            CHUNKS=chunks, BLOCK_V=_ARGMAX_BLOCK, num_warps=8,
+            base, base.stride(0), bias, out_buf, out_buf.stride(0), part_max, part_idx, vocab,
+            CHUNKS=chunks, BLOCK_V=_ARGMAX_BLOCK, WRITE_OUT=write_out, num_warps=8,
         )  # fmt: skip
         _kernels.argmax_finish_kernel[(batch,)](
             part_max, part_idx, tokens, CHUNKS=chunks, CHUNKS_P2=triton.next_power_of_2(chunks),
@@ -486,9 +490,13 @@ class TritonMarkovLogits(OpWrapper):
         )  # fmt: skip
         return tokens
 
-    def reference(self, base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        out.copy_(base + bias)
-        return torch.argmax(out, dim=-1)
+    def reference(
+        self, base: torch.Tensor, bias: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        summed = base + bias
+        if out is not None:
+            out.copy_(summed)
+        return torch.argmax(summed, dim=-1)
 
 
 triton_draft_attention = TritonDraftAttention()

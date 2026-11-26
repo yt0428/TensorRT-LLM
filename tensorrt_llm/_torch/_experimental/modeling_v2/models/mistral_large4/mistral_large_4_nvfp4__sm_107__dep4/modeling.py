@@ -344,16 +344,14 @@ _TOPK_WAVE_TILE_KEYS = 1 << 17
 # row) to 65536 (one CTA scans a whole row). DSpark verification (next_n 4):
 # cluster_radix_topk_decode, the set of the op's ten-block split selected by one cluster of CTAs
 # per row in one launch, at 20480 columns (the narrowest row the op splits into ten blocks) to
-# 1048584 (the 1M envelope with DSpark's headroom, the selector's widest row), on the rows of a
-# rank's padded graph batches 1, 2, 4, 8 and 16. The selector takes at most 64 rows, so the
-# graph batches padding adds above 16 when max_batch_size allows them (24 and 32: 96 and 128
-# rows) keep the op, as do a mixed step's generation rows at other counts.
+# 1048584 (the 1M envelope with DSpark's headroom, the selector's widest row), on every padded
+# decode graph batch up to 32 requests (4..128 rows).
 # cluster_radix_topk_decode itself keeps the op for a call the op would not split into ten
 # blocks, or whose rows are not 32-byte aligned with a width that is a multiple of 8.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
 _TOPK_VERIFY_COLUMNS = (20480, 1048584)
-_TOPK_VERIFY_ROWS = (4, 8, 16, 32, 64)
+_TOPK_VERIFY_ROWS = tuple(range(4, 129, 4))
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -1223,14 +1221,10 @@ def _dspark_block(
             values.transpose(0, 1),
         )
         partial = cublas_mm(values.reshape(rows, -1), layer.out, None, None)
-        residual = residual + partial
-        o = flashinfer_rmsnorm(residual, layer.ffn_norm, core.eps)
-        gate = cublas_mm(o, layer.gate, None, None)
-        up = cublas_mm(o, layer.up, None, None)
-        activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
+        o, residual = flashinfer_fused_add_rmsnorm(partial, residual, layer.ffn_norm, core.eps)
+        activated = flashinfer_silu_and_mul(cublas_mm(o, layer.w13, None, None))
         mlp = cublas_mm(activated, layer.down, None, None)
-        residual = residual + mlp
-        x = flashinfer_rmsnorm(residual, layer.next_norm, core.eps)
+        x, residual = flashinfer_fused_add_rmsnorm(mlp, residual, layer.next_norm, core.eps)
     return x
 
 
@@ -2074,8 +2068,9 @@ class DecodeTarget:
                 core.eps,
             )
             if L.moe is None:
-                residual = torch.add(residual, self._dense(o, L))
-                x = flashinfer_rmsnorm(residual, L.next_norm, core.eps)
+                x, residual = flashinfer_fused_add_rmsnorm(
+                    self._dense(o, L), residual, L.next_norm, core.eps
+                )
             else:
                 x, residual = self._moe(o, L, residual, counts)
             if spec_metadata is not None:
@@ -2094,8 +2089,13 @@ class DecodeTarget:
         core = self.core
         bf16 = dict(dtype=dtype, device=dev)
         num_seqs = step["num_seqs"]
+        fused_q = (
+            torch.empty([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16)
+            if core.heads == _FLASH_MLA_HEADS
+            else torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16)
+        )
         return SimpleNamespace(
-            fused_q=torch.zeros([rows, _FLASH_MLA_HEADS, core.lat_dim], **bf16),
+            fused_q=fused_q,
             nope_lat=None if core.unfused_glue else torch.zeros([rows, core.lat_dim], **bf16),
             lat_out=(
                 torch.empty([rows, core.heads, core.kv_lora], **bf16) if core.unfused_glue else None
@@ -2308,8 +2308,7 @@ class DraftModel(nn.Module):
                     v_b=kv_b[:, core.nope :].contiguous(),
                     out=w[prefix + "wo"].t(),
                     ffn_norm=w[prefix + "ffn_norm"],
-                    gate=w[prefix + "w1"].t(),
-                    up=w[prefix + "w3"].t(),
+                    w13=w[prefix + "w13"].t(),
                     down=w[prefix + "w2"].t(),
                     next_norm=(
                         w[f"l{i + 1}_draft_attn_norm"]
@@ -2401,6 +2400,35 @@ class DraftModel(nn.Module):
             bias = cublas_mm(emitted, output.t(), None, None)
             previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
         return refined
+
+    def apply_markov_chain_greedy(
+        self,
+        base_logits,
+        first_prev_tokens,
+        *,
+        hidden_states,
+    ):
+        """Return the greedy Markov token chain ``[num_gens, K]`` without materializing refined
+        full-vocab logits or running a trailing full-vocab argmax."""
+        w = self.core.w
+        output = w["draft_markov_output"]
+        previous = first_prev_tokens.long()
+        state = None
+        steps = []
+        for i in range(base_logits.shape[1]):
+            joint = cublas_mm(
+                triton_markov_input(
+                    previous, w["draft_markov_embedding"], state, hidden_states[:, i]
+                ),
+                w["draft_joint"].t(),
+                w["draft_joint_bias"],
+                None,
+            )
+            state, emitted = triton_markov_gate(joint, state)
+            bias = cublas_mm(emitted, output.t(), None, None)
+            previous = triton_markov_logits(base_logits[:, i], bias, None)
+            steps.append(previous)
+        return torch.stack(steps, dim=1)
 
 
 class _VisionBlock(NamedTuple):

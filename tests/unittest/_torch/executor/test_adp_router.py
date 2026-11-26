@@ -1809,3 +1809,70 @@ class TestNumInputTokens:
                 raise AssertionError("input_token_ids must not be materialized")
 
         assert _num_input_tokens(_Req()) == 1234
+
+
+class TestDefaultADPRouterGraphBucketGuard:
+    """Optional CUDA-graph bucket guarding in DefaultADPRouter."""
+
+    def test_avoids_crossing_graph_bucket_when_other_rank_has_room(self):
+        # Rank 0 holds 16 short requests (at bucket 16 ceiling); rank 1 holds 11 long requests.
+        # Without bucket guard, rank 0 wins (lower tokens) and spills all ranks to bucket 24.
+        # With bucket guard, rank 1 takes the new request so max_rank stays <= 16.
+        states = [
+            RankState(rank=0, num_active_requests=16, num_active_tokens=640_000),
+            RankState(rank=1, num_active_requests=11, num_active_tokens=2_200_000),
+            RankState(rank=2, num_active_requests=12, num_active_tokens=1_800_000),
+            RankState(rank=3, num_active_requests=13, num_active_tokens=1_500_000),
+        ]
+        # Give another rank 17 so expected_num_active_requests=17 keeps rank 0 eligible.
+        states.append(RankState(rank=4, num_active_requests=17, num_active_tokens=1_900_000))
+        req = _make_request_item(req_id=100, num_tokens=50_000)
+
+        default_router = DefaultADPRouter(dist=_mock_dist(tp_size=5))
+        assign_default, _ = default_router.route_requests(states, [req], max_num_active_requests=32)
+        assert len(assign_default[0]) == 1
+
+        guarded_router = DefaultADPRouter(
+            dist=_mock_dist(tp_size=5),
+            cuda_graph_batch_sizes=(1, 2, 4, 8, 16, 24, 32),
+        )
+        assign_guarded, _ = guarded_router.route_requests(states, [req], max_num_active_requests=32)
+        assert len(assign_guarded[0]) == 0
+        # Among ranks staying in bucket 16 (ranks 1, 2, 3), lowest token load is rank 3.
+        assert len(assign_guarded[3]) == 1
+
+    def test_within_same_bucket_balances_by_tokens(self):
+        states = [
+            RankState(rank=0, num_active_requests=10, num_active_tokens=2_000_000),
+            RankState(rank=1, num_active_requests=13, num_active_tokens=900_000),
+            RankState(rank=2, num_active_requests=14, num_active_tokens=1_500_000),
+        ]
+        req = _make_request_item(req_id=101, num_tokens=100_000)
+        router = DefaultADPRouter(
+            dist=_mock_dist(tp_size=3),
+            cuda_graph_batch_sizes=(1, 2, 4, 8, 16, 24, 32),
+        )
+        assign, _ = router.route_requests(states, [req], max_num_active_requests=32)
+        # Ranks 0 and 1 are both eligible (< expected=14) and stay in bucket 16 (11<=16, 14<=16),
+        # so lower token rank 1 wins.
+        assert len(assign[1]) == 1
+
+    def test_multi_request_batch_updates_bucket_after_each_assignment(self):
+        states = [
+            RankState(rank=0, num_active_requests=15, num_active_tokens=500_000),
+            RankState(rank=1, num_active_requests=14, num_active_tokens=1_500_000),
+        ]
+        reqs = [
+            _make_request_item(req_id=201, num_tokens=100_000),
+            _make_request_item(req_id=202, num_tokens=80_000),
+            _make_request_item(req_id=203, num_tokens=60_000),
+        ]
+        router = DefaultADPRouter(
+            dist=_mock_dist(tp_size=2),
+            cuda_graph_batch_sizes=(1, 2, 4, 8, 16, 24, 32),
+        )
+        assign, _ = router.route_requests(states, reqs, max_num_active_requests=32)
+        # First fills rank 0 to 16 (stays in b16), then routes remaining two to rank 1 (14->16)
+        # instead of spilling rank 0 to 17 (bucket 24).
+        assert len(assign[0]) == 1
+        assert len(assign[1]) == 2

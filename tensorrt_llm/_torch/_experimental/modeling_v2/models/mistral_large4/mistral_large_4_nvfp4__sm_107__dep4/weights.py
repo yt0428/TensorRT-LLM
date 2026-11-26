@@ -929,15 +929,16 @@ class MistralLarge4Dep4Weights:
             layers=_draft_layers,
         ),
         W(
-            "draft_w1",
-            lambda d: (d.dense_inter, d.hidden),
-            _draft_source("feed_forward.w1.weight"),
-            layers=_draft_layers,
-        ),
-        W(
-            "draft_w3",
-            lambda d: (d.dense_inter, d.hidden),
-            _draft_source("feed_forward.w3.weight"),
+            "draft_w13",
+            lambda d: (2 * d.dense_inter, d.hidden),
+            _stack(
+                ("{p}.feed_forward.w1.weight", lambda d: (slice(0, d.dense_inter),)),
+                (
+                    "{p}.feed_forward.w3.weight",
+                    lambda d: (slice(d.dense_inter, 2 * d.dense_inter),),
+                ),
+                prefix="mtp_dspark.backbone.layers",
+            ),
             layers=_draft_layers,
         ),
         W(
