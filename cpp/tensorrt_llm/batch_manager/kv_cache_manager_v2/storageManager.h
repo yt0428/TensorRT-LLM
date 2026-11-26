@@ -606,7 +606,7 @@ private:
     void eraseRetainedCopy(RetainedCopyList::iterator iter, bool waitInFlight);
     [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
 
-    TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;
+    TypedVec<CacheLevel, uint8_t> mKeepCopyAfterRestoreAt;
     TypedVec<CacheLevel, float> mProtectedCopyFractionAt;
     // Oldest first.
     RetainedCopyList mRetainedCopies;

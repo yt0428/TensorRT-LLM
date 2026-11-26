@@ -808,29 +808,47 @@ TEST_F(KvCacheManagerV2DiskIoTest, KeepOnReadRespectsProtectedCopyFractionAndRec
     engine().drain();
     storage().reapDiskIo();
 
-    // Restore firstSpan so its 2 disk slots become retained copies (above protectedCopyFraction = 0).
+    // Restore firstSpan and keep it locked on GPU so its 2 disk slots remain retained copies
+    // (above protectedCopyFraction = 0) instead of being reused when host evicts.
     auto reader = mManager->createKvCache({}, firstSpan, mNextCacheId++);
     ASSERT_TRUE(reader->prefetch(kHostLevel));
     EXPECT_EQ(reader->pollDiskReads(/*wait=*/true), DiskIoStatus::kOk);
-    reader->close();
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
     EXPECT_EQ(storage().numRetainedCopies(kDiskLevel, diskGroup), 2);
 
-    // Fill the remaining disk slots + 1 more so disk runs short: with protectedCopyFraction = 0,
-    // the 2 retained copies must be reclaimed before any disk-only page is dropped.
-    int const fillBlocks = static_cast<int>(diskTotal);
-    std::vector<TokenIdExt> fillerTokens;
-    auto const fillerSpan = span(fillerTokens, fillBlocks * 4, 10000);
-    ASSERT_EQ(commitPrefix(fillerSpan, fillBlocks * 4).size(), static_cast<size_t>(fillBlocks));
+    // Fill all diskTotal slots with new disk-only blocks in chunks that fit GPU/host alongside
+    // the 2 locked pages: with protectedCopyFraction = 0, the 2 retained copies must be reclaimed
+    // before any disk-only page is dropped.
+    auto const hotGroup = storage().getPoolGroupIndex(kHotLevel, mLifeCycle);
+    auto const hostGroup = storage().getPoolGroupIndex(kHostLevel, mLifeCycle);
+    auto const chunkCap = std::min(
+        storage().getStatistics(kHotLevel, hotGroup).free, storage().getStatistics(kHostLevel, hostGroup).total);
+    ASSERT_GT(chunkCap, 0);
     static_cast<void>(storage().getAndResetDiskIoStats());
-    pressure(kHotLevel);
-    pressure(kHostLevel);
-    engine().drain();
-    storage().reapDiskIo();
+    int pushed = 0;
+    int tokenBase = 10000;
+    while (pushed < static_cast<int>(diskTotal))
+    {
+        int const batchBlocks = std::min(static_cast<int>(diskTotal) - pushed, static_cast<int>(chunkCap));
+        std::vector<TokenIdExt> fillerTokens;
+        auto const fillerSpan = span(fillerTokens, batchBlocks * 4, tokenBase);
+        ASSERT_EQ(commitPrefix(fillerSpan, batchBlocks * 4).size(), static_cast<size_t>(batchBlocks));
+        TypedVec<PoolGroupIndex, SlotCount> hotGoals(storage().numPoolGroups(kHotLevel), SlotCount{0});
+        hotGoals[hotGroup] = storage().getStatistics(kHotLevel, hotGroup).available();
+        storage().prepareFreeSlots(kHotLevel, hotGoals);
+        pressure(kHostLevel);
+        engine().drain();
+        storage().reapDiskIo();
+        pushed += batchBlocks;
+        tokenBase += batchBlocks * 4 + 1000;
+    }
 
     EXPECT_EQ(storage().numRetainedCopies(kDiskLevel, diskGroup), 0);
     auto const stats = storage().getAndResetDiskIoStats();
     EXPECT_EQ(stats.retainedCopiesReclaimed, 2u);
     EXPECT_EQ(stats.lastLevelDroppedPages, 0u);
+    reader->close();
 }
 
 TEST_F(KvCacheManagerV2DiskIoTest, HasDiskResidentPrefixTracksDiskAndPendingReads)

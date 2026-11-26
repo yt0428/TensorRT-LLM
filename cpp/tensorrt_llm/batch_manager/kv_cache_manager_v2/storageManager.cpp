@@ -515,13 +515,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         mNumRetainedCopies[level].resize(numPoolGroups(level), 0);
     }
-    mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, uint8_t>(numCacheLevels(), 0);
     mProtectedCopyFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 1.0F);
     for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
-            mKeepCopyAfterRestoreAt[level] = disk->keepCopyAfterRestore;
+            mKeepCopyAfterRestoreAt[level] = static_cast<uint8_t>(disk->keepCopyAfterRestore);
             mProtectedCopyFractionAt[level] = disk->protectedCopyFraction;
             if (disk->keepCopyAfterRestore)
             {
@@ -1680,7 +1680,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         bool const dstIsDisk = cacheTier(dstLevel) == CacheTier::DISK;
         bool const touchesDisk = srcIsDisk || dstIsDisk;
         bool const retainSrcCopy
-            = updateSrc && !defrag && dstLevel < srcLevel && srcIsDisk && mKeepCopyAfterRestoreAt.at(srcLevel);
+            = updateSrc && !defrag && dstLevel < srcLevel && srcIsDisk && mKeepCopyAfterRestoreAt.at(srcLevel) != 0;
         // Host/disk transfers in the background scopes leave every stream free to run ahead: a stream
         // parked on disk I/O would stall the streams sharing its hardware connection.
         bool const unfenced = updateSrc && !defrag
