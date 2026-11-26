@@ -102,6 +102,7 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
         iter_counter=0,
         sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
         execution_stream=Mock(),
+        _loop_on_execution_stream=False,
         _iter_adp_dummy_ctx_tokens=0,
         _iter_adp_dummy_gen_tokens=0,
         _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
@@ -2244,6 +2245,8 @@ class _CleanupStub:
     """Stub for _executor_loop_cleanup: records the order in which the
     shutdown notification and PP-handle wait happen."""
 
+    _executor_events = None
+
     def __init__(self, pp_handles_raise=False):
         self.response_lock = threading.Lock()
         self.response_cv = threading.Condition(self.response_lock)
@@ -2675,6 +2678,20 @@ def test_encoder_decoder_disagg_wait_and_transfer_states_are_not_schedulable(sta
         LlmRequestState.GENERATION_TO_COMPLETE,
     )
     stub.active_requests = [_make_adp_request(state)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def test_context_request_onboarding_from_disk_is_not_schedulable():
+    """A request waiting for its disk reads leaves the rank without forward work, like a disagg wait."""
+    stub = _StubADPExecutor()
+    request = _make_adp_request(LlmRequestState.CONTEXT_INIT)
+    request.py_kv_onboard_pending = True
+    stub.active_requests = [request]
     stub.expected_num_active_requests = 2
 
     _run_pad(stub)

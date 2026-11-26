@@ -162,6 +162,8 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
+add_subdirectory(glmMoeDsa)
+
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>

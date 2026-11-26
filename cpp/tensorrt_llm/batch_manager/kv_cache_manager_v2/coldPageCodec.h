@@ -139,4 +139,8 @@ public:
 //! Creates the lossless default codec that concatenates hot pools into one cold-page blob.
 [[nodiscard]] std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec();
 
+//! The default codec with each cold page rounded up to a multiple of coldPageAlignment bytes, so that
+//! cold pages can be transferred with O_DIRECT. The padding is never read or written.
+[[nodiscard]] std::unique_ptr<IKvCacheColdPageCodec> createAlignedDefaultKvCacheColdPageCodec(size_t coldPageAlignment);
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

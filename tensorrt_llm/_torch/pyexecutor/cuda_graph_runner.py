@@ -27,6 +27,7 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import make_weak_ref, piecewise_cuda_graph
+from . import step_inputs
 from .llm_request import LlmRequest, get_draft_token_length
 from .resource_manager import (BaseResourceManager, ResourceManager,
                                ResourceManagerType)
@@ -192,6 +193,8 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        # Graphs captured with a step-input pack's prologue, and that pack.
+        self._step_input_prologue_keys: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -764,6 +767,12 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
+                # A pre-replay hook reads the static inputs before replay, so their copies must
+                # land before it rather than inside the graph prologue.
+                prologue_pack = (None if self._pre_replay_hooks else
+                                 step_inputs.capture_prologue())
+                if prologue_pack is not None:
+                    self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
             # Snapshot before postprocessing so the check compares against
             # the addresses the graph actually baked in.
@@ -785,11 +794,14 @@ class CUDAGraphRunner:
         current_inputs: Dict[str, Any],
         *,
         position_id_offsets: Optional[torch.Tensor] = None,
+        static_inputs_staged: int = 0,
     ) -> Optional[torch.Tensor]:
         """Replay a graph, applying optional per-generation-token offsets to hooks.
 
         ``position_id_offsets`` is a one-dimensional device tensor containing the
         position corrections applied inside the captured speculative preprocessing.
+        ``static_inputs_staged`` is the number of tokens already written into the
+        graph's static input buffers by the steady preparer (0 when none were).
         """
         key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
@@ -809,7 +821,11 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        prestaged = static_inputs_staged == seqlen
+        static_input_ids = static_tensors["input_ids"][:seqlen]
+        if not prestaged and input_ids.data_ptr() != static_input_ids.data_ptr(
+        ):
+            step_inputs.copy_(static_input_ids, input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -820,7 +836,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            if not prestaged:
+                static_tensors["position_ids"][:, :, :seqlen].copy_(
+                    position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             num_slots = key.batch_size * self.max_beam_width
@@ -856,7 +874,10 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            static_position_ids = static_tensors["position_ids"][:, :seqlen]
+            if (not prestaged and position_ids.data_ptr()
+                    != static_position_ids.data_ptr()):
+                step_inputs.copy_(static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -880,6 +901,16 @@ class CUDAGraphRunner:
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
+        # Issue the step's packed input copies (no-op without an open pack) before
+        # anything below reads the static inputs on the device; a graph captured
+        # with the pack's prologue issues them itself at the start of the replay.
+        prologue_pack = self._step_input_prologue_keys.get(key)
+        captured_pack_active = (prologue_pack is not None
+                                and step_inputs.is_active(prologue_pack))
+        step_inputs.flush(in_graph=captured_pack_active)
+        if prologue_pack is not None and not captured_pack_active:
+            prologue_pack.quiesce_graph_window()
+
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:
@@ -898,7 +929,11 @@ class CUDAGraphRunner:
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
 
-        self.graphs[key].replay()
+        try:
+            self.graphs[key].replay()
+        finally:
+            if prologue_pack is not None:
+                prologue_pack.on_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref

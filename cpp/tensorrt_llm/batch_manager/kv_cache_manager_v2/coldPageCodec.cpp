@@ -43,6 +43,12 @@ struct PoolCopyPlan
 class ConcatKvCacheColdPageCodec final : public IKvCacheColdPageCodec
 {
 public:
+    explicit ConcatKvCacheColdPageCodec(size_t coldPageAlignment = 1)
+        : mColdPageAlignment(coldPageAlignment)
+    {
+        TLLM_CHECK_WITH_INFO(coldPageAlignment > 0, "Cold-page alignment must be positive");
+    }
+
     // The concat layout depends only on hot-pool geometry. Therefore, all lifecycle variants in one hot pool group
     // form one codec batching equivalence class. Codecs with lifecycle-specific algorithms or sizes need finer-grained
     // configuration.
@@ -178,8 +184,12 @@ private:
                 batchingLayerGroupId = std::min(batchingLayerGroupId, variant.lifeCycleId);
             }
 
+            // The tail between the concatenated pools and the aligned page end is never read or written.
+            TLLM_CHECK(coldOffset <= std::numeric_limits<size_t>::max() - (mColdPageAlignment - 1));
+            size_t const coldPageBytes
+                = (coldOffset + mColdPageAlignment - 1) / mColdPageAlignment * mColdPageAlignment;
             groups.at(poolGroupIndex)
-                = std::make_unique<GroupConfig>(GroupConfig{coldOffset, batchingLayerGroupId, std::move(copyPlans)});
+                = std::make_unique<GroupConfig>(GroupConfig{coldPageBytes, batchingLayerGroupId, std::move(copyPlans)});
         }
 
         mGroups = std::move(groups);
@@ -263,6 +273,7 @@ private:
         return true;
     }
 
+    size_t mColdPageAlignment;
     //! Mutable: launch() reuses per-dispatcher descriptor scratch, and dispatch() is const.
     BatchedPageCopier mCopier;
     TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;
@@ -282,6 +293,11 @@ LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGr
 std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()
 {
     return std::make_unique<ConcatKvCacheColdPageCodec>();
+}
+
+std::unique_ptr<IKvCacheColdPageCodec> createAlignedDefaultKvCacheColdPageCodec(size_t coldPageAlignment)
+{
+    return std::make_unique<ConcatKvCacheColdPageCodec>(coldPageAlignment);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

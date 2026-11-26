@@ -60,7 +60,7 @@ Page::~Page()
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);
                 resetSlot();
-                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s), diskIoTicket);
             }
         });
 }

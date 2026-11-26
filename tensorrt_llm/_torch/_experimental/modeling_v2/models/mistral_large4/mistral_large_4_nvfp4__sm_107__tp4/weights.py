@@ -5,24 +5,25 @@
 The checkpoint is Mistral-native (`consolidated-*.safetensors`, `layers.N.attention.wq`, ...)
 and ModelOpt `MIXED_PRECISION`: the routed experts NVFP4, the other big linears FP8 128x128
 block (`FP8_PB_WO`), everything else bf16. Every rank is handed the whole of it, so every split
-is this table's, every width read off the mapping (`tp_size` and `moe_tp_size` 4 on one node, or
-8 over two nodes of four, and `moe_ep_size` 1):
+is this table's, every width read off the mapping (`tp_size` and `moe_tp_size` 4 on one node,
+8 over two nodes of four, or 16 over four nodes of four, and `moe_ep_size` 1):
 
 * **tensor-parallel slices** -- `wq` by output rows and `wo` by input columns (this rank's 16
-  heads at 4 ranks, 8 heads -- 1024 rows or columns -- at 8); `wkv_b` by heads; the MLA SSMax
-  `s`/`b` by heads; the dense layer's and the shared expert's `w1`/`w3` by rows and `w2` by
-  columns (6144 and 1536 per rank at 4 ranks, 3072 and 768 at 8); the shell's `lm_head` by
-  vocabulary rows (51200 or 25600 per rank). Every slice is whole 128-blocks, and a block scale
-  is sliced on the same boundary. The slice is taken on the checkpoint entry before the copy to
-  the device, so a rank moves only its own bytes. That is the `shard` column of `W`.
+  heads at 4 ranks, 8 heads -- 1024 rows or columns -- at 8, 4 heads -- 512 -- at 16); `wkv_b`
+  by heads; the MLA SSMax `s`/`b` by heads; the dense layer's and the shared expert's `w1`/`w3`
+  by rows and `w2` by columns (6144/1536 at 4 ranks, 3072/768 at 8, 1536/384 at 16); the shell's
+  `lm_head` by vocabulary rows (51200, 25600 or 12800 per rank). Every slice is whole 128-blocks,
+  and a block scale is sliced on the same boundary. The slice is taken on the checkpoint entry
+  before the copy to the device, so a rank moves only its own bytes. That is the `shard` column
+  of `W`.
 * **routed-expert width slices** -- every rank loads all 128 routed experts (the window
   `[expert_offset, expert_offset + local_experts)` that `moe_ep_size` 1 makes `[0, 128)`), each
   cut along its intermediate width to `moe_inter = moe_intermediate_size / moe_tp_size` (1536 at
-  4 ranks, 768 at 8) at `moe_tp_rank * moe_inter`: `w1` and `w3`, codes and block scales alike,
-  by output rows `[Ir, Ir + I)`; `w2`'s codes by input bytes `[Ir/2, Ir/2 + I/2)` (two e2m1 per
-  byte: 768 or 384 bytes) and its block scales by columns `[Ir/16, Ir/16 + I/16)` (one per 16
-  inputs, 96 or 48 columns, so the cut splits no block). These are `shard`s too: a row read, and
-  for `w2` a strided column read, of the checkpoint entry.
+  4 ranks, 768 at 8, 384 at 16) at `moe_tp_rank * moe_inter`: `w1` and `w3`, codes and block
+  scales alike, by output rows `[Ir, Ir + I)`; `w2`'s codes by input bytes `[Ir/2, Ir/2 + I/2)`
+  (two e2m1 per byte: 768, 384 or 192 bytes) and its block scales by columns `[Ir/16, Ir/16 +
+  I/16)` (one per 16 inputs, 96, 48 or 24 columns, so the cut splits no block). These are
+  `shard`s too: a row read, and for `w2` a strided column read, of the checkpoint entry.
 * **replicated** -- `wkv_a_with_mqa` and `kv_a_norm`, the whole indexer (all 32 of its heads),
   the router, the embedding, every norm, `lerope.alpha`, and the routed experts' per-tensor
   scalars.

@@ -750,6 +750,29 @@ class TestLogIterationStatsKvCacheIteration:
             for level, tier in enumerate(["gpu", "gpu", "host"])
         ] == [5, 2, 1]
 
+    def test_disk_io_metrics(self):
+        """IterDiskIo counters accumulate per iteration; pending write bytes is a gauge."""
+        collector = _make_kv_iter_collector()
+        disk_io = {
+            "writeBytes": 1 << 20,
+            "readBytes": 1 << 19,
+            "failedPages": 0,
+            "reserveEvictedPages": 3,
+            "reserveDeferredPages": 5,
+            "lastLevelDroppedPages": 2,
+            "pendingWriteBytes": 4096,
+        }
+        collector.log_iteration_stats({"iterDiskIo": disk_io})
+        collector.log_iteration_stats({"iterDiskIo": {**disk_io, "pendingWriteBytes": 0}})
+
+        assert _get_counter_value(collector, "kv_cache_disk_write_bytes_total") == 2 << 20
+        assert _get_counter_value(collector, "kv_cache_disk_read_bytes_total") == 1 << 20
+        assert _get_counter_value(collector, "kv_cache_disk_failed_pages_total") == 0
+        assert _get_counter_value(collector, "kv_cache_host_reserve_written_pages_total") == 6
+        assert _get_counter_value(collector, "kv_cache_host_reserve_deferred_pages_total") == 10
+        assert _get_counter_value(collector, "kv_cache_last_tier_dropped_pages_total") == 4
+        assert _get_gauge_value(collector, "kv_cache_disk_pending_write_bytes") == 0
+
     def test_counters_incremented(self):
         """Counter metrics should accumulate deltas across calls."""
         collector = _make_kv_iter_collector()
