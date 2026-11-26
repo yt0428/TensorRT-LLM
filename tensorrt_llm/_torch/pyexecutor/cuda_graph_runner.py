@@ -823,7 +823,8 @@ class CUDAGraphRunner:
                 "input_ids leaves the tail of the static input buffer stale.")
         prestaged = static_inputs_staged == seqlen
         static_input_ids = static_tensors["input_ids"][:seqlen]
-        if not prestaged and input_ids.data_ptr() != static_input_ids.data_ptr():
+        if not prestaged and input_ids.data_ptr() != static_input_ids.data_ptr(
+        ):
             step_inputs.copy_(static_input_ids, input_ids)
 
         position_ids = current_inputs["position_ids"]
@@ -874,8 +875,8 @@ class CUDAGraphRunner:
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
             static_position_ids = static_tensors["position_ids"][:, :seqlen]
-            if (not prestaged
-                    and position_ids.data_ptr() != static_position_ids.data_ptr()):
+            if (not prestaged and position_ids.data_ptr()
+                    != static_position_ids.data_ptr()):
                 step_inputs.copy_(static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens

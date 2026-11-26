@@ -1382,7 +1382,8 @@ def _create_py_executor(
             )
 
     _adjust_torch_mem_fraction(
-        runtime_hooks_of(getattr(model_engine, "model", None)).torch_mem_safety_margin)
+        runtime_hooks_of(getattr(model_engine, "model",
+                                 None)).torch_mem_safety_margin)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

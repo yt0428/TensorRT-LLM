@@ -2145,9 +2145,7 @@ class DecoderInputPreparer:
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
         else:
-            step_inputs.copy_(
-                self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids
-            )
+            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
 
         host.host_position_ids = host_position_ids
 
