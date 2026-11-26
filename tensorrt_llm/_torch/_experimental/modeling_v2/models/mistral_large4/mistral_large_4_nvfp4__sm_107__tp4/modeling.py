@@ -246,6 +246,11 @@ from .ops.dsa.hist_shard_meta import hist_shard_meta
 from .ops.dsa.hist_topk import hist_topk
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
+from .ops.gemm.ml4_mx_gemv import ml4_mx_gemv, ml4_mx_gemv_swiglu
+from .ops.gemm.ml4_mx_gemv import precompile as precompile_ml4_gemv
+from .ops.moe.ml4_moe_kernel import SUPPORTED_INTER as _ML4_MOE_SUPPORTED_INTER
+from .ops.moe.ml4_moe_kernel import Ml4MoeLayer, Ml4MoeState, ml4_moe_engine
+from .ops.moe.ml4_moe_kernel import is_supported as _ml4_moe_is_supported
 from .runtime_hooks import make_ml4_runtime_hooks
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
@@ -400,6 +405,8 @@ _LOGITS_GATHER_ROWS = 64
 # The gather's buffer slot per caller: one target and one draft gather a step.
 _TARGET_LOGITS_SLOT = 0
 _DRAFT_LOGITS_SLOT = 1
+# Maximum decode tokens per step served by the persistent CuTe DSL MoE kernel.
+_ML4_MOE_ENGINE_MAX_TOKENS = 8
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -688,10 +695,15 @@ def _layer_views(core: "MistralLarge4Tp4ModelingV2") -> list[SimpleNamespace]:
         if i >= core.dense_layers:
             moe = SimpleNamespace(
                 router=w[p + "router"].t(),
+                router_raw=w[p + "router"],
                 fc1_w=w[p + "fc1_w"],
                 fc1_s=w[p + "fc1_s"],
                 fc2_w=w[p + "fc2_w"],
                 fc2_s=w[p + "fc2_s"],
+                placed_fc1_w=None,
+                placed_fc1_s=None,
+                placed_fc2_w=None,
+                placed_fc2_s=None,
                 **vars(_moe_scalars(w[p + "isc1"], w[p + "isc2"], w[p + "ws2_13"], w[p + "ws2_2"])),
             )
         layers.append(
@@ -1794,6 +1806,104 @@ class DecodeTarget:
         self._keys_ready = torch.cuda.Event()
         self._latent_ready = torch.cuda.Event()
 
+        # Paradigm-B die-aware MoE placement, fused persistent CuTe DSL MoE engine, and
+        # single-launch cluster FP8 GEMV (initialized outside CUDA-graph capture).
+        self._use_ml4_mx_gemv = True
+        self._moe_states: dict[int, Ml4MoeState] = {}
+        self._moe_layers: dict[int, dict[int, Ml4MoeLayer]] = {}
+        self._moe_locality_mode = "none"
+
+        dev = self._norm0.device
+        if dev.type == "cuda":
+            ugpu_info = _weights.place_target_ugpu_weights(
+                self._layers,
+                moe_locality_mode="auto",
+                gemv_ugpu=False,
+                device=dev,
+            )
+            if ugpu_info is not None:
+                self._moe_locality_mode = ugpu_info.moe_locality_mode
+            self._precompile_target_gemv()
+            for m_pre in (1, 2, 3, 4, 8):
+                if m_pre <= min(_ML4_MOE_ENGINE_MAX_TOKENS, core.max_num_tokens):
+                    self._ensure_moe_engine(m_pre)
+
+    def _precompile_target_gemv(self) -> None:
+        """Precompile single-launch ``ml4_mx_gemv`` for the step's target FP8 shapes before
+        CUDA-graph capture."""
+        if (
+            torch.cuda.is_current_stream_capturing()
+            or not self._layers
+            or torch.cuda.get_device_capability(self._norm0.device) != (10, 7)
+        ):
+            return
+        L0 = self._layers[0]
+        ix_layer = next((L for L in self._layers if L.indexer is not None), None)
+        for m in (4, 16):
+            if m > self.core.max_num_tokens:
+                continue
+            precompile_ml4_gemv(L0.wq, L0.wq_s, m)
+            precompile_ml4_gemv(L0.wo, L0.wo_s, m)
+            if L0.moe is None:
+                precompile_ml4_gemv(L0.mlp_gu, L0.mlp_gu_s, m)
+                precompile_ml4_gemv(L0.mlp_dn, L0.mlp_dn_s, m, x_swiglu=True)
+            if ix_layer is not None:
+                precompile_ml4_gemv(ix_layer.indexer.wq_b, ix_layer.indexer.wq_b_s, m)
+
+    def _ensure_moe_engine(self, rows: int) -> bool:
+        """Ensure the persistent ML4 MoE engine state and layer bindings exist for ``rows`` tokens.
+        Returns False when unsupported or unbuilt during CUDA-graph capture."""
+        if rows in self._moe_layers:
+            return True
+        core = self.core
+        if (
+            not (1 <= rows <= _ML4_MOE_ENGINE_MAX_TOKENS)
+            or core.moe_inter not in _ML4_MOE_SUPPORTED_INTER
+            or core.local_experts != core.num_experts
+            or core.expert_offset != 0
+        ):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        dev = self._norm0.device
+        ok, _ = _ml4_moe_is_supported(dev)
+        if not ok:
+            return False
+        state = Ml4MoeState(
+            dev,
+            num_tokens=rows,
+            inter=core.moe_inter,
+            shared_inter=core.moe_inter,
+            shared=True,
+            locality_mode=self._moe_locality_mode,
+        )
+        bound: dict[int, Ml4MoeLayer] = {}
+        for L in self._layers:
+            if L.moe is None:
+                continue
+            m = L.moe
+            bound[L.index] = state.layer(
+                m.fc1_w,
+                m.fc1_s,
+                m.fc2_w,
+                m.fc2_s,
+                m.out1_gate,
+                m.out1,
+                m.out2,
+                m.router_raw,
+                m.gscale,
+                shared_weights=(L.mlp_gu, L.mlp_gu_s, L.mlp_dn, L.mlp_dn_s),
+                placed_fc1_w=m.placed_fc1_w,
+                placed_fc1_s=m.placed_fc1_s,
+                placed_fc2_w=m.placed_fc2_w,
+                placed_fc2_s=m.placed_fc2_s,
+            )
+        self._moe_states[rows] = state
+        self._moe_layers[rows] = bound
+        if bound:
+            state.precompile(next(iter(bound.values())))
+        return True
+
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast: calling `step_args` reads every metadata field this
         target consumes (private trtllm surface). Fixed at engine construction, so once per
@@ -1813,9 +1923,13 @@ class DecodeTarget:
         step.update(num_contexts=0, num_ctx_tokens=0)
         return step
 
-    def _linear_fp8(self, x, w, w_s):
-        """K128-quantized FP8 linear: activation quantization fused into the GEMM at the
-        (M, N, K) shapes the entry has tuned, the Rubin MXFP8 kernel at every other."""
+    def _linear_fp8(self, x, w, w_s, placed=None):
+        """K128-quantized FP8 linear: single-launch cluster ``ml4_mx_gemv`` when served,
+        else ``cute_dsl_fused_fp8_block_scale_linear`` / Rubin MXFP8."""
+        if getattr(self, "_use_ml4_mx_gemv", False):
+            out = ml4_mx_gemv(x, w, w_s, placed=placed)
+            if out is not None:
+                return out
         return cute_dsl_fused_fp8_block_scale_linear(x, w, w_s)
 
     def _latent(self, x, L, nope_lat):
@@ -1949,12 +2063,22 @@ class DecodeTarget:
         core = self.core
 
         def shared():
-            act = flashinfer_silu_and_mul(self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s))
+            gu = self._linear_fp8(o, L.mlp_gu, L.mlp_gu_s)
+            if getattr(self, "_use_ml4_mx_gemv", False):
+                dn = ml4_mx_gemv_swiglu(gu, L.mlp_dn, L.mlp_dn_s)
+                if dn is not None:
+                    return dn
+            act = flashinfer_silu_and_mul(gu)
             return self._linear_fp8(act, L.mlp_dn, L.mlp_dn_s)
 
         m = L.moe
         if m is None:
             return None, shared()
+
+        rows = o.shape[0]
+        moe_layers = getattr(self, "_moe_layers", None)
+        if moe_layers is not None and rows in moe_layers:
+            return None, ml4_moe_engine(o, moe_layers[rows][L.index])
 
         def routed():
             logits = cublas_mm(o, m.router, None, torch.float32)
@@ -2015,6 +2139,7 @@ class DecodeTarget:
         # around it (each the same bits as the separate op). Those are one-shot kernels, so a
         # step of more rows than they take keeps the separate ops: per step, by its row count.
         one_shot = rows <= ONE_SHOT_ROWS
+        use_moe_engine = self._ensure_moe_engine(rows)
 
         x = flashinfer_rmsnorm(h, self._norm0, core.eps)
         residual = h
@@ -2025,7 +2150,7 @@ class DecodeTarget:
             )
             partial = self._linear_fp8(attn_out, L.wo, L.wo_s)
             quantized = None
-            if one_shot and L.moe is not None:
+            if one_shot and L.moe is not None and not use_moe_engine:
                 o, *quantized = allreduce_add_rmsnorm_nvfp4(
                     partial, residual, L.ffn_norm, L.moe.gscale, core._lamport
                 )
