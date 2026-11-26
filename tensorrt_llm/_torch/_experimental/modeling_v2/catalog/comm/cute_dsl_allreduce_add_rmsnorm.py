@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""TP4 and TP8 all-reduce fused with the residual add and RMSNorm that consume it."""
+"""TP4, TP8 and TP16 all-reduce fused with the residual add and RMSNorm that consume it."""
 
 from __future__ import annotations
 
@@ -33,6 +33,10 @@ _ML4_32 = dict(world_size=4, hidden=6144, eps=1e-5, max_rows=32768)
 # starts them. Both targets make the same two calls per layer at the same rows; the second
 # sums tep8's expert-window partials, tp8's expert width-slice partials.
 _ML4_32_TEP8 = dict(world_size=8, nodes=2, hidden=6144, eps=1e-5, max_rows=32768)
+# Mistral Large 4 NVFP4 at tp16 on SM107 (VR200): 16 ranks over four nodes of 4 on one NVL72
+# segment (MNNVL), same hidden, eps and 32768-row workspace. At 4 decode rows (c=1 verify),
+# one-shot payload is 4 x 6144 x 2B x 16 = 768 KiB (< 1.5 MiB MNNVL threshold).
+_ML4_32_TP16 = dict(world_size=16, nodes=4, hidden=6144, eps=1e-5, max_rows=32768)
 
 
 class CuteDslAllreduceAddRmsnorm(OpWrapper):
@@ -195,6 +199,25 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
             why="NVFP4 tep8 max_num_tokens, 32768 rows: the whole 32768-row workspace over 8 ranks",
             spec=dict(_ML4_32_TEP8, rows=32768),
         ),
+        *(
+            Cell(
+                why=f"NVFP4 tp16 decode batch {rows}, 16 ranks on 4 nodes: a captured step, replayed",
+                spec=dict(_ML4_32_TP16, rows=rows, graph=True),
+            )
+            for rows in (1, 2, 3, 4, 8, 16, 64)
+        ),
+        Cell(
+            why="NVFP4 tp16 prefill at the last one-shot row count, 3072: 15 peers' partials",
+            spec=dict(_ML4_32_TP16, rows=3072),
+        ),
+        Cell(
+            why="NVFP4 tp16 prefill at the first two-shot row count, 3073: 64-row groups",
+            spec=dict(_ML4_32_TP16, rows=3073),
+        ),
+        Cell(
+            why="NVFP4 tp16 max_num_tokens, 32768 rows: Int64 mode-0 stride over 16 ranks",
+            spec=dict(_ML4_32_TP16, rows=32768),
+        ),
     )
 
     note = """
@@ -312,11 +335,9 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
                           element 3,221,225,472, past 2^31) passes its gate,
                           and a two-shot launch clears slot 2 to element
                           4,831,838,207: passed.
-      workspace numel     max_rows x hidden, the compiled Int32 extent:
-                          passes 2^31 at 349,526 rows at 6144, not probed
-      buffer mode-0       world x max_rows x hidden: passes 2^31 at 87,382
-      stride              rows at world 4, 43,691 at world 8 (hidden 6144),
-                          computed, not probed
+      workspace numel     max_rows x hidden, compiled Int64 extent so buffer
+      & buffer mode-0     mode-0 stride (world x max_rows x hidden) exceeds
+      stride              2^31 cleanly (3,221,225,472 at world 16, 32768 rows)
       rows x hidden       input offsets and the vector counts in Int32: pass
                           2^31 at 349,526 rows, not probed (rows <= max_rows)
       rows > max_rows     `is_valid` refuses: the kernel would write past every
