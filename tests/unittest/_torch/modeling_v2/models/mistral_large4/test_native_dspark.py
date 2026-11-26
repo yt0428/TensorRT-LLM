@@ -142,6 +142,10 @@ def test_indexer_preserves_request_geometry(
     monkeypatch.setattr(modeling, "cublas_mm", lambda *a: torch.zeros(rows, dim + heads))
     monkeypatch.setattr(modeling, "cute_dsl_indexer_k_cache_update", lambda *a, **kw: a[5])
     monkeypatch.setattr(modeling, "layer_norm", lambda x, *a: x)
+    if hasattr(modeling, "layer_norm_fp8_block_scale_linear"):
+        monkeypatch.setattr(
+            modeling, "layer_norm_fp8_block_scale_linear", lambda *a: torch.zeros(rows, heads * dim)
+        )
     scale = Mock(side_effect=lambda q, *a: q)
     fused = Mock(side_effect=lambda *a: (a[7], a[8]))
     q_side = Mock(side_effect=lambda *a, **kw: (a[5], a[6]))
@@ -167,6 +171,9 @@ def test_indexer_preserves_request_geometry(
     if mixed:
         modeling.PrefillTarget._indexer(*args, tc, False, False)
         target._select_ctx.assert_called_once()
+    elif hasattr(modeling.DecodeTarget, "_indexer_keys"):
+        kw = modeling.DecodeTarget._indexer_keys(*args[:5])
+        modeling.DecodeTarget._indexer(*args[:5], kw, None, output)
     else:
         modeling.DecodeTarget._indexer(*args, False)
     query, _, weights, kv_lens, page_table, *_ = scorer.call_args.args
@@ -414,6 +421,13 @@ def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypa
         lambda x: torch.nn.functional.silu(x.chunk(2, -1)[0]) * x.chunk(2, -1)[1],
     )
     monkeypatch.setattr(modeling, "flashinfer_rmsnorm", norm)
+    if hasattr(modeling, "flashinfer_fused_add_rmsnorm"):
+
+        def fused_add_norm(x, residual, weight, eps):
+            residual.add_(x)
+            return norm(residual, weight, eps), residual
+
+        monkeypatch.setattr(modeling, "flashinfer_fused_add_rmsnorm", fused_add_norm)
     if hasattr(modeling, "cute_dsl_allreduce_add_rmsnorm"):
 
         def add_norm(partial, residual, weight, out, workspace):
@@ -444,23 +458,26 @@ def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypa
         _run_references(modeling, monkeypatch, "triton_latent_tail", "triton_draft_attention")
     draft = _draft(modeling, core)
     draft._rope = SimpleNamespace(rows=32, indexer=torch.tensor([[1.0, 0.0]] * 32))
-    draft._layers = [
-        SimpleNamespace(
-            attn_norm=torch.ones(4),
-            ffn_norm=torch.ones(4),
-            next_norm=torch.ones(4),
-            q=rand(4, 8),
-            kv_a=rand(4, 6),
-            kv_norm=torch.ones(4),
-            k_b=rand(2, 2, 4),
-            v_b=rand(2, 2, 4),
-            out=rand(4, 4),
-            gate=rand(4, 8),
-            up=rand(4, 8),
-            down=rand(8, 4),
+    draft._layers = []
+    for _ in range(2):
+        gate, up = rand(4, 8), rand(4, 8)
+        draft._layers.append(
+            SimpleNamespace(
+                attn_norm=torch.ones(4),
+                ffn_norm=torch.ones(4),
+                next_norm=torch.ones(4),
+                q=rand(4, 8),
+                kv_a=rand(4, 6),
+                kv_norm=torch.ones(4),
+                k_b=rand(2, 2, 4),
+                v_b=rand(2, 2, 4),
+                out=rand(4, 4),
+                gate=gate,
+                up=up,
+                w13=torch.cat((gate, up), dim=-1),
+                down=rand(8, 4),
+            )
         )
-        for _ in range(2)
-    ]
     core.w.update(embed=rand(2, 4), draft_mask=rand(2, 4))
     noise = draft.embed_draft_block(torch.tensor([1, 0]), draft.block_size)
     lengths = torch.tensor([7, 2])
