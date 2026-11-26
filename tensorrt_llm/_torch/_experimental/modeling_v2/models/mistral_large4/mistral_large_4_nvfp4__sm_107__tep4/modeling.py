@@ -160,6 +160,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allredu
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.cute_dsl_allreduce_add_rmsnorm import (
     cute_dsl_allreduce_add_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.dspark.draft_ops import (
+    triton_embed_draft_block,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_block_scale_linear import (
@@ -204,6 +207,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..mistral_large_4_nvfp4__sm_107__dep4.runtime_hooks import make_ml4_dep_runtime_hooks
 from . import weights as _weights
 
 #: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
@@ -1987,11 +1991,10 @@ class DraftModel(nn.Module):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
         weight = self.core.w["embed"]
-        valid = (anchors >= 0) & (anchors < weight.shape[0])
-        embedded = nn.functional.embedding(anchors.clamp(0, weight.shape[0] - 1), weight)
-        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
-        masks = self.core.w["draft_mask"].unsqueeze(0).expand(anchors.shape[0], -1, -1)
-        return torch.cat((embedded.unsqueeze(1), masks), dim=1)
+        masks = self.core.w["draft_mask"]
+        if anchors.is_cuda or os.environ.get("TRITON_INTERPRET") == "1":
+            return triton_embed_draft_block(anchors, weight, masks, block_size)
+        return triton_embed_draft_block.reference(anchors, weight, masks, block_size)
 
     def project_target_hidden(self, hidden):
         w = self.core.w
@@ -2353,6 +2356,11 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tep4(
             vocab_size=cfg.vocab_size,
         )
         self.softcap = float(cfg.softmax_tanh_gating)
+        self.runtime_hooks = make_ml4_dep_runtime_hooks(
+            model_config.mapping,
+            use_cuda_graph=model_config.use_cuda_graph,
+            enable_attention_dp=model_config.mapping.enable_attention_dp,
+        )
         self._vision: Optional[VisionTower] = None
         vis = getattr(cfg, "vision_config", None)
         self._image_token_ids = (

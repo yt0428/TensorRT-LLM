@@ -1393,13 +1393,16 @@ def place_target_ugpu_weights(
     moe_locality_mode: str = "none",
     gemv_ugpu: bool = False,
     device=None,
+    max_batch_size: int | None = None,
+    use_cuda_graph: bool = True,
 ) -> SimpleNamespace | None:
     """Place Target FP8 Linears (``wq``, ``wo``, ``ix_wq_b``, ``dense0``) and Routed MoE weights
     into Paradigm-B die-aware Rubin uGPU VMM allocations on ``layers`` in place.
 
     Original parameters in ``core.w`` are left untouched so non-die-aware consumers (``PrefillTarget``,
     stock fallbacks) never incur cross-die traffic. Returns the resolved :class:`LocalityMap` and
-    effective ``moe_locality_mode`` (or ``None`` if dual-domain uGPU is unavailable on ``device``).
+    effective ``moe_locality_mode`` (or ``None`` if dual-domain uGPU is unavailable or skipped
+    for high-batch/non-CUDA-graph serving).
     """
     if moe_locality_mode == "none" and not gemv_ugpu:
         return None
@@ -1417,8 +1420,17 @@ def place_target_ugpu_weights(
     num_experts = moe_layer.fc1_w.shape[0] if moe_layer is not None else 128
     if moe_layer is None:
         resolved_moe_mode = "none"
+        skip_reason = None
     else:
-        resolved_moe_mode, _ = resolve_moe_locality_mode(moe_locality_mode, inter, num_experts)
+        resolved_moe_mode, skip_reason = resolve_moe_locality_mode(
+            moe_locality_mode,
+            inter,
+            num_experts,
+            max_batch_size=max_batch_size,
+            use_cuda_graph=use_cuda_graph,
+        )
+    if skip_reason is not None:
+        logger.info(f"[ML4 sm_107] Paradigm-B MoE uGPU skipped: {skip_reason}")
 
     if resolved_moe_mode == "none" and not gemv_ugpu:
         return None

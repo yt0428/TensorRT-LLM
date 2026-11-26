@@ -1873,11 +1873,16 @@ class DecodeTarget:
 
         dev = self._norm0.device
         if dev.type == "cuda":
+            cfg_max_batch = core.model_config.extra_attrs.get("max_batch_size")
             ugpu_info = _weights.place_target_ugpu_weights(
                 self._layers,
                 moe_locality_mode="auto",
                 gemv_ugpu=False,
                 device=dev,
+                max_batch_size=cfg_max_batch,
+                use_cuda_graph=(
+                    core.model_config.use_cuda_graph if cfg_max_batch is not None else True
+                ),
             )
             if ugpu_info is not None:
                 self._moe_locality_mode = ugpu_info.moe_locality_mode

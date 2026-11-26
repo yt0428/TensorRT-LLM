@@ -33,6 +33,18 @@ import triton.language as tl
 SENTINEL = tl.constexpr(-32768)
 #: Slots the device counter rotates over.
 SLOTS = tl.constexpr(3)
+#: Maximum number of peer ranks polled concurrently per wave in `combine_kernel`.
+#: Four 16-bit vectors of length `BLOCK=8192` across 8 warps keep register usage below
+#: spill thresholds while overlapping up to 4 NVLink peer loads per burst (1 wave for
+#: DEP4, 2 waves for DEP8).
+COMBINE_POLL_WAVE_SIZE = 4
+
+
+def resolve_combine_wave_size(world: int) -> int:
+    """Return the parallel peer-poll wave size for ``combine_kernel`` at ``world`` ranks."""
+    if world < 1 or world > 8:
+        raise ValueError(f"combine_kernel supports world in 1..8, got {world}")
+    return min(world, COMBINE_POLL_WAVE_SIZE)
 
 
 @triton.jit
@@ -79,6 +91,12 @@ def _peer(peers, q):
 
 
 @triton.jit
+def _or_combine(a, b):
+    """Bitwise-OR reduction combinator for single-barrier multi-peer sentinel checks."""
+    return a | b
+
+
+@triton.jit
 def _poll(src, mask):
     """`src`'s words once none of them is the sentinel."""
     words = tl.load(src, mask=mask, other=0, volatile=True)
@@ -88,9 +106,99 @@ def _poll(src, mask):
 
 
 @triton.jit
+def _poll_wave4(
+    buf,
+    slot_base,
+    region,
+    row_off,
+    live,
+    rank,
+    own_v,
+    acc,
+    P0: tl.constexpr,
+    WORLD: tl.constexpr,
+):
+    """Poll up to four consecutive ranks ``[P0, P0 + 4)`` in parallel and accumulate into
+    ``acc`` in strict ascending rank order.
+
+    Issues straight-line vectorized volatile loads for every active remote peer in the wave
+    so NVLink read latencies overlap, packs all four peers' sentinel status bits into a single
+    CTA-wide bitwise-OR reduction (one ``bar.sync`` per wave instead of one per peer), reloads
+    only peers whose bit remains set, and folds ``own_v`` at ``p == rank`` for bit-identical
+    FP32 rank-order summation. Sentinel clearing is deferred until after the output stores.
+    """
+    HAS0: tl.constexpr = P0 < WORLD
+    HAS1: tl.constexpr = (P0 + 1) < WORLD
+    HAS2: tl.constexpr = (P0 + 2) < WORLD
+    HAS3: tl.constexpr = (P0 + 3) < WORLD
+
+    rem0 = (P0 != rank) if HAS0 else False
+    rem1 = ((P0 + 1) != rank) if HAS1 else False
+    rem2 = ((P0 + 2) != rank) if HAS2 else False
+    rem3 = ((P0 + 3) != rank) if HAS3 else False
+
+    src0 = buf + slot_base + P0 * region + row_off
+    src1 = buf + slot_base + (P0 + 1) * region + row_off
+    src2 = buf + slot_base + (P0 + 2) * region + row_off
+    src3 = buf + slot_base + (P0 + 3) * region + row_off
+
+    # Straight-line parallel burst: issue all active remote peer loads back-to-back.
+    if HAS0:
+        w0 = tl.load(src0, mask=live & rem0, other=0, volatile=True)
+    if HAS1:
+        w1 = tl.load(src1, mask=live & rem1, other=0, volatile=True)
+    if HAS2:
+        w2 = tl.load(src2, mask=live & rem2, other=0, volatile=True)
+    if HAS3:
+        w3 = tl.load(src3, mask=live & rem3, other=0, volatile=True)
+
+    # Single CTA-wide bitwise-OR reduction checks all peers in this wave with one barrier.
+    bits = tl.zeros(live.shape, dtype=tl.int32)
+    if HAS0:
+        bits = bits | tl.where((w0 == SENTINEL) & rem0, 1, 0)
+    if HAS1:
+        bits = bits | tl.where((w1 == SENTINEL) & rem1, 2, 0)
+    if HAS2:
+        bits = bits | tl.where((w2 == SENTINEL) & rem2, 4, 0)
+    if HAS3:
+        bits = bits | tl.where((w3 == SENTINEL) & rem3, 8, 0)
+    pending = tl.reduce(bits, axis=0, combine_fn=_or_combine)
+
+    while pending != 0:
+        next_bits = tl.zeros(live.shape, dtype=tl.int32)
+        if HAS0:
+            if (pending & 1) != 0:
+                w0 = tl.load(src0, mask=live, other=0, volatile=True)
+                next_bits = next_bits | tl.where(w0 == SENTINEL, 1, 0)
+        if HAS1:
+            if (pending & 2) != 0:
+                w1 = tl.load(src1, mask=live, other=0, volatile=True)
+                next_bits = next_bits | tl.where(w1 == SENTINEL, 2, 0)
+        if HAS2:
+            if (pending & 4) != 0:
+                w2 = tl.load(src2, mask=live, other=0, volatile=True)
+                next_bits = next_bits | tl.where(w2 == SENTINEL, 4, 0)
+        if HAS3:
+            if (pending & 8) != 0:
+                w3 = tl.load(src3, mask=live, other=0, volatile=True)
+                next_bits = next_bits | tl.where(w3 == SENTINEL, 8, 0)
+        pending = tl.reduce(next_bits, axis=0, combine_fn=_or_combine)
+
+    if HAS0:
+        acc += tl.where(rem0, w0.to(tl.bfloat16, bitcast=True).to(tl.float32), own_v.to(tl.float32))
+    if HAS1:
+        acc += tl.where(rem1, w1.to(tl.bfloat16, bitcast=True).to(tl.float32), own_v.to(tl.float32))
+    if HAS2:
+        acc += tl.where(rem2, w2.to(tl.bfloat16, bitcast=True).to(tl.float32), own_v.to(tl.float32))
+    if HAS3:
+        acc += tl.where(rem3, w3.to(tl.bfloat16, bitcast=True).to(tl.float32), own_v.to(tl.float32))
+    return acc
+
+
+@triton.jit
 def _dispatch_row(codes, scales, ids, weights, j, lanes, CODES, SCALES, IDS, WEIGHTS):
     """Row `j` of the four inputs as one row of words: codes, scales, ids, weights."""
-    j = j.to(tl.int64)
+    j = tl.cast(j, tl.int64)
     s0 = CODES
     s1 = s0 + SCALES
     s2 = s1 + IDS
@@ -105,7 +213,7 @@ def _dispatch_row(codes, scales, ids, weights, j, lanes, CODES, SCALES, IDS, WEI
 @triton.jit
 def _dispatch_store(codes, scales, ids, weights, r, row, lanes, CODES, SCALES, IDS, WEIGHTS):
     """One row of words into gathered row `r` of the four outputs."""
-    r = r.to(tl.int64)
+    r = tl.cast(r, tl.int64)
     s0 = CODES
     s1 = s0 + SCALES
     s2 = s1 + IDS
@@ -166,9 +274,10 @@ def dispatch_kernel(
     own = _offset(rank, c0, c1, c2, c3, c4, c5, c6, c7)
     widest = _widest(c0, c1, c2, c3, c4, c5, c6, c7)
     # Send: this rank's row j to rank q's slot region `rank`, or to its own outputs.
+    # Rotate peer order by `rank` so all ranks do not contend on peer 0 first.
     for i in range(pid, n_own * WORLD, programs):
         j = i // WORLD
-        q = i % WORLD
+        q = (i % WORLD + rank) % WORLD
         row = _dispatch_row(codes, scales, ids, weights, j, lanes, CODES, SCALES, IDS, WEIGHTS)
         row = tl.where(row == SENTINEL, 0, row).to(tl.int16)
         if q == rank:
@@ -179,9 +288,11 @@ def dispatch_kernel(
         else:
             dst = _peer(peers, q) + slot_base + rank * region + j * ROW
             tl.store(dst + lanes, row, mask=in_row)
-    # Receive: rank q's row j out of this rank's slot region q.
+    # Receive: rank q's row j out of this rank's slot region q, clearing sentinels with
+    # non-polluting streaming stores after the output writes.
+    sentinel = tl.full([BLOCK], SENTINEL, tl.int16)
     for i in range(pid, WORLD * widest, programs):
-        q = i // widest
+        q = (i // widest + rank) % WORLD
         j = i % widest
         if (q != rank) & (j < _count(q, c0, c1, c2, c3, c4, c5, c6, c7)):
             src = buf + slot_base + q * region + j * ROW + lanes
@@ -191,7 +302,7 @@ def dispatch_kernel(
                 _offset(q, c0, c1, c2, c3, c4, c5, c6, c7) + j, row, lanes,
                 CODES, SCALES, IDS, WEIGHTS,
             )  # fmt: skip
-            tl.store(src, tl.full([BLOCK], SENTINEL, tl.int16), mask=in_row)
+            tl.store(src, sentinel, mask=in_row, cache_modifier=".cs")
     _advance(state, programs)
 
 
@@ -239,32 +350,29 @@ def combine_kernel(
     cols = tl.arange(0, BLOCK)
     live = cols < H
     widest = _widest(c0, c1, c2, c3, c4, c5, c6, c7)
-    # Send: rank q's rows of this partial to its slot region `rank`.
+    # Send: rank q's rows of this partial to its slot region `rank` (rotated by `rank` to
+    # spread NVLink write traffic across peers).
     for i in range(pid, WORLD * widest, programs):
-        q = i % WORLD
+        q = (i % WORLD + rank) % WORLD
         j = i // WORLD
         if (q != rank) & (j < _count(q, c0, c1, c2, c3, c4, c5, c6, c7)):
-            r = (_offset(q, c0, c1, c2, c3, c4, c5, c6, c7) + j).to(tl.int64)
+            r = tl.cast(_offset(q, c0, c1, c2, c3, c4, c5, c6, c7) + j, tl.int64)
             words = tl.load(partial + r * H + cols, mask=live, other=0.0).to(tl.int16, bitcast=True)
             words = tl.where(words == SENTINEL, 0, words).to(tl.int16)
             dst = _peer(peers, q) + slot_base + rank * region + j * H
             tl.store(dst + cols, words, mask=live)
-    # Receive and reduce: this rank's row j from every rank, in rank order.
+    # Receive and reduce: preload this rank's own partial, poll peers in parallel 4-peer waves
+    # while accumulating in strict rank order, write outputs, then clear sentinels off the
+    # critical path with non-polluting streaming stores before advancing the slot counter.
     n_own = _count(rank, c0, c1, c2, c3, c4, c5, c6, c7)
     own = _offset(rank, c0, c1, c2, c3, c4, c5, c6, c7)
+    sentinel = tl.full([BLOCK], SENTINEL, tl.int16)
     for j in range(pid, n_own, programs):
+        row = tl.cast(j, tl.int64) * H + cols
+        own_v = tl.load(partial + tl.cast(own + j, tl.int64) * H + cols, mask=live, other=0.0)
         acc = tl.zeros([BLOCK], dtype=tl.float32)
-        for p in tl.static_range(WORLD):
-            if p == rank:
-                v = tl.load(partial + (own + j).to(tl.int64) * H + cols, mask=live, other=0.0)
-                v = v.to(tl.float32)
-            else:
-                src = buf + slot_base + p * region + j * H + cols
-                words = _poll(src, live)
-                tl.store(src, tl.full([BLOCK], SENTINEL, tl.int16), mask=live)
-                v = words.to(tl.bfloat16, bitcast=True).to(tl.float32)
-            acc += v
-        row = j.to(tl.int64) * H + cols
+        for wave_base in tl.static_range(0, WORLD, 4):
+            acc = _poll_wave4(buf, slot_base, region, row, live, rank, own_v, acc, wave_base, WORLD)
         s = tl.load(shared + row, mask=live, other=0.0).to(tl.float32)
         mlp = (acc.to(tl.bfloat16).to(tl.float32) + s).to(tl.bfloat16)
         if NORM:
@@ -277,4 +385,12 @@ def combine_kernel(
             tl.store(out + row, (hf * inv * w).to(tl.bfloat16), mask=live)
         else:
             tl.store(out + row, mlp, mask=live)
+        for p in tl.static_range(WORLD):
+            if p != rank:
+                tl.store(
+                    buf + slot_base + p * region + row,
+                    sentinel,
+                    mask=live,
+                    cache_modifier=".cs",
+                )
     _advance(state, programs)
